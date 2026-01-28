@@ -3059,6 +3059,333 @@ fn postEvent(self: *Engine, event: SocketEvent) void {
 
 ---
 
+## libzmq Reference: Critical Behaviors and Edge Cases
+
+This section documents specific libzmq behaviors that ZZMQ must match. These are derived from studying the libzmq source code.
+
+### Credit-Based Flow Control (HWM)
+
+**libzmq implementation** (`src/pipe.cpp:533-538`):
+```cpp
+bool zmq::pipe_t::check_hwm () const
+{
+    const bool full =
+      _hwm > 0 && _msgs_written - _peers_msgs_read >= uint64_t (_hwm);
+    return !full;
+}
+```
+
+**Key behaviors:**
+1. HWM is tracked via credit system, not queue length
+2. Writer tracks `_msgs_written`, reader periodically sends `_msgs_read` back
+3. Writer is blocked when `written - peer_read >= HWM`
+
+**ZZMQ approach:** ZIO channels handle this implicitly - channel capacity = HWM.
+
+### Low Water Mark (LWM)
+
+**libzmq implementation** (`src/pipe.cpp:452-473`):
+```cpp
+int zmq::pipe_t::compute_lwm (int hwm_)
+{
+    // LWM = HWM / 2
+    const int result = (hwm_ + 1) / 2;
+    return result;
+}
+```
+
+**Why LWM matters:**
+- If LWM = 0: After filling queue, reader must drain ALL messages before writer resumes → poor performance
+- If LWM = HWM-1: Lock-step filling, one message at a time → poor performance
+- LWM = HWM/2: Good balance between throughput and latency
+
+**libzmq behavior** (`src/pipe.cpp:201-202`):
+```cpp
+if (_lwm > 0 && _msgs_read % _lwm == 0)
+    send_activate_write (_peer, _msgs_read);
+```
+
+Reader sends activation signal every LWM messages read.
+
+**ZZMQ approach:** ZIO channels don't expose LWM directly. May need wrapper if fine-grained control needed.
+
+### Message Counting for HWM
+
+**Critical detail** (`src/pipe.cpp:198-199, 227-232`):
+```cpp
+// Only count complete messages, not MORE frames
+if (!(msg_->flags () & msg_t::more) && !msg_->is_routing_id ())
+    _msgs_read++;
+```
+
+**HWM counts MESSAGES, not frames:**
+- A 10-frame multipart message counts as 1 message for HWM
+- Routing ID frames don't count
+- This is essential for multipart atomicity
+
+**ZZMQ must match:** Count only complete messages against HWM, not individual frames.
+
+### Pipe State Machine
+
+**libzmq pipe states** (`src/pipe.hpp:206-214`):
+```cpp
+enum {
+    active,
+    delimiter_received,
+    waiting_for_delimiter,
+    term_ack_sent,
+    term_req_sent1,
+    term_req_sent2
+} _state;
+```
+
+**Why 6 states?**
+1. Both ends may terminate simultaneously
+2. Delimiter may arrive before or after term command
+3. Must handle all timing combinations gracefully
+
+**Key termination behaviors:**
+- `delimiter_received`: Delimiter came first, waiting for term command
+- `waiting_for_delimiter`: Term came first, draining pending messages
+- `term_req_sent1/2`: Handles simultaneous termination from both sides
+
+**ZZMQ approach:** ZIO channel close semantics may simplify this, but we must ensure:
+- Pending messages are delivered before close completes (linger behavior)
+- Both ends coordinate cleanly regardless of close timing
+
+### Multipart Message Rollback
+
+**libzmq implementation** (`src/pipe.cpp:236-247`):
+```cpp
+void zmq::pipe_t::rollback () const
+{
+    msg_t msg;
+    if (_out_pipe) {
+        while (_out_pipe->unwrite (&msg)) {
+            zmq_assert (msg.flags () & msg_t::more);
+            const int rc = msg.close ();
+            errno_assert (rc == 0);
+        }
+    }
+}
+```
+
+**When rollback happens:**
+- Connection lost mid-multipart send
+- Termination requested mid-multipart
+- Send fails mid-multipart
+
+**ZZMQ must support:** Ability to "undo" partial multipart sends. With ZIO channels, may need to track multipart state separately.
+
+### Load Balancer Dropping Mode
+
+**libzmq implementation** (`src/lb.cpp:56-101`):
+```cpp
+int zmq::lb_t::sendpipe (msg_t *msg_, pipe_t **pipe_)
+{
+    // Drop the message if required
+    if (_dropping) {
+        _more = (msg_->flags () & msg_t::more) != 0;
+        _dropping = _more;
+        // ... drop message ...
+        return 0;
+    }
+
+    // If send fails mid-multipart
+    if (_more) {
+        _pipes[_current]->rollback ();
+        _dropping = (msg_->flags () & msg_t::more) != 0;
+        _more = false;
+        errno = EAGAIN;
+        return -2;  // Special error code
+    }
+```
+
+**Critical edge case:**
+- If pipe disconnects mid-multipart, enter "dropping mode"
+- Continue consuming frames until end of multipart (MORE=false)
+- Return success (0) even though messages dropped - for backward compatibility
+
+**ZZMQ must handle:** Track `_more` state in load balancer, handle mid-multipart disconnects gracefully.
+
+### Fair Queue Atomicity Assertion
+
+**libzmq implementation** (`src/fq.cpp:77-80`):
+```cpp
+//  Check the atomicity of the message.
+//  If we've already received the first part of the message
+//  we should get the remaining parts without blocking.
+zmq_assert (!_more);
+```
+
+**Invariant:** If we're mid-multipart recv, next read MUST succeed (pipe shouldn't be empty).
+
+**This assertion catches bugs** - if it fires, multipart atomicity was violated.
+
+### Session-Engine Lifecycle
+
+**Pipe creation timing** (`src/session_base.cpp:394-424`):
+```cpp
+void zmq::session_base_t::engine_ready ()
+{
+    // Pipe created AFTER handshake completes
+    if (!_pipe && !is_terminating ()) {
+        // Create pipe pair...
+    }
+}
+```
+
+**Key insight:** Pipe doesn't exist until handshake succeeds. This means:
+- No messages queued during handshake
+- Socket only sees connection after successful handshake
+- Failed handshakes don't create orphan pipes
+
+### Reconnection and Subscription Resend
+
+**libzmq implementation** (`src/session_base.cpp:576-582`):
+```cpp
+//  For subscriber sockets we hiccup the inbound pipe, which will cause
+//  the socket object to resend all the subscriptions.
+if (_pipe
+    && (options.type == ZMQ_SUB || options.type == ZMQ_XSUB
+        || options.type == ZMQ_DISH))
+    _pipe->hiccup ();
+```
+
+**Hiccup mechanism:**
+1. Creates new inbound pipe
+2. Notifies peer to switch to new pipe
+3. Triggers socket to resend subscriptions
+
+**Why needed:** After reconnect, the new PUB peer doesn't know our subscriptions.
+
+**ZZMQ must implement:** Track subscriptions in SUB socket, resend on reconnect.
+
+### Linger Timer
+
+**libzmq implementation** (`src/session_base.cpp:497-516`):
+```cpp
+if (linger_ > 0) {
+    zmq_assert (!_has_linger_timer);
+    add_timer (linger_, linger_timer_id);
+    _has_linger_timer = true;
+}
+// Pipe termination with delay
+_pipe->terminate (linger_ != 0);
+```
+
+**Linger semantics:**
+- `linger = -1`: Infinite wait for pending messages
+- `linger = 0`: Drop all pending messages immediately
+- `linger > 0`: Wait up to N ms for pending messages, then drop
+
+**Timer expiry** (`src/session_base.cpp:522-532`):
+```cpp
+void zmq::session_base_t::timer_event (int id_)
+{
+    zmq_assert (id_ == linger_timer_id);
+    _has_linger_timer = false;
+    _pipe->terminate (false);  // Force terminate, drop messages
+}
+```
+
+### Context Shutdown Coordination
+
+**Pending inproc connections** (`src/ctx.cpp:137-145`):
+```cpp
+// Connect up any pending inproc connections, otherwise we will hang
+pending_connections_t copy = _pending_connections;
+for (pending_connections_t::iterator p = copy.begin(); p != end; ++p) {
+    zmq::socket_base_t *s = create_socket (ZMQ_PAIR);
+    s->bind (p->first.c_str ());
+    s->close ();
+}
+```
+
+**Critical edge case:** If socket A calls `connect("inproc://foo")` but nothing ever binds, context shutdown would hang forever waiting for that connection. Solution: create temporary PAIR socket to satisfy pending connects.
+
+**ZZMQ must handle:** Track pending inproc connects, satisfy them on shutdown.
+
+### Active vs Passive Connections
+
+**libzmq session types** (`src/session_base.hpp:98-100`):
+```cpp
+//  If true, this session (re)connects to the peer.
+//  Otherwise, it's a transient session created by the listener.
+const bool _active;
+```
+
+**Behavior difference:**
+- Active (from `connect()`): Will reconnect on disconnect
+- Passive (from `accept()`): Destroyed on disconnect, no reconnect
+
+### Flush After Complete Message Only
+
+**libzmq implementation** (`src/lb.cpp:116-124`):
+```cpp
+_more = (msg_->flags () & msg_t::more) != 0;
+if (!_more) {
+    _pipes[_current]->flush ();  // Flush only on complete message
+    if (++_current >= _active)
+        _current = 0;  // Advance round-robin only on complete message
+}
+```
+
+**Why?**
+- Multipart must go to same pipe
+- Only advance round-robin after complete message
+- Only flush (signal peer) after complete message
+
+### Zero-Copy and Message Ownership
+
+**libzmq pattern** (`src/lb.cpp:126-128`):
+```cpp
+// Detach the message from the data buffer
+const int rc = msg_->init ();  // Resets msg to empty, caller loses data
+```
+
+**Ownership transfer:** After successful `send()`, caller's message is emptied. The pipe now owns the data.
+
+**ZZMQ must match:** Move semantics - sender loses ownership on successful send.
+
+### Engine Error Categories
+
+**libzmq error types** (`src/session_base.cpp:450-473`):
+```cpp
+zmq_assert (reason_ == i_engine::connection_error
+            || reason_ == i_engine::timeout_error
+            || reason_ == i_engine::protocol_error);
+
+switch (reason_) {
+    case i_engine::timeout_error:
+    case i_engine::connection_error:
+        if (_active) {
+            reconnect ();  // Active sessions reconnect
+            break;
+        }
+    case i_engine::protocol_error:
+        terminate ();  // Protocol errors always terminate
+```
+
+**Error handling rules:**
+- Connection/timeout errors on active session → reconnect
+- Connection/timeout errors on passive session → terminate
+- Protocol errors → always terminate (can't recover)
+
+### Summary: Critical ZZMQ Implementation Requirements
+
+1. **HWM counts complete messages**, not frames
+2. **Multipart must be atomic** - rollback partial sends, assert on partial recvs
+3. **Load balancer dropping mode** - consume remaining multipart frames silently
+4. **Subscriptions must be resent** on reconnect
+5. **Linger timer** controls message drain timeout
+6. **Pending inproc connects** must be satisfied on shutdown
+7. **Flush and round-robin advance** only after complete messages
+8. **Move semantics** - sender loses ownership after send
+9. **Protocol errors** always terminate, connection errors may reconnect
+
+---
+
 ## Implementation Roadmap
 
 ### Phase 1: Core Infrastructure
