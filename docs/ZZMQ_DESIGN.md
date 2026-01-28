@@ -257,6 +257,299 @@ The ZIO runtime handles all the complexity of efficient wakeup. We don't need to
 
 ---
 
+## ZIO Deep Dive: Actual APIs for ZZMQ
+
+This section documents the actual ZIO APIs we'll use, based on source code analysis of the ZIO library.
+
+### Channel API (`zio.sync.Channel`)
+
+ZIO channels are bounded FIFO queues with coroutine-aware blocking.
+
+```zig
+const Channel = @import("zio").sync.Channel;
+
+// Create channel with buffer (capacity = buffer.len = HWM)
+var buffer: [1000]Message = undefined;
+var channel = Channel(Message).init(&buffer);
+
+// Unbuffered channel (synchronous rendezvous)
+var unbuffered = Channel(Message).init(&.{});
+
+// Blocking operations (suspend coroutine if needed)
+try channel.send(rt, msg);           // Block if full
+const msg = try channel.receive(rt); // Block if empty
+
+// Non-blocking operations (return immediately)
+channel.trySend(msg) catch |err| switch (err) {
+    error.ChannelFull => {},   // Would block
+    error.ChannelClosed => {}, // Channel closed
+};
+
+const msg = channel.tryReceive() catch |err| switch (err) {
+    error.ChannelEmpty => {},  // Would block
+    error.ChannelClosed => {}, // Channel closed
+};
+
+// Check state (not atomic with operations!)
+if (channel.isEmpty()) { ... }
+if (channel.isFull()) { ... }
+
+// Close channel
+channel.close(.graceful);   // Allow draining buffered items
+channel.close(.immediate);  // Clear buffer, receivers get ChannelClosed
+```
+
+**Key Insight**: Channel uses `std.Thread.Mutex` internally, not lock-free. For ZZMQ, this is fine because:
+1. Each pipe is SPSC (single socket writes, single engine reads)
+2. Contention is rare (only when HWM triggers backpressure)
+3. The coroutine suspend/resume is the dominant cost, not the mutex
+
+### Select API (`zio.select`)
+
+Wait on multiple operations simultaneously (like Go's select).
+
+```zig
+const select = @import("zio").select;
+const Timeout = @import("zio").time.Timeout;
+
+// Create async operations for select
+var recv1 = channel1.asyncReceive();
+var recv2 = channel2.asyncReceive();
+var send_op = channel3.asyncSend(msg);
+
+// Select returns tagged union with winner's result
+const result = try select(rt, .{
+    .ch1 = &recv1,
+    .ch2 = &recv2,
+    .send = &send_op,
+    .timeout = Timeout{ .duration = Duration.fromMilliseconds(100) },
+});
+
+switch (result) {
+    .ch1 => |val| {
+        const msg = try val;  // val is error union!
+        // Handle message from ch1
+    },
+    .ch2 => |val| {
+        const msg = try val;
+        // Handle message from ch2
+    },
+    .send => |res| {
+        try res;  // Check if send succeeded
+    },
+    .timeout => {
+        // Timeout expired, no message received
+    },
+}
+```
+
+**Key Pattern for ZZMQ Fair Queue**:
+```zig
+fn selectFromPipes(pipes: []Pipe, rt: *Runtime, timeout: ?Duration) !Message {
+    // Build async receivers for all pipes
+    var receivers: [MAX_PIPES]Channel(Message).AsyncReceive = undefined;
+    for (pipes, 0..) |pipe, i| {
+        receivers[i] = pipe.inbound.asyncReceive();
+    }
+
+    // Use selectAwaitables for runtime-sized array
+    const awaitables = buildAwaitables(receivers[0..pipes.len]);
+    const winner_idx = try zio.selectAwaitables(rt, awaitables);
+
+    return receivers[winner_idx].getResult();
+}
+```
+
+### Time and Timeout API
+
+```zig
+const time = @import("zio").time;
+
+// Duration (stored as nanoseconds)
+const d1 = time.Duration.fromMilliseconds(100);
+const d2 = time.Duration.fromSeconds(5);
+const d3 = time.Duration.fromNanoseconds(1000);
+
+// Sleep current coroutine
+try rt.sleep(time.Duration.fromMilliseconds(100));
+
+// Timeout as a future (for select)
+const timeout = time.Timeout{ .duration = time.Duration.fromMilliseconds(100) };
+const no_timeout = time.Timeout.none;  // Wait forever
+
+// Timestamp (point in time)
+const now = time.os.now(.monotonic);
+const deadline = now.addDuration(d1);
+
+// Stopwatch for measuring elapsed time
+var stopwatch = time.Stopwatch.start();
+// ... do work ...
+const elapsed = stopwatch.read();
+```
+
+### Network API
+
+```zig
+const net = @import("zio").net;
+
+// TCP Client
+const stream = try net.tcpConnectToAddress(rt, address, .{});
+defer stream.close();
+
+const bytes_written = try stream.write(rt, data);
+const bytes_read = try stream.read(rt, &buffer);
+
+// TCP Server
+var server = try net.Server.init(address, .{ .backlog = 128 });
+defer server.close();
+
+while (true) {
+    const client_stream = try server.accept(rt);
+    try group.spawn(rt, handleClient, .{ rt, client_stream });
+}
+
+// Addresses
+const addr = net.IpAddress.parse("127.0.0.1", 5555);
+const any_addr = net.IpAddress.any(5555);  // 0.0.0.0:5555
+```
+
+### Runtime and Coroutine Management
+
+```zig
+const Runtime = @import("zio").Runtime;
+const Group = @import("zio").runtime.Group;
+
+// Initialize runtime
+const rt = try Runtime.init(allocator, .{});
+defer rt.deinit();
+
+// Spawn a coroutine
+var handle = try rt.spawn(myFunction, .{ arg1, arg2 });
+
+// Wait for result
+const result = try handle.join(rt);
+
+// Cancel a coroutine
+handle.cancel(rt);
+
+// Yield to other coroutines
+try rt.yield();
+
+// Group: manage multiple coroutines
+var group: Group = .init;
+defer group.cancel(rt);
+
+try group.spawn(rt, task1, .{});
+try group.spawn(rt, task2, .{});
+try group.spawn(rt, task3, .{});
+
+// Wait for all to complete
+try group.wait(rt);
+
+if (group.hasFailed()) {
+    // At least one task failed
+}
+```
+
+### io_uring Integration
+
+ZIO uses io_uring on Linux with optimized flags:
+- `IORING_SETUP_SINGLE_ISSUER` - Single thread submits (our model)
+- `IORING_SETUP_DEFER_TASKRUN` - Defer completion processing
+- `IORING_SETUP_COOP_TASKRUN` - Cooperative task running
+
+**Implications for ZZMQ**:
+1. Syscalls are automatically batched by io_uring
+2. Multiple network operations can be submitted in one syscall
+3. Falls back to epoll on older kernels, kqueue on macOS/BSD
+
+### ZZMQ-Specific Usage Patterns
+
+**Pattern 1: Engine Reader/Writer Pair**
+```zig
+pub fn runEngine(self: *Engine, rt: *Runtime) void {
+    var group: Group = .init;
+    defer group.cancel(rt);
+
+    try group.spawn(rt, readerLoop, .{ self, rt });
+    try group.spawn(rt, writerLoop, .{ self, rt });
+
+    group.wait(rt) catch {};
+}
+```
+
+**Pattern 2: Socket Send with Timeout**
+```zig
+pub fn sendWithTimeout(self: *Socket, rt: *Runtime, msg: Message, timeout_ms: u32) !void {
+    const pipe = self.selectPipeForSend();
+
+    var send_op = pipe.outbound.asyncSend(msg);
+    const result = try select(rt, .{
+        .send = &send_op,
+        .timeout = Timeout{ .duration = Duration.fromMilliseconds(timeout_ms) },
+    });
+
+    switch (result) {
+        .send => |res| try res,
+        .timeout => return error.Timeout,
+    }
+}
+```
+
+**Pattern 3: Fair Queue Receive**
+```zig
+pub fn recvFairQueue(self: *FairQueue, rt: *Runtime) !Message {
+    // Try non-blocking first (fast path)
+    while (self.active > 0) {
+        const pipe = self.pipes.items[self.current];
+        if (pipe.inbound.tryReceive()) |msg| {
+            self.current = (self.current + 1) % self.active;
+            return msg;
+        }
+        self.deactivatePipe(self.current);
+    }
+
+    // All empty - must wait (slow path)
+    // Re-activate all pipes and use select
+    self.reactivateAll();
+    return self.selectFromAllPipes(rt);
+}
+```
+
+**Pattern 4: Heartbeat Timer Loop**
+```zig
+fn heartbeatLoop(self: *Engine, rt: *Runtime) !void {
+    while (!self.terminated) {
+        try rt.sleep(Duration.fromMilliseconds(self.heartbeat_interval));
+
+        const now = time.os.now(.monotonic);
+        const since_recv = self.last_recv.durationTo(now);
+
+        if (since_recv.toMilliseconds() > self.heartbeat_timeout) {
+            return error.HeartbeatTimeout;
+        }
+
+        if (since_recv.toMilliseconds() > self.heartbeat_interval) {
+            try self.sendPing();
+        }
+    }
+}
+```
+
+### Design Corrections from ZIO Analysis
+
+Based on ZIO source analysis, here are corrections to earlier assumptions:
+
+| Original Assumption | Actual ZIO Behavior |
+|---------------------|---------------------|
+| Lock-free channels | Mutex-based (fine for SPSC) |
+| `zio.time.Timer` type | Use `Timeout` as select future |
+| `zio.select(&channels, timeout)` | `select(rt, .{ .name = future })` struct-based |
+| Implicit coroutine switching | Explicit `rt` parameter everywhere |
+| `channel.send(msg)` | `channel.send(rt, msg)` - needs runtime |
+
+---
+
 ## Architecture Overview
 
 ```
