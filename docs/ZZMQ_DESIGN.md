@@ -11,14 +11,21 @@ A high-performance messaging library implementing ZeroMQ semantics, built idioma
 5. [Message System](#message-system)
 6. [Socket Architecture](#socket-architecture)
 7. [Pipe System](#pipe-system)
-8. [Connection Management](#connection-management)
-9. [Transport Layer](#transport-layer)
-10. [Socket Patterns](#socket-patterns)
-11. [Options and Configuration](#options-and-configuration)
-12. [Error Handling](#error-handling)
-13. [API Design](#api-design)
-14. [Performance Analysis](#performance-analysis)
-15. [Implementation Roadmap](#implementation-roadmap)
+8. [Select and Multiplexing](#select-and-multiplexing)
+9. [Connection Management](#connection-management)
+10. [Transport Layer](#transport-layer)
+11. [ZMTP Codec](#zmtp-codec)
+12. [Socket Patterns](#socket-patterns)
+13. [Options and Configuration](#options-and-configuration)
+14. [Error Handling](#error-handling)
+15. [API Design](#api-design)
+16. [Performance Considerations](#performance-considerations)
+17. [Monitoring and Events](#monitoring-and-events)
+18. [libzmq Reference: Critical Behaviors](#libzmq-reference-critical-behaviors-and-edge-cases)
+19. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
+20. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
+21. [Implementation Roadmap](#implementation-roadmap)
+22. [Summary](#summary)
 
 ---
 
@@ -4286,6 +4293,457 @@ pub const Socket = struct {
 
 ---
 
+## libzmq Reference: Level vs Edge Triggering and Polling
+
+This section analyzes how libzmq handles event polling, the critical distinction between level-triggered and edge-triggered I/O, and the full polling API surface that ZZMQ must provide.
+
+### Level-Triggered vs Edge-Triggered I/O
+
+**Level-Triggered (libzmq's choice)**:
+- Event fires repeatedly as long as the condition exists (data available, buffer writable)
+- Simpler to use correctly - no risk of missing events
+- Requires explicit enable/disable to prevent spurious wakeups
+
+**Edge-Triggered**:
+- Event fires once when the condition changes
+- More efficient (fewer wakeups) but harder to use correctly
+- Must drain all data on each event or risk starvation
+
+**libzmq uses LEVEL-TRIGGERED mode** for all polling backends:
+
+```cpp
+// epoll.cpp - Note: NO EPOLLET flag, so level-triggered
+void zmq::epoll_t::set_pollin (handle_t handle_)
+{
+    pe->ev.events |= EPOLLIN;  // Just EPOLLIN, not EPOLLIN | EPOLLET
+    epoll_ctl (_epoll_fd, EPOLL_CTL_MOD, pe->fd, &pe->ev);
+}
+
+// kqueue.cpp - Note: NO EV_CLEAR flag, so level-triggered
+void zmq::kqueue_t::kevent_add (fd_t fd_, short filter_, void *udata_)
+{
+    EV_SET (&ev, fd_, filter_, EV_ADD, 0, 0, udata_);  // EV_ADD only, not EV_ADD | EV_CLEAR
+    kevent (kqueue_fd, &ev, 1, NULL, 0, NULL);
+}
+```
+
+### The set_pollin/reset_pollin Pattern
+
+To avoid wasteful repeated notifications with level-triggered I/O, libzmq manually enables/disables polling for each event:
+
+```cpp
+// stream_engine_base.cpp:307 - Disable read polling when backpressured
+if (rc == -1 && errno == EAGAIN) {
+    _input_stopped = true;
+    reset_pollin (_handle);  // Stop getting in_event() calls
+}
+
+// stream_engine_base.cpp:442 - Re-enable when ready
+if (!_input_stopped) {
+    set_pollin ();  // Resume getting in_event() calls
+}
+
+// stream_engine_base.cpp:350-354 - Disable write polling when nothing to send
+if (_outsize == 0) {
+    _output_stopped = true;
+    reset_pollout ();  // Stop getting out_event() calls
+}
+
+// stream_engine_base.cpp:388-391 - Re-enable when data available
+if (likely (_output_stopped)) {
+    set_pollout ();  // Resume getting out_event() calls
+    _output_stopped = false;
+}
+```
+
+This pattern simulates edge-triggered behavior on top of level-triggered I/O, giving libzmq precise control over event delivery.
+
+### Internal Poller Interface (poller_t concept)
+
+libzmq defines an internal poller interface that all backends must implement:
+
+```cpp
+// poller_base.hpp - The poller_t concept
+class poller_t {
+    // Add a file descriptor, returning a handle
+    handle_t add_fd(fd_t fd_, i_poll_events *events_);
+
+    // Remove a file descriptor
+    void rm_fd(handle_t handle_);
+
+    // Enable/disable input polling
+    void set_pollin(handle_t handle_);
+    void reset_pollin(handle_t handle_);
+
+    // Enable/disable output polling
+    void set_pollout(handle_t handle_);
+    void reset_pollout(handle_t handle_);
+
+    // Timer management
+    void add_timer(int timeout_, i_poll_events *sink_, int id_);
+    void cancel_timer(i_poll_events *sink_, int id_);
+
+    // Lifecycle
+    void start(const char *name = NULL);
+    void stop();
+
+    // Load tracking
+    int get_load() const;
+    static int max_fds();
+};
+
+// Event handler interface
+struct i_poll_events {
+    virtual void in_event() = 0;   // Called when readable
+    virtual void out_event() = 0;  // Called when writable
+    virtual void timer_event(int id_) = 0;  // Called when timer fires
+};
+```
+
+### User-Facing Polling APIs
+
+libzmq provides two user-facing polling APIs:
+
+#### 1. zmq_poll (Legacy, simpler)
+
+```c
+// Poll multiple sockets/fds at once
+typedef struct {
+    void *socket;      // ZMQ socket (or NULL for raw fd)
+    int fd;            // Raw file descriptor (if socket is NULL)
+    short events;      // ZMQ_POLLIN | ZMQ_POLLOUT | ZMQ_POLLERR | ZMQ_POLLPRI
+    short revents;     // Output: which events occurred
+} zmq_pollitem_t;
+
+int zmq_poll(zmq_pollitem_t *items, int nitems, long timeout);
+// Returns: number of ready items, or -1 on error
+// Timeout: -1 = block forever, 0 = return immediately, >0 = milliseconds
+
+// Example usage:
+zmq_pollitem_t items[2] = {
+    { socket1, 0, ZMQ_POLLIN, 0 },
+    { socket2, 0, ZMQ_POLLIN | ZMQ_POLLOUT, 0 }
+};
+int rc = zmq_poll(items, 2, 1000);  // Wait up to 1 second
+if (items[0].revents & ZMQ_POLLIN) { /* socket1 readable */ }
+if (items[1].revents & ZMQ_POLLOUT) { /* socket2 writable */ }
+```
+
+#### 2. zmq_poller (Modern, more flexible)
+
+```c
+// Create/destroy poller
+void *zmq_poller_new(void);
+int zmq_poller_destroy(void **poller_p);
+
+// Add/modify/remove sockets
+int zmq_poller_add(void *poller, void *socket, void *user_data, short events);
+int zmq_poller_modify(void *poller, void *socket, short events);
+int zmq_poller_remove(void *poller, void *socket);
+
+// Add/modify/remove raw file descriptors
+int zmq_poller_add_fd(void *poller, int fd, void *user_data, short events);
+int zmq_poller_modify_fd(void *poller, int fd, short events);
+int zmq_poller_remove_fd(void *poller, int fd);
+
+// Wait for events
+int zmq_poller_wait(void *poller, zmq_poller_event_t *event, long timeout);
+int zmq_poller_wait_all(void *poller, zmq_poller_event_t *events, int n_events, long timeout);
+
+// Get internal fd for external event loops
+int zmq_poller_fd(void *poller, int *fd);
+
+// Event structure
+typedef struct {
+    void *socket;      // The ZMQ socket (or NULL for raw fd)
+    int fd;            // The raw fd (if socket is NULL)
+    void *user_data;   // User data passed to add
+    short events;      // Which events occurred
+} zmq_poller_event_t;
+
+// Example usage:
+void *poller = zmq_poller_new();
+zmq_poller_add(poller, socket1, (void*)"socket1", ZMQ_POLLIN);
+zmq_poller_add(poller, socket2, (void*)"socket2", ZMQ_POLLIN | ZMQ_POLLOUT);
+
+zmq_poller_event_t events[10];
+int n = zmq_poller_wait_all(poller, events, 10, 1000);
+for (int i = 0; i < n; i++) {
+    printf("Socket %s ready for %s\n",
+           (char*)events[i].user_data,
+           events[i].events & ZMQ_POLLIN ? "read" : "write");
+}
+zmq_poller_destroy(&poller);
+```
+
+### ZMQ_FD Socket Option
+
+Each ZMQ socket exposes an internal file descriptor for integration with external event loops:
+
+```c
+// Get the socket's signaling fd
+int fd;
+size_t fd_size = sizeof(fd);
+zmq_getsockopt(socket, ZMQ_FD, &fd, &fd_size);
+
+// IMPORTANT: ZMQ_FD becomes readable when ZMQ_EVENTS changes
+// You must ALWAYS check ZMQ_EVENTS after ZMQ_FD signals readiness
+int events;
+size_t events_size = sizeof(events);
+zmq_getsockopt(socket, ZMQ_EVENTS, &events, &events_size);
+if (events & ZMQ_POLLIN) { /* Actually readable */ }
+if (events & ZMQ_POLLOUT) { /* Actually writable */ }
+```
+
+This two-step check is required because:
+1. ZMQ_FD signals "something changed" not "specific event ready"
+2. Multiple sockets may share internal I/O threads
+3. The event may have been consumed between signal and check
+
+### ZMQ_EVENTS Socket Option
+
+Returns the current readiness state of a socket:
+
+```c
+int events;
+size_t events_size = sizeof(events);
+zmq_getsockopt(socket, ZMQ_EVENTS, &events, &events_size);
+
+// events is a bitmask:
+// ZMQ_POLLIN  - socket has messages ready to receive
+// ZMQ_POLLOUT - socket is ready to send (not at HWM)
+```
+
+Implementation in socket_base.cpp:
+
+```cpp
+int zmq::socket_base_t::getsockopt (int option_, void *optval_, size_t *optvallen_)
+{
+    if (option_ == ZMQ_EVENTS) {
+        *value = 0;
+        if (has_in())
+            *value |= ZMQ_POLLIN;
+        if (has_out())
+            *value |= ZMQ_POLLOUT;
+        return 0;
+    }
+}
+```
+
+### Thread-Safe Sockets and Signaling
+
+Thread-safe sockets (SERVER, CLIENT, RADIO, DISH, GATHER, SCATTER, DGRAM, PEER, CHANNEL) use a different signaling mechanism:
+
+```cpp
+// socket_poller.cpp:95-111
+if (is_thread_safe (*socket_)) {
+    if (_signaler == NULL) {
+        _signaler = new signaler_t();
+    }
+    socket_->add_signaler (_signaler);  // Socket signals this when events change
+}
+
+// check_events then queries each socket directly:
+if (it->socket->getsockopt (ZMQ_EVENTS, &events, &events_size) == -1) {
+    return -1;
+}
+```
+
+### ZZMQ Polling Design
+
+For ZZMQ with ZIO, we leverage ZIO's native polling capabilities:
+
+```zig
+/// User-facing poll item
+pub const PollItem = struct {
+    socket: ?*Socket = null,    // ZZMQ socket
+    fd: ?std.posix.fd_t = null, // Raw fd (if socket is null)
+    events: Events = .{},       // Requested events
+    revents: Events = .{},      // Returned events
+    user_data: ?*anyopaque = null,
+
+    pub const Events = packed struct {
+        pollin: bool = false,
+        pollout: bool = false,
+        pollerr: bool = false,
+        pollpri: bool = false,
+    };
+};
+
+/// zmq_poll equivalent - poll multiple sockets/fds
+pub fn poll(items: []PollItem, timeout_ms: ?i64) !usize {
+    // For ZMQ sockets: check readiness directly
+    // For raw fds: use ZIO's I/O abstraction
+
+    var ready_count: usize = 0;
+
+    // First pass: check if any sockets are immediately ready
+    for (items) |*item| {
+        item.revents = .{};
+        if (item.socket) |socket| {
+            const events = socket.getEvents();
+            if (item.events.pollin and events.pollin) {
+                item.revents.pollin = true;
+                ready_count += 1;
+            }
+            if (item.events.pollout and events.pollout) {
+                item.revents.pollout = true;
+                ready_count += 1;
+            }
+        }
+    }
+
+    if (ready_count > 0 or timeout_ms == 0) {
+        return ready_count;
+    }
+
+    // Need to wait - use ZIO's select mechanism
+    const deadline = if (timeout_ms) |t|
+        zio.time.Instant.now().add(.{ .ms = t })
+    else
+        null;
+
+    return zzmq_poll_wait(items, deadline);
+}
+
+/// Modern zmq_poller equivalent
+pub const Poller = struct {
+    items: std.ArrayList(PollItem),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Poller {
+        return .{
+            .items = std.ArrayList(PollItem).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Poller) void {
+        self.items.deinit();
+    }
+
+    pub fn add(self: *Poller, socket: *Socket, user_data: ?*anyopaque, events: PollItem.Events) !void {
+        try self.items.append(.{
+            .socket = socket,
+            .user_data = user_data,
+            .events = events,
+        });
+    }
+
+    pub fn addFd(self: *Poller, fd: std.posix.fd_t, user_data: ?*anyopaque, events: PollItem.Events) !void {
+        try self.items.append(.{
+            .fd = fd,
+            .user_data = user_data,
+            .events = events,
+        });
+    }
+
+    pub fn modify(self: *Poller, socket: *Socket, events: PollItem.Events) !void {
+        for (self.items.items) |*item| {
+            if (item.socket == socket) {
+                item.events = events;
+                return;
+            }
+        }
+        return error.NotFound;
+    }
+
+    pub fn remove(self: *Poller, socket: *Socket) !void {
+        for (self.items.items, 0..) |item, i| {
+            if (item.socket == socket) {
+                _ = self.items.orderedRemove(i);
+                return;
+            }
+        }
+        return error.NotFound;
+    }
+
+    pub fn wait(self: *Poller, events: []PollItem, timeout_ms: ?i64) !usize {
+        return poll(self.items.items, timeout_ms);
+    }
+};
+
+/// Socket.getEvents() - equivalent to ZMQ_EVENTS getsockopt
+pub fn getEvents(self: *Socket) PollItem.Events {
+    return .{
+        .pollin = self.hasIn(),
+        .pollout = self.hasOut(),
+    };
+}
+
+/// Socket.getFd() - equivalent to ZMQ_FD getsockopt
+/// Returns fd that signals when socket events change
+pub fn getFd(self: *Socket) !std.posix.fd_t {
+    // Return the read end of an internal signaling pipe/eventfd
+    return self.event_signaler.getReadFd();
+}
+```
+
+### ZIO's Native Polling Advantage
+
+ZIO already handles I/O readiness internally. For ZZMQ:
+
+```zig
+/// ZIO-native way to wait for socket readiness
+pub fn waitReadable(self: *Socket) !void {
+    // ZIO handles this through channel operations
+    // When receiving, the coroutine suspends until data is available
+    // No explicit polling needed for single-socket operations
+}
+
+/// For multi-socket operations, use select
+pub fn selectReadable(sockets: []*Socket, timeout: ?zio.time.Duration) !?*Socket {
+    // Build list of channels to wait on
+    var channels: [sockets.len]anyframe = undefined;
+    for (sockets, 0..) |s, i| {
+        channels[i] = s.getReadFrame();
+    }
+
+    // ZIO select - returns which channel became ready
+    const ready_idx = zio.select(&channels, timeout) orelse return null;
+    return sockets[ready_idx];
+}
+```
+
+### Internal vs External Event Loop Integration
+
+**Scenario 1: ZZMQ as the event loop (typical)**
+```zig
+// Simple blocking API - ZIO handles scheduling
+const msg = try socket.recv();  // Suspends coroutine until ready
+try socket.send(response);      // Suspends if would block
+```
+
+**Scenario 2: External event loop integration**
+```zig
+// Get signaling fd for external loop (e.g., libuv, Qt)
+const fd = try socket.getFd();
+
+// External loop:
+// when fd becomes readable {
+    const events = socket.getEvents();
+    if (events.pollin) {
+        // Non-blocking recv since we know it's ready
+        const msg = try socket.recvNoWait();
+    }
+// }
+```
+
+### Summary: ZZMQ Polling Requirements
+
+| libzmq Feature | ZZMQ Approach |
+|---------------|---------------|
+| Level-triggered epoll/kqueue | ZIO handles backend selection automatically |
+| set_pollin/reset_pollin | ZIO channels manage readiness internally |
+| zmq_poll() | `zzmq.poll()` function with PollItem array |
+| zmq_poller_* API | `zzmq.Poller` struct |
+| ZMQ_FD | `socket.getFd()` for external loop integration |
+| ZMQ_EVENTS | `socket.getEvents()` returns current readiness |
+| Thread-safe signaling | Event signaler per socket |
+| Timer integration | ZIO timer integration in poll/select |
+
+---
+
 ## Implementation Roadmap
 
 ### Phase 1: Core Infrastructure
@@ -4293,12 +4751,15 @@ pub const Socket = struct {
 - [ ] Context and socket lifecycle
 - [ ] Pipe with zio.Channel
 - [ ] Basic PUSH/PULL patterns
+- [ ] Polling API (`poll()` and `Poller`)
+- [ ] Socket readiness (`hasIn()`, `hasOut()`, `getEvents()`)
 
 ### Phase 2: Network Transport
 - [ ] TCP transport (connect/listen)
 - [ ] Engine with reader/writer coroutines
 - [ ] ZMTP codec (minimal: greeting, message frames)
 - [ ] Reconnection logic
+- [ ] `getFd()` for external event loop integration
 
 ### Phase 3: More Patterns
 - [ ] PUB/SUB with subscriptions
@@ -4315,6 +4776,7 @@ pub const Socket = struct {
 - [ ] Inproc transport
 - [ ] Socket monitoring
 - [ ] CURVE security (optional)
+- [ ] Thread-safe socket signaling
 
 ---
 
@@ -4327,8 +4789,9 @@ ZZMQ provides ZeroMQ semantics on Zig/ZIO by:
 3. **Pattern-specific logic**: Traits for PUSH/PULL/PUB/SUB/etc.
 4. **Reference-counted messages**: Zero-copy fan-out
 5. **Blocking API backed by async**: Natural code, efficient execution
+6. **Level-triggered polling via ZIO**: Compatible poll/poller APIs with external event loop integration
 
 The design prioritizes:
 - Simplicity (ZIO does the hard work)
 - Performance (minimal copies, efficient scheduling)
-- Compatibility (libzmq semantics, ZMTP wire protocol)
+- Compatibility (libzmq semantics, ZMTP wire protocol, polling APIs)
