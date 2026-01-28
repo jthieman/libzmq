@@ -1078,35 +1078,413 @@ pub const Pipe = struct {
 pub const PipeId = u32;
 ```
 
-### Channel Backpressure = HWM
+### High Water Mark (HWM) - Comprehensive Design
 
-The key insight: `zio.Channel(Message)` with bounded capacity naturally implements HWM:
+HWM is one of the most critical ZMQ semantics. This section details how ZZMQ implements HWM to match libzmq behavior.
+
+#### libzmq HWM Reference
+
+From `src/pipe.cpp:533-538`:
+```cpp
+bool zmq::pipe_t::check_hwm () const
+{
+    const bool full =
+      _hwm > 0 && _msgs_written - _peers_msgs_read >= uint64_t (_hwm);
+    return !full;
+}
+```
+
+Key libzmq behaviors:
+- Default HWM = 1000 (`src/options.cpp:168`)
+- HWM = 0 means **unlimited** (never blocks)
+- Inproc: HWM = sender's sndhwm + receiver's rcvhwm
+- TCP/IPC: Each side uses its own HWMs independently
+- HWM counts **complete messages**, not frames
+
+#### HWM Type Definition
 
 ```zig
-// Create pipe with HWM
-fn createPipe(allocator: std.mem.Allocator, options: PipeOptions) !*Pipe {
-    // Allocate channel buffers
-    const outbound_buf = try allocator.alloc(Message, options.send_hwm);
-    const inbound_buf = try allocator.alloc(Message, options.recv_hwm);
+/// High water mark value
+/// null = unlimited (0 in libzmq)
+/// value = bounded capacity
+pub const Hwm = ?u32;
+
+pub const HwmDefaults = struct {
+    pub const send: Hwm = 1000;
+    pub const recv: Hwm = 1000;
+};
+
+/// Convert libzmq-style HWM (0 = unlimited) to ZZMQ
+pub fn fromLibzmq(value: i32) Hwm {
+    return if (value <= 0) null else @intCast(value);
+}
+
+/// Convert ZZMQ HWM to libzmq-style
+pub fn toLibzmq(hwm: Hwm) i32 {
+    return hwm orelse 0;
+}
+```
+
+#### Channel Capacity from HWM
+
+```zig
+/// Calculate effective channel capacity
+/// For unlimited HWM, we use a large but finite buffer
+fn hwmToCapacity(hwm: Hwm) usize {
+    return hwm orelse std.math.maxInt(u32);  // ~4 billion for "unlimited"
+}
+
+/// Alternative: truly unbounded using growable buffer
+/// (but this loses backpressure guarantees)
+```
+
+**Design decision**: Even "unlimited" HWM uses a large finite buffer. This prevents:
+- Memory exhaustion from runaway producers
+- Provides eventual backpressure at extreme scales
+- Matches practical libzmq behavior (memory is finite)
+
+#### Inproc HWM Calculation
+
+From `src/socket_base.cpp:785-794`:
+```cpp
+// The total HWM for an inproc connection should be the sum of
+// the binder's HWM and the connector's HWM.
+const int sndhwm = peer.socket == NULL ? options.sndhwm
+                   : options.sndhwm != 0 && peer.options.rcvhwm != 0
+                     ? options.sndhwm + peer.options.rcvhwm
+                     : 0;
+```
+
+**ZZMQ implementation:**
+
+```zig
+/// Calculate effective HWM for inproc connection
+/// libzmq sums both sides; if either is unlimited, total is unlimited
+fn calculateInprocHwm(
+    connector_send: Hwm,
+    binder_recv: Hwm,
+) Hwm {
+    // If either side is unlimited, total is unlimited
+    if (connector_send == null or binder_recv == null) {
+        return null;  // unlimited
+    }
+    // Sum both sides
+    return connector_send.? + binder_recv.?;
+}
+
+/// Create pipe pair for inproc connection
+fn createInprocPipePair(
+    allocator: std.mem.Allocator,
+    connector_opts: *const SocketOptions,
+    binder_opts: *const SocketOptions,
+) !struct { connector_pipe: *Pipe, binder_pipe: *Pipe } {
+    // Direction: connector → binder
+    const c2b_hwm = calculateInprocHwm(
+        connector_opts.send_hwm,
+        binder_opts.recv_hwm,
+    );
+
+    // Direction: binder → connector
+    const b2c_hwm = calculateInprocHwm(
+        binder_opts.send_hwm,
+        connector_opts.recv_hwm,
+    );
+
+    // Create channels with calculated capacities
+    const c2b_cap = hwmToCapacity(c2b_hwm);
+    const b2c_cap = hwmToCapacity(b2c_hwm);
+
+    const c2b_buf = try allocator.alloc(Message, c2b_cap);
+    const b2c_buf = try allocator.alloc(Message, b2c_cap);
+
+    // Connector's pipe: outbound=c2b, inbound=b2c
+    const connector_pipe = try allocator.create(Pipe);
+    connector_pipe.* = .{
+        .outbound = zio.Channel(Message).init(c2b_buf),
+        .inbound = zio.Channel(Message).init(b2c_buf),
+        .effective_send_hwm = c2b_hwm,
+        .effective_recv_hwm = b2c_hwm,
+        // Track peer's HWM for dynamic updates
+        .peer_send_hwm = binder_opts.send_hwm,
+        .peer_recv_hwm = binder_opts.recv_hwm,
+    };
+
+    // Binder's pipe: shares same channels, reversed direction
+    const binder_pipe = try allocator.create(Pipe);
+    binder_pipe.* = .{
+        .outbound = zio.Channel(Message).init(b2c_buf),
+        .inbound = zio.Channel(Message).init(c2b_buf),
+        .effective_send_hwm = b2c_hwm,
+        .effective_recv_hwm = c2b_hwm,
+        .peer_send_hwm = connector_opts.send_hwm,
+        .peer_recv_hwm = connector_opts.recv_hwm,
+    };
+
+    return .{ .connector_pipe = connector_pipe, .binder_pipe = binder_pipe };
+}
+```
+
+#### TCP/IPC HWM (Non-Inproc)
+
+For TCP connections, each side uses its own HWM independently:
+
+```zig
+/// Create pipe for TCP/IPC connection
+/// Each side uses its own HWM (no summing)
+fn createTcpPipe(
+    allocator: std.mem.Allocator,
+    options: *const SocketOptions,
+) !*Pipe {
+    const send_cap = hwmToCapacity(options.send_hwm);
+    const recv_cap = hwmToCapacity(options.recv_hwm);
+
+    const send_buf = try allocator.alloc(Message, send_cap);
+    const recv_buf = try allocator.alloc(Message, recv_cap);
 
     const pipe = try allocator.create(Pipe);
     pipe.* = .{
-        .id = generatePipeId(),
-        .outbound = zio.Channel(Message).init(outbound_buf),
-        .inbound = zio.Channel(Message).init(inbound_buf),
-        // ...
+        .outbound = zio.Channel(Message).init(send_buf),
+        .inbound = zio.Channel(Message).init(recv_buf),
+        .effective_send_hwm = options.send_hwm,
+        .effective_recv_hwm = options.recv_hwm,
+        .peer_send_hwm = null,  // Unknown for TCP
+        .peer_recv_hwm = null,
     };
 
     return pipe;
 }
 ```
 
-When a socket calls `pipe.write()`:
-1. If channel has space → immediate write, coroutine continues
-2. If channel full (HWM reached) → coroutine suspends until engine drains
-3. If `trySend` used → returns false immediately when full
+#### HWM Counts Complete Messages, Not Frames
 
-This matches libzmq's HWM semantics exactly, but using ZIO's cooperative scheduling instead of lock-free queues + signaling.
+**Critical semantic**: A 10-frame multipart message counts as ONE message for HWM.
+
+From libzmq `src/pipe.cpp:198-199`:
+```cpp
+if (!(msg_->flags () & msg_t::more) && !msg_->is_routing_id ())
+    _msgs_read++;
+```
+
+**ZZMQ implementation:**
+
+```zig
+pub const Pipe = struct {
+    outbound: *zio.Channel(Message),
+    inbound: *zio.Channel(Message),
+
+    /// Track messages written (for HWM, not frames)
+    msgs_written: u64 = 0,
+
+    /// Messages in current multipart (not counted until complete)
+    pending_multipart_count: u32 = 0,
+
+    /// Write message to pipe, respecting multipart HWM semantics
+    pub fn write(self: *Pipe, msg: Message, rt: *zio.Runtime) !void {
+        // Always write to channel (channel enforces backpressure)
+        try self.outbound.send(rt, msg);
+
+        // Track for HWM: only count complete messages
+        if (msg.flags.more) {
+            // Part of multipart - don't count yet
+            self.pending_multipart_count += 1;
+        } else {
+            // End of message (single or multipart)
+            // This counts as ONE message for HWM
+            self.msgs_written += 1;
+            self.pending_multipart_count = 0;
+        }
+    }
+
+    /// Check if HWM allows writing
+    /// Note: This is for patterns that need to check before writing
+    pub fn canWrite(self: *Pipe) bool {
+        // If unlimited HWM, always writable
+        if (self.effective_send_hwm == null) return true;
+
+        // Check channel capacity
+        return !self.outbound.isFull();
+    }
+};
+```
+
+**Important**: The channel itself provides frame-level backpressure. The `msgs_written` counter is for statistics and compatibility, but the actual HWM enforcement happens at the channel level. Since multipart messages are written atomically (all frames or none), this works correctly.
+
+#### Dynamic HWM Updates
+
+libzmq allows changing HWM via `setsockopt` after connections exist:
+
+From `src/socket_base.cpp:1586-1588`:
+```cpp
+for (pipes_t::size_type i = 0; i != size; ++i) {
+    _pipes[i]->set_hwms (options.rcvhwm, options.sndhwm);
+    _pipes[i]->send_hwms_to_peer (options.sndhwm, options.rcvhwm);
+}
+```
+
+**ZZMQ challenge**: ZIO channels have fixed capacity at creation. Options:
+
+1. **Recreate channel** (disruptive, loses messages)
+2. **Track logical HWM separately** (channel may be larger than HWM)
+3. **Disallow dynamic HWM changes** (deviation from libzmq)
+
+**ZZMQ approach**: Track logical HWM separately from channel capacity:
+
+```zig
+pub const Pipe = struct {
+    outbound: *zio.Channel(Message),
+
+    /// Physical channel capacity (immutable)
+    channel_capacity: usize,
+
+    /// Logical HWM (can be changed dynamically)
+    effective_send_hwm: Hwm,
+
+    /// For inproc: peer's HWM for boost calculation
+    peer_recv_hwm: Hwm,
+
+    /// Check if logical HWM allows writing
+    pub fn checkLogicalHwm(self: *Pipe) bool {
+        const hwm = self.effective_send_hwm orelse return true;
+
+        // Count messages in channel (not frames)
+        // This requires tracking or counting
+        return self.outstandingMessages() < hwm;
+    }
+
+    /// Update HWM dynamically (for setsockopt)
+    pub fn setHwm(self: *Pipe, new_hwm: Hwm) void {
+        self.effective_send_hwm = new_hwm;
+        // Note: If new HWM > channel_capacity, we're limited by channel
+        // If new HWM < channel_capacity, logical HWM takes effect
+    }
+
+    /// Update peer's HWM (received via command from peer)
+    pub fn setPeerHwm(self: *Pipe, peer_send: Hwm, peer_recv: Hwm) void {
+        self.peer_recv_hwm = peer_recv;
+        // Recalculate effective HWM for inproc
+        self.effective_send_hwm = calculateInprocHwm(
+            self.local_send_hwm,
+            peer_recv,
+        );
+    }
+};
+```
+
+#### Conflate Mode (ZMQ_CONFLATE)
+
+libzmq's conflate mode keeps only the latest message, dropping older ones:
+
+From `src/pipe.cpp:26-27`:
+```cpp
+if (conflate_[0])
+    upipe1 = new (std::nothrow) ypipe_conflate_t ();
+```
+
+**ZZMQ implementation:**
+
+```zig
+/// Conflating channel - keeps only latest message
+pub fn ConflatingChannel(comptime T: type) type {
+    return struct {
+        latest: ?T = null,
+        mutex: std.Thread.Mutex = .{},
+        has_value: std.Thread.Condition = .{},
+        closed: bool = false,
+
+        const Self = @This();
+
+        /// Send overwrites any existing value
+        pub fn send(self: *Self, rt: *zio.Runtime, value: T) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.closed) return error.ChannelClosed;
+
+            // Drop old value if exists
+            if (self.latest) |*old| {
+                old.deinit();
+            }
+
+            self.latest = value;
+            self.has_value.signal();
+        }
+
+        /// Receive gets latest value (waits if none)
+        pub fn receive(self: *Self, rt: *zio.Runtime) !T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (self.latest == null and !self.closed) {
+                // Suspend via ZIO
+                self.has_value.wait(&self.mutex);
+            }
+
+            if (self.latest) |value| {
+                self.latest = null;
+                return value;
+            }
+
+            return error.ChannelClosed;
+        }
+    };
+}
+
+/// Create pipe with conflate support
+fn createPipe(
+    allocator: std.mem.Allocator,
+    options: *const SocketOptions,
+) !*Pipe {
+    if (options.conflate) {
+        // Conflating channels (capacity 1, overwrites)
+        return createConflatePipe(allocator);
+    } else {
+        // Normal bounded channels
+        return createNormalPipe(allocator, options);
+    }
+}
+```
+
+#### HWM Behavior Summary
+
+| Scenario | libzmq Behavior | ZZMQ Implementation |
+|----------|-----------------|---------------------|
+| Default HWM | 1000 | `HwmDefaults.send = 1000` |
+| HWM = 0 | Unlimited | `Hwm = null` |
+| Inproc HWM | Sum of both sides | `calculateInprocHwm()` |
+| TCP HWM | Each side independent | Use socket's own HWM |
+| HWM counting | Complete messages only | Track `msgs_written` on !more |
+| Dynamic HWM | Update via command | `setHwm()` + command to peer |
+| Conflate mode | Keep only latest | `ConflatingChannel` |
+| Either side unlimited | Total unlimited | `null` propagates |
+
+#### Backpressure Flow
+
+```
+Socket.send()
+    │
+    ▼
+Pattern.send() ─── check canWrite() for pattern-specific logic
+    │
+    ▼
+Pipe.write()
+    │
+    ├── Channel has space? ─── Yes ──► Immediate write
+    │           │
+    │          No (HWM)
+    │           │
+    │           ▼
+    │   Coroutine suspends
+    │           │
+    │   Engine drains channel
+    │           │
+    │   Channel signals space
+    │           │
+    │   Coroutine resumes
+    │           │
+    └───────────┴──────────► Write completes
+```
+
+This matches libzmq's HWM semantics using ZIO's cooperative scheduling instead of lock-free queues + signaling.
 
 ---
 
