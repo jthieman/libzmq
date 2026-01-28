@@ -3764,6 +3764,528 @@ switch (reason_) {
 
 ---
 
+## libzmq Reference: Signaling, Connection, Readiness, Heartbeat, Disconnect
+
+This section documents libzmq's mechanisms for these critical behaviors.
+
+### Signaling (signaler_t, mailbox_t)
+
+libzmq uses a signaler + command queue pattern for cross-thread communication.
+
+**signaler_t** (`src/signaler.cpp`):
+```cpp
+// Uses socketpair (or eventfd on Linux)
+zmq::signaler_t::signaler_t () {
+    make_fdpair (&_r, &_w);  // Create read/write fd pair
+    unblock_socket (_w);
+    unblock_socket (_r);
+}
+
+void zmq::signaler_t::send () {
+    unsigned char dummy = 0;
+    ::send (_w, &dummy, sizeof (dummy), 0);  // Wake up receiver
+}
+
+void zmq::signaler_t::recv () {
+    unsigned char dummy;
+    ::recv (_r, &dummy, sizeof (dummy), 0);  // Consume signal
+}
+```
+
+**mailbox_t** (`src/mailbox.cpp`) - combines signaler with command queue:
+```cpp
+void zmq::mailbox_t::send (const command_t &cmd_) {
+    _sync.lock ();
+    _cpipe.write (cmd_, false);
+    const bool ok = _cpipe.flush ();  // Returns false if reader was idle
+    _sync.unlock ();
+    if (!ok)
+        _signaler.send ();  // Only signal if reader was waiting
+}
+
+int zmq::mailbox_t::recv (command_t *cmd_, int timeout_) {
+    if (_active) {
+        if (_cpipe.read (cmd_))
+            return 0;  // Fast path: direct read
+        _active = false;  // No more commands, go passive
+    }
+
+    _signaler.wait (timeout_);  // Wait for signal
+    _signaler.recv ();          // Consume signal
+    _active = true;             // Now we can read again
+
+    _cpipe.read (cmd_);
+    return 0;
+}
+```
+
+**Key insight**: Signal is only sent when transitioning from idle to active. This minimizes syscalls when commands flow continuously.
+
+**ZZMQ approach**: With ZIO, coroutines suspend/resume without explicit signaling. ZIO channels handle this automatically.
+
+### Connection Lifecycle
+
+**TCP Connect** (`src/stream_connecter_base.cpp`):
+```
+process_plug()
+    |-- delayed_start? -> add_reconnect_timer()
+    +-- immediate      -> start_connecting()
+
+start_connecting()
+    |-- Create socket
+    |-- connect() (non-blocking)
+    +-- Register for poll
+
+out_event() [connection complete]
+    |-- Check getsockopt(SO_ERROR)
+    |-- create_engine() -> zmtp_engine_t
+    |-- send_attach() to session
+    +-- terminate() connecter (job done)
+```
+
+**Reconnect with Exponential Backoff** (`src/stream_connecter_base.cpp:86-114`):
+```cpp
+int zmq::stream_connecter_base_t::get_new_reconnect_ivl () {
+    if (options.reconnect_ivl_max > 0) {
+        // Exponential backoff with cap
+        if (_current_reconnect_ivl == -1)
+            candidate_interval = options.reconnect_ivl;
+        else
+            candidate_interval = _current_reconnect_ivl * 2;
+
+        if (candidate_interval > options.reconnect_ivl_max)
+            _current_reconnect_ivl = options.reconnect_ivl_max;
+        else
+            _current_reconnect_ivl = candidate_interval;
+    } else {
+        // Base interval + random jitter
+        const int random_jitter = generate_random () % options.reconnect_ivl;
+        interval = _current_reconnect_ivl + random_jitter;
+    }
+}
+```
+
+**Inproc Pending Connections** (`src/ctx.cpp:739-775`):
+```cpp
+// When connect() called before bind()
+void zmq::ctx_t::pend_connection (...) {
+    if (_endpoints.find (addr_) == _endpoints.end ()) {
+        // No bind yet - store for later
+        _pending_connections.insert (addr_, pending_connection);
+    } else {
+        // Bind exists - connect immediately
+        connect_inproc_sockets (...);
+    }
+}
+
+// When bind() called with pending connects
+void zmq::ctx_t::connect_pending (...) {
+    for (auto& pending : _pending_connections.equal_range (addr_)) {
+        connect_inproc_sockets (bind_socket_, pending);
+    }
+    _pending_connections.erase (addr_);
+}
+```
+
+**ZZMQ implementation:**
+
+```zig
+pub const ConnectionManager = struct {
+    /// Active connections by endpoint
+    connections: std.StringHashMap(*Connection),
+
+    /// Pending inproc connects (waiting for bind)
+    pending_inproc: std.StringHashMap(PendingConnect),
+
+    /// Reconnect backoff state
+    reconnect_ivl: i64,
+    reconnect_ivl_max: i64,
+    current_reconnect_ivl: i64 = -1,
+
+    pub fn connect(self: *ConnectionManager, uri: []const u8, rt: *zio.Runtime) !void {
+        const parsed = try parseUri(uri);
+
+        if (parsed.protocol == .inproc) {
+            return self.connectInproc(parsed.path, rt);
+        }
+
+        // TCP/IPC: Start async connect
+        try self.startTcpConnect(parsed, rt);
+    }
+
+    fn getNextReconnectInterval(self: *ConnectionManager) i64 {
+        if (self.reconnect_ivl_max > 0) {
+            // Exponential backoff
+            if (self.current_reconnect_ivl == -1) {
+                self.current_reconnect_ivl = self.reconnect_ivl;
+            } else {
+                self.current_reconnect_ivl = @min(
+                    self.current_reconnect_ivl * 2,
+                    self.reconnect_ivl_max
+                );
+            }
+        } else {
+            // Base + jitter
+            if (self.current_reconnect_ivl == -1) {
+                self.current_reconnect_ivl = self.reconnect_ivl;
+            }
+            const jitter = std.crypto.random.int(u32) % @intCast(self.reconnect_ivl);
+            return self.current_reconnect_ivl + jitter;
+        }
+        return self.current_reconnect_ivl;
+    }
+};
+```
+
+### Readiness (has_in, has_out)
+
+**Polling model** (`src/socket_base.cpp:459-468`):
+```cpp
+if (option_ == ZMQ_EVENTS) {
+    // Process any pending commands first
+    process_commands (0, false);
+
+    // Return bitmask of ready states
+    return (has_out () ? ZMQ_POLLOUT : 0)
+         | (has_in () ? ZMQ_POLLIN : 0);
+}
+```
+
+**Fair queue has_in** (`src/fq.cpp:96-118`):
+```cpp
+bool zmq::fq_t::has_in () {
+    // If mid-multipart, more data is available
+    if (_more)
+        return true;
+
+    // Scan pipes for data, deactivating empty ones
+    while (_active > 0) {
+        if (_pipes[_current]->check_read ())
+            return true;
+
+        // Deactivate empty pipe
+        _active--;
+        _pipes.swap (_current, _active);
+        if (_current == _active)
+            _current = 0;
+    }
+    return false;
+}
+```
+
+**ZZMQ approach**: Readiness check scans pipes similarly:
+
+```zig
+pub fn hasIn(self: *Socket) bool {
+    // Check if mid-multipart (must continue reading)
+    if (self.pattern_state.receiving_multipart) return true;
+
+    // Check each pipe for readable data
+    var iter = self.pipes.iterator();
+    while (iter.next()) |pipe| {
+        if (!pipe.inbound.isEmpty()) return true;
+    }
+    return false;
+}
+
+pub fn hasOut(self: *Socket) bool {
+    // Check if mid-multipart (must continue writing)
+    if (self.pattern_state.sending_multipart) return true;
+
+    // Check each pipe for write space
+    var iter = self.pipes.iterator();
+    while (iter.next()) |pipe| {
+        if (!pipe.outbound.isFull()) return true;
+    }
+    return false;
+}
+```
+
+### Heartbeat Mechanism
+
+**ZMTP Heartbeat** (`src/stream_engine_base.cpp`, `src/zmtp_engine.cpp`):
+
+```
+mechanism_ready()
+    +-- if heartbeat_interval > 0
+        +-- add_timer(heartbeat_ivl_timer_id)
+
+timer_event(heartbeat_ivl_timer_id)
+    |-- _next_msg = produce_ping_message
+    |-- out_event()  // Send PING
+    +-- add_timer(heartbeat_ivl_timer_id)  // Reschedule
+
+produce_ping_message()
+    |-- Create "\4PING" + TTL message
+    |-- if heartbeat_timeout > 0
+    |   +-- add_timer(heartbeat_timeout_timer_id)
+    +-- Return encoded message
+
+On receiving PING:
+    |-- Extract remote TTL
+    |-- if TTL > 0
+    |   +-- add_timer(TTL, heartbeat_ttl_timer_id)
+    |-- Prepare PONG response with context
+    +-- _next_msg = produce_pong_message
+
+On receiving PONG:
+    +-- cancel_timer(heartbeat_timeout_timer_id)
+
+timer_event(heartbeat_timeout_timer_id)
+    +-- error(timeout_error)  // No PONG received
+
+timer_event(heartbeat_ttl_timer_id)
+    +-- error(timeout_error)  // Peer went silent
+```
+
+**ZZMQ implementation:**
+
+```zig
+pub const HeartbeatState = struct {
+    interval_ms: u32,       // How often to send PING
+    timeout_ms: u32,        // How long to wait for PONG
+    ttl_ms: u32,            // Tell peer our TTL
+
+    last_ping_sent: i64 = 0,
+    awaiting_pong: bool = false,
+    peer_ttl_deadline: ?i64 = null,
+
+    pub fn run(self: *HeartbeatState, engine: *Engine, rt: *zio.Runtime) !void {
+        while (engine.isConnected()) {
+            // Wait for interval
+            try zio.time.sleep(rt, self.interval_ms * std.time.ns_per_ms);
+
+            // Send PING with our TTL
+            try engine.sendPing(self.ttl_ms);
+            self.last_ping_sent = std.time.milliTimestamp();
+            self.awaiting_pong = true;
+
+            // Wait for PONG with timeout
+            const deadline = self.last_ping_sent + self.timeout_ms;
+            while (self.awaiting_pong) {
+                const now = std.time.milliTimestamp();
+                if (now >= deadline) {
+                    return error.HeartbeatTimeout;
+                }
+
+                // Check for incoming PONG (via channel)
+                if (engine.checkPong()) {
+                    self.awaiting_pong = false;
+                    break;
+                }
+
+                try zio.time.sleep(rt, 10 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    pub fn onPingReceived(self: *HeartbeatState, peer_ttl: u32) void {
+        if (peer_ttl > 0) {
+            self.peer_ttl_deadline = std.time.milliTimestamp() + peer_ttl;
+        }
+    }
+
+    pub fn onAnyMessageReceived(self: *HeartbeatState) void {
+        // Any message from peer resets TTL deadline
+        self.peer_ttl_deadline = null;
+    }
+};
+```
+
+### Disconnect Detection and Handling
+
+**Error detection** (`src/stream_engine_base.cpp:262-270`):
+```cpp
+const int rc = read (_inpos, bufsize);
+if (rc == -1) {
+    if (errno != EAGAIN) {
+        error (connection_error);  // Read failed
+        return false;
+    }
+    return true;  // EAGAIN is ok, just no data
+}
+if (rc == 0) {
+    // Connection closed by peer (tcp_read sets errno = EPIPE)
+    error (connection_error);
+    return false;
+}
+```
+
+**Error propagation** (`src/stream_engine_base.cpp:667-707`):
+```cpp
+void zmq::stream_engine_base_t::error (error_reason_t reason_) {
+    // For ROUTER with notifications, send disconnect message
+    if (options.router_notify & ZMQ_NOTIFY_DISCONNECT) {
+        _session->rollback ();
+        msg_t disconnect_notification;
+        disconnect_notification.init ();
+        _session->push_msg (&disconnect_notification);
+    }
+
+    // Fire events
+    _socket->event_disconnected (_endpoint_uri_pair, _s);
+
+    // Notify session
+    _session->engine_error (
+        !_handshaking,  // handshaked_
+        reason_         // connection_error, timeout_error, protocol_error
+    );
+
+    unplug ();
+    delete this;
+}
+```
+
+**Session handling** (`src/session_base.cpp:426-481`):
+```cpp
+void zmq::session_base_t::engine_error (bool handshaked_, error_reason_t reason_) {
+    _engine = NULL;
+
+    // Clean up half-processed messages
+    if (_pipe) {
+        clean_pipes ();
+
+        // Send disconnect/hiccup messages if configured
+        if (!_active && handshaked_ && options.can_recv_disconnect_msg)
+            _pipe->send_disconnect_msg ();
+        if (_active && handshaked_ && options.can_recv_hiccup_msg)
+            _pipe->send_hiccup_msg ();
+    }
+
+    // Decide: reconnect or terminate
+    switch (reason_) {
+        case timeout_error:
+        case connection_error:
+            if (_active) {
+                reconnect ();  // Connector: try again
+                break;
+            }
+            // Passive (from accept): fall through to terminate
+        case protocol_error:
+            terminate ();
+            break;
+    }
+}
+```
+
+**ZZMQ implementation:**
+
+```zig
+pub const Engine = struct {
+    stream: zio.net.TcpStream,
+    pipe: *Pipe,
+    session: *Session,
+    state: State,
+
+    const State = enum { handshaking, ready, error_ };
+
+    pub fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
+        defer self.handleDisconnect();
+
+        while (self.state == .ready) {
+            const n = self.stream.read(rt, &self.read_buf) catch |err| {
+                self.onError(.connection_error, err);
+                return;
+            };
+
+            if (n == 0) {
+                self.onError(.connection_error, error.EndOfStream);
+                return;
+            }
+
+            self.processIncoming(self.read_buf[0..n]) catch |err| {
+                self.onError(.protocol_error, err);
+                return;
+            };
+        }
+    }
+
+    fn onError(self: *Engine, reason: ErrorReason, err: anyerror) void {
+        self.state = .error_;
+
+        // Fire disconnect event
+        if (self.session.socket.monitor) |mon| {
+            mon.post(.{ .disconnected = .{
+                .endpoint = self.endpoint,
+                .reason = reason,
+            }});
+        }
+
+        // Notify session
+        self.session.engineError(!self.handshaking, reason);
+    }
+};
+```
+
+### ZMQ_IMMEDIATE Option
+
+**Effect on pipe creation** (`src/socket_base.cpp:1068`):
+```cpp
+if (options.immediate != 1 || subscribe_to_all) {
+    // Create pipe immediately (can queue messages before connect)
+    pipepair (...);
+    attach_pipe (...);
+}
+```
+
+**Effect on hiccup (reconnect)** (`src/socket_base.cpp:1716-1722`):
+```cpp
+void zmq::socket_base_t::hiccuped (pipe_t *pipe_) {
+    if (options.immediate == 1)
+        pipe_->terminate (false);  // Drop pipe, create new on reconnect
+    else
+        xhiccuped (pipe_);         // Keep pipe, resend subscriptions
+}
+```
+
+**ZZMQ implementation:**
+
+```zig
+pub const SocketOptions = struct {
+    /// ZMQ_IMMEDIATE - if true, don't create pipe until connected
+    immediate: bool = false,
+};
+
+pub const Socket = struct {
+    pub fn connect(self: *Socket, uri: []const u8, rt: *zio.Runtime) !void {
+        if (self.options.immediate) {
+            // Don't create pipe yet - wait for connection
+            try self.connection_manager.connectDeferred(uri, rt, self);
+        } else {
+            // Create pipe immediately (can queue before connected)
+            const pipe = try self.createPipe();
+            try self.attachPipe(pipe);
+            try self.connection_manager.connect(uri, rt, pipe);
+        }
+    }
+
+    fn onHiccup(self: *Socket, pipe: *Pipe) void {
+        if (self.options.immediate) {
+            pipe.terminate();  // New pipe on reconnect
+        } else {
+            self.pattern.onHiccup(pipe);  // Resend subs
+        }
+    }
+};
+```
+
+### Summary: ZZMQ Implementation Requirements
+
+| libzmq Mechanism | ZZMQ Approach |
+|-----------------|---------------|
+| signaler_t + mailbox_t | ZIO channels handle wake-up automatically |
+| Command queue | Direct method calls + channels |
+| Reconnect backoff | Coroutine with exponential delay |
+| Pending inproc | HashMap of waiting connects |
+| has_in/has_out | Scan pipes for readable/writable |
+| Heartbeat PING/PONG | Coroutine with timers |
+| TTL monitoring | Deadline tracking per connection |
+| Disconnect detection | Read returning 0 or error |
+| Error propagation | Session.engineError() callback |
+| ZMQ_IMMEDIATE | Deferred pipe creation |
+
+---
+
 ## Implementation Roadmap
 
 ### Phase 1: Core Infrastructure
