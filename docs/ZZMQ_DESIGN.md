@@ -688,6 +688,137 @@ pub const RoutingId = struct {
 };
 ```
 
+### Multipart Messages
+
+ZMQ guarantees atomic delivery of multipart messages - either all frames are delivered or none. This is critical for request envelopes (ROUTER) and complex protocols.
+
+**Multipart API:**
+
+```zig
+/// Send a multipart message (all frames at once)
+pub fn sendMultipart(self: *Socket, frames: []const Message) !void {
+    // Mark all but last with MORE flag
+    for (frames[0 .. frames.len - 1]) |*frame| {
+        frame.flags.more = true;
+    }
+    frames[frames.len - 1].flags.more = false;
+
+    // Send all frames
+    for (frames) |*frame| {
+        try self.send(frame);
+    }
+}
+
+/// Receive a complete multipart message
+pub fn recvMultipart(self: *Socket, allocator: std.mem.Allocator) !MultipartMessage {
+    var frames = std.ArrayList(Message).init(allocator);
+    errdefer {
+        for (frames.items) |*f| f.deinit();
+        frames.deinit();
+    }
+
+    while (true) {
+        var msg = try self.recv();
+        errdefer msg.deinit();
+
+        const has_more = msg.flags.more;
+        try frames.append(msg);
+
+        if (!has_more) break;
+    }
+
+    return MultipartMessage{ .frames = frames };
+}
+
+/// Multipart message container
+pub const MultipartMessage = struct {
+    frames: std.ArrayList(Message),
+
+    pub fn deinit(self: *MultipartMessage) void {
+        for (self.frames.items) |*f| f.deinit();
+        self.frames.deinit();
+    }
+
+    /// Get frame by index
+    pub fn get(self: *const MultipartMessage, index: usize) ?*const Message {
+        if (index >= self.frames.items.len) return null;
+        return &self.frames.items[index];
+    }
+
+    /// Number of frames
+    pub fn frameCount(self: *const MultipartMessage) usize {
+        return self.frames.items.len;
+    }
+};
+```
+
+**Atomic Delivery Guarantee:**
+
+The atomic delivery is ensured at the pipe/engine level:
+
+```zig
+/// Engine writer: send multipart atomically
+fn writeMultipart(self: *Engine, rt: *zio.Runtime) !void {
+    var multipart_frames = std.ArrayList([]u8).init(self.allocator);
+    defer multipart_frames.deinit();
+
+    // Collect all frames of multipart
+    while (true) {
+        const msg = try self.pipe.outbound.receive(rt);
+        defer msg.deinit();
+
+        const encoded = try self.codec.encodeMessage(&self.write_buf, &msg);
+        try multipart_frames.append(try self.allocator.dupe(u8, encoded));
+
+        if (!msg.flags.more) break;
+    }
+
+    // Write all frames in single operation (or as close as possible)
+    // TCP may split across packets, but ZMQ peers handle reassembly
+    for (multipart_frames.items) |frame| {
+        try self.stream.writeAll(rt, frame);
+    }
+}
+
+/// Engine reader: buffer multipart before delivering
+fn readMultipart(self: *Engine, rt: *zio.Runtime) !void {
+    var multipart = std.ArrayList(Message).init(self.allocator);
+    defer {
+        for (multipart.items) |*m| m.deinit();
+        multipart.deinit();
+    }
+
+    // Read all frames of multipart
+    while (true) {
+        const result = self.codec.decode(self.read_buf, self.allocator);
+        const msg = switch (result) {
+            .frame => |f| f.content.message,
+            else => return error.ProtocolError,
+        };
+
+        const has_more = msg.flags.more;
+        try multipart.append(msg);
+
+        if (!has_more) break;
+    }
+
+    // Deliver complete multipart atomically
+    for (multipart.items) |msg| {
+        try self.pipe.inbound.send(rt, msg);
+    }
+    multipart.clearRetainingCapacity();  // Ownership transferred
+}
+```
+
+**Backpressure with Multipart:**
+
+When HWM is reached mid-multipart:
+1. We've already committed to sending the multipart
+2. Channel.send() will suspend until space available
+3. The entire multipart blocks together
+
+This maintains atomicity: either the whole multipart fits or we wait.
+
 ### Message Copying Rules
 
 | Scenario | Behavior |
@@ -976,6 +1107,232 @@ When a socket calls `pipe.write()`:
 3. If `trySend` used → returns false immediately when full
 
 This matches libzmq's HWM semantics exactly, but using ZIO's cooperative scheduling instead of lock-free queues + signaling.
+
+---
+
+## Select and Multiplexing
+
+A critical operation for ZMQ patterns is waiting on multiple pipes simultaneously. ZIO provides `zio.select` for this purpose.
+
+### The Problem
+
+Consider a PULL socket with 3 connected peers. When the user calls `recv()`:
+- We need to check all 3 inbound channels
+- If all are empty, we need to wait until ANY has data
+- We want fair-queuing (round-robin) among ready channels
+
+Similarly for PUSH with HWM reached on all pipes - we wait for ANY to have space.
+
+### ZIO Select
+
+ZIO's `select` function waits on multiple async operations simultaneously:
+
+```zig
+const result = try zio.select(rt, .{
+    .pipe1 = pipe1.inbound.asyncReceive(),
+    .pipe2 = pipe2.inbound.asyncReceive(),
+    .pipe3 = pipe3.inbound.asyncReceive(),
+});
+
+switch (result) {
+    .pipe1 => |msg| return msg,
+    .pipe2 => |msg| return msg,
+    .pipe3 => |msg| return msg,
+}
+```
+
+Key properties:
+- Returns as soon as ANY operation completes
+- Cancels other pending operations automatically
+- Zero-cost when one is immediately ready (fast path)
+- Supports timeouts via additional timer channel
+
+### Helper: Wait for Any Readable Pipe
+
+```zig
+/// Block until any pipe has data, return that message.
+/// Used by PULL, SUB, DEALER patterns.
+fn blockOnReadable(
+    pipes: *PipeSet,
+    timeout: Timeout,
+    rt: *zio.Runtime,
+) RecvError!Message {
+    // Build async receives for all pipes
+    const pipe_count = pipes.count();
+    if (pipe_count == 0) return error.NoRoute;
+
+    // For small pipe counts, use inline select
+    if (pipe_count <= 8) {
+        return blockOnReadableSmall(pipes, timeout, rt);
+    }
+
+    // For large pipe counts, use polling approach
+    return blockOnReadableLarge(pipes, timeout, rt);
+}
+
+/// Optimized for common case of few connections
+fn blockOnReadableSmall(
+    pipes: *PipeSet,
+    timeout: Timeout,
+    rt: *zio.Runtime,
+) RecvError!Message {
+    // ZIO select with up to 8 channels
+    // Using comptime-generated switch based on actual count
+
+    var iter = pipes.iterator();
+
+    // Collect async receives
+    var ops: [8]AsyncReceiveOp = undefined;
+    var count: usize = 0;
+
+    while (iter.next()) |pipe| : (count += 1) {
+        if (count >= 8) break;
+        ops[count] = pipe.inbound.asyncReceive();
+    }
+
+    // Select based on count
+    return switch (count) {
+        1 => {
+            const result = try zio.select(rt, .{ .p0 = ops[0] });
+            return result.p0;
+        },
+        2 => {
+            const result = try zio.select(rt, .{ .p0 = ops[0], .p1 = ops[1] });
+            return switch (result) {
+                .p0 => |m| m,
+                .p1 => |m| m,
+            };
+        },
+        // ... etc for 3-8
+        else => unreachable,
+    };
+}
+```
+
+### Helper: Wait for Any Writable Pipe
+
+```zig
+/// Block until any pipe can accept a write, then write.
+/// Used by PUSH, DEALER patterns.
+fn blockOnWritable(
+    pipes: *PipeSet,
+    msg: *Message,
+    timeout: Timeout,
+    rt: *zio.Runtime,
+) SendError!void {
+    const pipe_count = pipes.count();
+    if (pipe_count == 0) return error.NoRoute;
+
+    // Try each pipe once first (fast path)
+    var iter = pipes.iterator();
+    while (iter.next()) |pipe| {
+        if (pipe.tryWrite(msg.*)) |_| {
+            return;  // Success
+        } else |_| {}
+    }
+
+    // All full - wait for space on any
+    // Build async send operations
+    var wait_ops = std.ArrayList(AsyncSendOp).init(rt.allocator);
+    defer wait_ops.deinit();
+
+    iter.reset();
+    while (iter.next()) |pipe| {
+        try wait_ops.append(pipe.outbound.asyncSend(msg.*));
+    }
+
+    // Select waits for first available
+    // When one succeeds, others are automatically cancelled
+    // The ZIO channel handles the send atomically
+
+    _ = try selectFromSlice(rt, wait_ops.items, timeout);
+}
+```
+
+### Pattern-Specific Select Usage
+
+**ROUTER recv (with routing ID tracking):**
+```zig
+pub fn recv(state: *State, pipes: *PipeSet, timeout: Timeout, rt: *zio.Runtime) !Message {
+    // We need to know WHICH pipe the message came from
+    // to attach the routing ID
+
+    // Try non-blocking first
+    var iter = pipes.iterator();
+    while (iter.next()) |pipe| {
+        if (pipe.tryRead()) |msg| {
+            var result = msg;
+            result.routing_id = pipe.routing_id;
+            return result;
+        } else |_| {}
+    }
+
+    // All empty - use select to find which becomes ready
+    const idx = try selectReadable(pipes, timeout, rt);
+    const pipe = pipes.getByIndex(idx).?;
+
+    var msg = try pipe.read(rt);
+    msg.routing_id = pipe.routing_id;
+    return msg;
+}
+```
+
+**PUB/SUB subscription matching:**
+```zig
+pub fn recv(state: *State, pipes: *PipeSet, timeout: Timeout, rt: *zio.Runtime) !Message {
+    while (true) {
+        // Fair queue from any pipe
+        const msg = try blockOnReadable(pipes, timeout, rt);
+
+        // Check subscription filter
+        if (state.subscriptions.matches(msg.slice())) {
+            return msg;
+        }
+
+        // Doesn't match subscription - drop and try again
+        msg.deinit();
+    }
+}
+```
+
+### Timeout Integration
+
+```zig
+/// Receive with timeout support
+fn recvWithTimeout(
+    pipes: *PipeSet,
+    timeout: Timeout,
+    rt: *zio.Runtime,
+) RecvError!Message {
+    if (timeout == .infinite) {
+        return blockOnReadable(pipes, timeout, rt);
+    }
+
+    // Race against timer
+    var timer = zio.time.Timer.init(timeout.duration);
+
+    const result = try zio.select(rt, .{
+        .message = blockOnReadableAsync(pipes),
+        .timeout = timer.asyncWait(),
+    });
+
+    switch (result) {
+        .message => |msg| return msg,
+        .timeout => return error.Timeout,
+    }
+}
+```
+
+### Performance Characteristics
+
+| Scenario | Behavior |
+|----------|----------|
+| One pipe ready | O(1) - immediate return on first check |
+| All pipes empty | O(n) setup + suspend until any ready |
+| HWM backpressure | Coroutine suspends, zero CPU spin |
+| Many pipes (>8) | Falls back to polling or batched select |
+
+The key insight: ZIO's cooperative scheduling means "waiting" is just coroutine suspension. No busy-waiting, no kernel threads blocked.
 
 ---
 
@@ -1449,6 +1806,389 @@ pub const InprocRegistry = struct {
         attachPipeToSocket(connect_socket, pipe);
     }
 };
+```
+
+---
+
+## ZMTP Codec
+
+ZMTP (ZeroMQ Message Transport Protocol) is the wire protocol for ZMQ. We implement ZMTP 3.1 for compatibility with libzmq.
+
+### Protocol Overview
+
+```
+Connection lifecycle:
+1. Greeting exchange (64 bytes each direction)
+2. Handshake (mechanism-specific: NULL, PLAIN, CURVE)
+3. Ready command with metadata
+4. Message frames
+```
+
+### Frame Format
+
+```
+┌──────────┬──────────┬───────────────────────────────────────┐
+│  Flags   │  Size    │              Body                      │
+│ (1 byte) │ (1-8 b)  │          (Size bytes)                  │
+└──────────┴──────────┴───────────────────────────────────────┘
+
+Flags byte:
+  bit 0: MORE (1 = more frames follow)
+  bit 1: LONG (1 = 8-byte size, 0 = 1-byte size)
+  bit 2: COMMAND (1 = command frame, 0 = message frame)
+```
+
+### Codec Structure
+
+```zig
+pub const ZmtpCodec = struct {
+    /// Protocol state machine
+    state: State,
+
+    /// Negotiated properties
+    properties: Properties,
+
+    /// Decode buffer for partial frames
+    decode_buffer: std.ArrayList(u8),
+
+    /// Partial frame state
+    partial: ?PartialFrame,
+
+    const State = enum {
+        /// Waiting to send/receive greeting
+        greeting,
+        /// Performing security handshake
+        handshaking,
+        /// Exchanging READY commands
+        ready_exchange,
+        /// Normal message flow
+        traffic,
+        /// Error state
+        failed,
+    };
+
+    const Properties = struct {
+        /// Peer's socket type
+        peer_socket_type: ?SocketType = null,
+        /// Peer's identity
+        peer_identity: ?[]const u8 = null,
+        /// Security mechanism
+        mechanism: Mechanism = .null_,
+        /// As-server flag
+        as_server: bool = false,
+    };
+
+    const PartialFrame = struct {
+        flags: u8,
+        size: u64,
+        body_received: usize,
+    };
+
+    /// Initialize codec for a new connection
+    pub fn init(allocator: std.mem.Allocator, role: Role, socket_type: SocketType) ZmtpCodec {
+        return .{
+            .state = .greeting,
+            .properties = .{},
+            .decode_buffer = std.ArrayList(u8).init(allocator),
+            .partial = null,
+        };
+    }
+
+    pub fn deinit(self: *ZmtpCodec) void {
+        self.decode_buffer.deinit();
+    }
+};
+```
+
+### Greeting
+
+```zig
+/// ZMTP 3.1 greeting (64 bytes)
+pub const Greeting = extern struct {
+    signature: [10]u8,      // 0xFF, size[8], 0x7F
+    version: [2]u8,         // major, minor (3, 1)
+    mechanism: [20]u8,      // "NULL" + padding
+    as_server: u8,          // 0 or 1
+    filler: [31]u8,         // zeros
+
+    pub fn init(mechanism: Mechanism, as_server: bool) Greeting {
+        var g: Greeting = undefined;
+
+        // Signature
+        g.signature[0] = 0xFF;
+        @memset(g.signature[1..9], 0);
+        g.signature[9] = 0x7F;
+
+        // Version 3.1
+        g.version[0] = 3;
+        g.version[1] = 1;
+
+        // Mechanism (NULL, PLAIN, CURVE)
+        @memset(&g.mechanism, 0);
+        const mech_name = mechanism.name();
+        @memcpy(g.mechanism[0..mech_name.len], mech_name);
+
+        // As-server
+        g.as_server = if (as_server) 1 else 0;
+
+        // Filler
+        @memset(&g.filler, 0);
+
+        return g;
+    }
+
+    pub fn validate(self: *const Greeting) !void {
+        if (self.signature[0] != 0xFF or self.signature[9] != 0x7F) {
+            return error.InvalidSignature;
+        }
+        if (self.version[0] < 3) {
+            return error.UnsupportedVersion;
+        }
+    }
+};
+```
+
+### Encoding Messages
+
+```zig
+/// Encode a message to wire format
+/// Returns slice of encoded data (written to buf)
+pub fn encodeMessage(self: *ZmtpCodec, buf: []u8, msg: *const Message) ![]u8 {
+    const data = msg.slice();
+    var offset: usize = 0;
+
+    // Flags byte
+    var flags: u8 = 0;
+    if (msg.flags.more) flags |= 0x01;
+    if (data.len > 255) flags |= 0x02;  // LONG flag
+    // Command flag (0x04) not set for messages
+
+    buf[offset] = flags;
+    offset += 1;
+
+    // Size
+    if (data.len > 255) {
+        // 8-byte size (big-endian)
+        std.mem.writeInt(u64, buf[offset..][0..8], data.len, .big);
+        offset += 8;
+    } else {
+        // 1-byte size
+        buf[offset] = @intCast(data.len);
+        offset += 1;
+    }
+
+    // Body
+    if (offset + data.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[offset .. offset + data.len], data);
+    offset += data.len;
+
+    return buf[0..offset];
+}
+
+/// Encode a command frame (READY, PING, PONG, etc.)
+pub fn encodeCommand(self: *ZmtpCodec, buf: []u8, cmd: Command) ![]u8 {
+    var offset: usize = 0;
+
+    // Flags: COMMAND bit set
+    const flags: u8 = 0x04 | (if (cmd.bodyLen() > 255) @as(u8, 0x02) else 0);
+    buf[offset] = flags;
+    offset += 1;
+
+    // Size
+    const total_len = 1 + cmd.name.len + cmd.bodyLen();
+    if (total_len > 255) {
+        std.mem.writeInt(u64, buf[offset..][0..8], total_len, .big);
+        offset += 8;
+    } else {
+        buf[offset] = @intCast(total_len);
+        offset += 1;
+    }
+
+    // Command name (length-prefixed)
+    buf[offset] = @intCast(cmd.name.len);
+    offset += 1;
+    @memcpy(buf[offset .. offset + cmd.name.len], cmd.name);
+    offset += cmd.name.len;
+
+    // Command body
+    offset += try cmd.encodeBody(buf[offset..]);
+
+    return buf[0..offset];
+}
+```
+
+### Decoding Messages
+
+```zig
+/// Decode result
+pub const DecodeResult = union(enum) {
+    /// Successfully decoded a frame
+    frame: DecodedFrame,
+    /// Need more data (returns bytes needed)
+    need_more: usize,
+    /// Protocol error
+    protocol_error: ProtocolError,
+};
+
+pub const DecodedFrame = struct {
+    /// Frame type
+    frame_type: FrameType,
+    /// Bytes consumed from input
+    consumed: usize,
+    /// Decoded content
+    content: union(enum) {
+        message: Message,
+        command: Command,
+    },
+
+    const FrameType = enum { message, command };
+};
+
+/// Decode a frame from wire data
+/// May return need_more if buffer doesn't contain complete frame
+pub fn decode(self: *ZmtpCodec, data: []const u8, allocator: std.mem.Allocator) DecodeResult {
+    if (data.len == 0) return .{ .need_more = 1 };
+
+    var offset: usize = 0;
+
+    // Parse flags
+    const flags = data[offset];
+    offset += 1;
+
+    const has_more = (flags & 0x01) != 0;
+    const is_long = (flags & 0x02) != 0;
+    const is_command = (flags & 0x04) != 0;
+
+    // Parse size
+    const size_bytes: usize = if (is_long) 8 else 1;
+    if (data.len < offset + size_bytes) {
+        return .{ .need_more = offset + size_bytes - data.len };
+    }
+
+    const body_len: u64 = if (is_long)
+        std.mem.readInt(u64, data[offset..][0..8], .big)
+    else
+        data[offset];
+    offset += size_bytes;
+
+    // Check we have full body
+    if (data.len < offset + body_len) {
+        return .{ .need_more = offset + body_len - data.len };
+    }
+
+    const body = data[offset .. offset + body_len];
+    offset += body_len;
+
+    // Decode based on frame type
+    if (is_command) {
+        const cmd = Command.decode(body) catch |err| {
+            return .{ .protocol_error = .{ .command_decode = err } };
+        };
+        return .{ .frame = .{
+            .frame_type = .command,
+            .consumed = offset,
+            .content = .{ .command = cmd },
+        } };
+    } else {
+        // Message frame
+        var msg = Message.initFromSlice(allocator, body) catch |err| {
+            return .{ .protocol_error = .{ .allocation = err } };
+        };
+        msg.flags.more = has_more;
+        return .{ .frame = .{
+            .frame_type = .message,
+            .consumed = offset,
+            .content = .{ .message = msg },
+        } };
+    }
+}
+```
+
+### Commands
+
+```zig
+pub const Command = struct {
+    name: []const u8,
+    properties: std.StringHashMap([]const u8),
+
+    // Standard commands
+    pub const READY = "READY";
+    pub const ERROR = "ERROR";
+    pub const SUBSCRIBE = "SUBSCRIBE";
+    pub const CANCEL = "CANCEL";
+    pub const PING = "PING";
+    pub const PONG = "PONG";
+
+    /// Create READY command with socket metadata
+    pub fn ready(allocator: std.mem.Allocator, socket_type: SocketType, identity: ?[]const u8) !Command {
+        var props = std.StringHashMap([]const u8).init(allocator);
+        try props.put("Socket-Type", socket_type.name());
+        if (identity) |id| {
+            try props.put("Identity", id);
+        }
+        return .{ .name = READY, .properties = props };
+    }
+
+    /// Create PING command
+    pub fn ping(context: []const u8) Command {
+        return .{ .name = PING, .context = context };
+    }
+
+    /// Create SUBSCRIBE command (for XPUB)
+    pub fn subscribe(prefix: []const u8) Command {
+        return .{ .name = SUBSCRIBE, .subscription = prefix };
+    }
+};
+```
+
+### Engine Integration
+
+The codec integrates with Engine's reader/writer loops:
+
+```zig
+fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
+    var read_buf: [65536]u8 = undefined;
+    var decode_offset: usize = 0;
+
+    while (self.state == .ready) {
+        // Read more data from network
+        const n = self.stream.read(rt, read_buf[decode_offset..]) catch |err| {
+            self.handleReadError(err);
+            break;
+        };
+
+        if (n == 0) break;  // EOF
+
+        const available = decode_offset + n;
+
+        // Decode all complete frames
+        var consumed: usize = 0;
+        while (consumed < available) {
+            const result = self.codec.decode(
+                read_buf[consumed..available],
+                self.allocator,
+            );
+
+            switch (result) {
+                .frame => |frame| {
+                    consumed += frame.consumed;
+                    self.handleFrame(rt, frame);
+                },
+                .need_more => break,  // Wait for more data
+                .protocol_error => |err| {
+                    self.handleProtocolError(err);
+                    return;
+                },
+            }
+        }
+
+        // Move unconsumed data to start of buffer
+        if (consumed > 0 and consumed < available) {
+            std.mem.copyForwards(u8, &read_buf, read_buf[consumed..available]);
+        }
+        decode_offset = available - consumed;
+    }
+}
 ```
 
 ---
@@ -2140,6 +2880,182 @@ When HWM is reached:
 4. Original coroutine resumes
 
 This is cooperative backpressure - no busy waiting, no signals, just coroutine scheduling.
+
+---
+
+## Monitoring and Events
+
+Like libzmq's socket monitor, ZZMQ provides visibility into socket lifecycle events.
+
+### Event Types
+
+```zig
+pub const SocketEvent = union(enum) {
+    // Connection events
+    connected: ConnectedEvent,
+    connect_delayed: ConnectDelayedEvent,
+    connect_retried: ConnectRetriedEvent,
+
+    // Listener events
+    listening: ListeningEvent,
+    bind_failed: BindFailedEvent,
+
+    // Accept events
+    accepted: AcceptedEvent,
+    accept_failed: AcceptFailedEvent,
+
+    // Disconnect events
+    disconnected: DisconnectedEvent,
+    closed: ClosedEvent,
+    close_failed: CloseFailedEvent,
+
+    // Handshake events
+    handshake_succeeded: HandshakeEvent,
+    handshake_failed: HandshakeFailedEvent,
+
+    // Protocol events
+    protocol_error: ProtocolErrorEvent,
+
+    pub const ConnectedEvent = struct {
+        endpoint: []const u8,
+        peer_address: ?std.net.Address,
+    };
+
+    pub const DisconnectedEvent = struct {
+        endpoint: []const u8,
+        peer_address: ?std.net.Address,
+        reason: DisconnectReason,
+    };
+
+    pub const DisconnectReason = enum {
+        peer_closed,
+        heartbeat_timeout,
+        protocol_error,
+        local_close,
+    };
+
+    // ... etc
+};
+```
+
+### Monitor Channel
+
+```zig
+pub const Monitor = struct {
+    /// Event channel (bounded to prevent buildup)
+    events: zio.Channel(SocketEvent),
+
+    /// Which events to capture (bitmask)
+    event_mask: EventMask,
+
+    pub const EventMask = packed struct {
+        connected: bool = true,
+        disconnected: bool = true,
+        bind_failed: bool = true,
+        accept_failed: bool = true,
+        handshake_failed: bool = true,
+        protocol_error: bool = true,
+        // ... etc
+    };
+
+    /// Create a monitor for a socket
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, mask: EventMask) !Monitor {
+        var buf = try allocator.alloc(SocketEvent, capacity);
+        return .{
+            .events = zio.Channel(SocketEvent).init(buf),
+            .event_mask = mask,
+        };
+    }
+
+    /// Receive next event (blocking)
+    pub fn recv(self: *Monitor, rt: *zio.Runtime) !SocketEvent {
+        return self.events.receive(rt);
+    }
+
+    /// Try to receive event (non-blocking)
+    pub fn tryRecv(self: *Monitor) ?SocketEvent {
+        return self.events.tryReceive() catch null;
+    }
+
+    /// Post event (internal use by socket)
+    pub fn post(self: *Monitor, event: SocketEvent) void {
+        // Non-blocking: drop if channel full
+        _ = self.events.trySend(event) catch {};
+    }
+};
+
+// Usage
+pub fn monitorExample(ctx: *zzmq.Context, rt: *zio.Runtime) !void {
+    var socket = try ctx.socket(zzmq.Push);
+    defer socket.close();
+
+    // Attach monitor
+    var monitor = try Monitor.init(ctx.allocator, 100, .{});
+    defer monitor.deinit();
+    try socket.attachMonitor(&monitor);
+
+    // Connect (will generate events)
+    try socket.connect("tcp://127.0.0.1:5555");
+
+    // Monitor events in separate coroutine
+    var group: zio.Group = .init;
+    defer group.cancel(rt);
+
+    try group.spawn(rt, struct {
+        fn run(mon: *Monitor, runtime: *zio.Runtime) !void {
+            while (true) {
+                const event = mon.recv(runtime) catch break;
+                switch (event) {
+                    .connected => |e| {
+                        std.log.info("Connected to {s}", .{e.endpoint});
+                    },
+                    .disconnected => |e| {
+                        std.log.info("Disconnected from {s}: {}", .{e.endpoint, e.reason});
+                    },
+                    .handshake_failed => |e| {
+                        std.log.err("Handshake failed: {}", .{e.error});
+                    },
+                    else => {},
+                }
+            }
+        }
+    }.run, .{ &monitor, rt });
+}
+```
+
+### Integration Points
+
+Events are posted from:
+- **Listener**: `listening`, `bind_failed`, `accepted`, `accept_failed`
+- **Connector**: `connected`, `connect_delayed`, `connect_retried`
+- **Engine**: `handshake_succeeded`, `handshake_failed`, `disconnected`, `protocol_error`
+- **Socket**: `closed`, `close_failed`
+
+```zig
+// Example: Engine posts events
+fn performHandshake(self: *Engine, rt: *zio.Runtime) !void {
+    // ... handshake logic ...
+
+    if (handshake_error) |err| {
+        self.postEvent(.{ .handshake_failed = .{
+            .endpoint = self.endpoint,
+            .error = err,
+        }});
+        return error.HandshakeFailed;
+    }
+
+    self.postEvent(.{ .handshake_succeeded = .{
+        .endpoint = self.endpoint,
+        .peer_identity = self.codec.properties.peer_identity,
+    }});
+}
+
+fn postEvent(self: *Engine, event: SocketEvent) void {
+    if (self.monitor) |mon| {
+        mon.post(event);
+    }
+}
+```
 
 ---
 
