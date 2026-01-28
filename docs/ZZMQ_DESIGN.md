@@ -1,12 +1,12 @@
 # ZZMQ: ZeroMQ Semantics on Zig with ZIO
 
-A comprehensive design for a ZeroMQ-compatible messaging library built on Zig and the ZIO async I/O framework.
+A high-performance messaging library implementing ZeroMQ semantics, built idiomatically on Zig and the ZIO async I/O framework.
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Design Principles](#design-principles)
-3. [Architecture](#architecture)
+1. [Design Goals](#design-goals)
+2. [Why Zig + ZIO](#why-zig--zio)
+3. [Architecture Overview](#architecture-overview)
 4. [Core Types](#core-types)
 5. [Message System](#message-system)
 6. [Socket Architecture](#socket-architecture)
@@ -17,47 +17,240 @@ A comprehensive design for a ZeroMQ-compatible messaging library built on Zig an
 11. [Options and Configuration](#options-and-configuration)
 12. [Error Handling](#error-handling)
 13. [API Design](#api-design)
-14. [Performance Considerations](#performance-considerations)
+14. [Performance Analysis](#performance-analysis)
 15. [Implementation Roadmap](#implementation-roadmap)
 
 ---
 
-## Overview
+## Design Goals
 
-ZZMQ is a messaging library that implements ZeroMQ semantics using Zig and the ZIO coroutine runtime. It provides familiar ZMQ patterns (PUSH/PULL, PUB/SUB, REQ/REP, etc.) with ZMTP wire compatibility, while leveraging ZIO's stackful coroutines for clean, efficient async I/O.
+ZZMQ has three primary goals, in order of priority:
+
+### Goal 1: Idiomatic Zig and ZIO
+
+ZZMQ should feel native to Zig programmers and leverage ZIO's strengths naturally.
+
+| Principle | Implementation |
+|-----------|----------------|
+| **Explicit allocation** | All allocators passed explicitly; no global state |
+| **Error handling** | Zig error unions; no exceptions or panics for recoverable errors |
+| **Resource cleanup** | `defer` patterns; `deinit()` methods; no hidden cleanup |
+| **Comptime generics** | Socket types parameterized by pattern at compile time |
+| **No hidden control flow** | Coroutine suspension is explicit (ZIO runtime calls) |
+| **Embrace ZIO primitives** | Use `Channel`, `Group`, `select` directly; don't reinvent |
+
+**Anti-patterns we avoid:**
+- Hidden threads or background work
+- Implicit allocations
+- Global mutable state
+- Blocking the OS thread (all blocking is coroutine suspension)
+- Fighting ZIO's model with our own synchronization
+
+```zig
+// Idiomatic ZZMQ usage
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+defer _ = gpa.deinit();
+
+const rt = try zio.Runtime.init(gpa.allocator(), .{});
+defer rt.deinit();
+
+const ctx = try zzmq.Context.init(rt, gpa.allocator(), .{});
+defer ctx.deinit();
+
+var socket = try ctx.socket(zzmq.Push);
+defer socket.close();
+
+try socket.bind("tcp://127.0.0.1:5555");
+
+var msg = try zzmq.Message.init(gpa.allocator(), "hello");
+defer msg.deinit();
+
+try socket.send(&msg);  // May suspend coroutine, never blocks OS thread
+```
+
+### Goal 2: Better Than libzmq Performance
+
+ZZMQ should match or exceed libzmq's throughput and latency.
+
+**Performance targets:**
+
+| Metric | libzmq | ZZMQ Target | How We Achieve It |
+|--------|--------|-------------|-------------------|
+| Inproc latency | ~500ns | <300ns | Direct channel, no ypipe overhead |
+| TCP latency (loopback) | ~15μs | <10μs | io_uring, fewer syscalls |
+| Small msg throughput | ~4M/s | >6M/s | Inline messages, no allocation |
+| Large msg throughput | ~2GB/s | >3GB/s | Zero-copy, vectored I/O |
+| PUB fan-out (1:1000) | ~500K/s | >1M/s | Refcounted messages, no copies |
+| Memory per connection | ~8KB | <4KB | Simpler state, shared buffers |
+
+**Why we expect better performance:**
+
+1. **No ypipe overhead**: libzmq's lock-free queue requires careful CAS operations and signaling. ZIO's channels use cooperative scheduling - when HWM is hit, the coroutine simply suspends. No atomic operations on the hot path.
+
+2. **Modern I/O**: ZIO uses io_uring on Linux, which batches syscalls and can operate in kernel-polled mode. libzmq uses epoll with one syscall per operation.
+
+3. **Simpler architecture**: libzmq has separate I/O threads, mailboxes, and command queues. We have coroutines on a single runtime - less cross-thread coordination.
+
+4. **Inline small messages**: Messages ≤48 bytes are stored inline in the Message struct. No allocation, no indirection.
+
+5. **No hidden allocations**: Every allocation is explicit and can use custom allocators. libzmq allocates internally with global malloc.
+
+**Performance-critical paths:**
+
+```
+HOT PATH - Send (called millions of times/sec):
+  socket.send(msg)
+    → pattern.selectPipe()      // O(1) round-robin
+    → pipe.outbound.send(msg)   // zio.Channel.send - may suspend
+
+HOT PATH - Recv (called millions of times/sec):
+  socket.recv()
+    → pattern.selectPipe()      // O(1) fair-queue
+    → pipe.inbound.receive()    // zio.Channel.receive - may suspend
+
+WARM PATH - Engine writer (per-message, but async):
+  channel.receive()             // Wake on data
+    → codec.encode(msg)         // In-place, no copy
+    → stream.write(buf)         // ZIO async write
+
+WARM PATH - Engine reader (per-message, but async):
+  stream.read(buf)              // ZIO async read
+    → codec.decode(buf)         // Parse in place
+    → channel.send(msg)         // May suspend on HWM
+```
+
+### Goal 3: Match libzmq Semantics and Guarantees
+
+ZZMQ should be a drop-in conceptual replacement for libzmq with identical behavior.
+
+**Semantics we preserve:**
+
+| Feature | libzmq Behavior | ZZMQ Behavior |
+|---------|-----------------|---------------|
+| **HWM (high water mark)** | Block or drop when queue full | Block (via coroutine suspend) or drop |
+| **Linger** | Wait for pending messages on close | Same - configurable timeout |
+| **Reconnection** | Automatic with exponential backoff | Same - IVL and IVL_MAX options |
+| **Heartbeat** | PING/PONG with configurable interval | Same - IVL, TIMEOUT, TTL options |
+| **Message atomicity** | Multipart delivered atomically | Same - all-or-nothing delivery |
+| **Fair queuing** | Round-robin across peers | Same algorithm |
+| **Subscriptions** | Prefix-based filtering | Same - trie-based matching |
+| **Routing IDs** | Assigned or explicit identity | Same - for ROUTER sockets |
+| **Conflate** | Keep only last message | Same - per-pipe option |
+
+**Socket options we support:**
+
+```zig
+// All standard ZMQ options
+pub const SocketOption = enum {
+    // Flow control
+    send_hwm,           // ZMQ_SNDHWM
+    recv_hwm,           // ZMQ_RCVHWM
+
+    // Timeouts
+    send_timeout,       // ZMQ_SNDTIMEO
+    recv_timeout,       // ZMQ_RCVTIMEO
+
+    // Connection
+    linger,             // ZMQ_LINGER
+    reconnect_ivl,      // ZMQ_RECONNECT_IVL
+    reconnect_ivl_max,  // ZMQ_RECONNECT_IVL_MAX
+    connect_timeout,    // ZMQ_CONNECT_TIMEOUT
+
+    // Identity
+    routing_id,         // ZMQ_ROUTING_ID
+
+    // Heartbeat
+    heartbeat_ivl,      // ZMQ_HEARTBEAT_IVL
+    heartbeat_timeout,  // ZMQ_HEARTBEAT_TIMEOUT
+    heartbeat_ttl,      // ZMQ_HEARTBEAT_TTL
+
+    // Pattern-specific
+    subscribe,          // ZMQ_SUBSCRIBE
+    unsubscribe,        // ZMQ_UNSUBSCRIBE
+    req_relaxed,        // ZMQ_REQ_RELAXED
+    req_correlate,      // ZMQ_REQ_CORRELATE
+    router_mandatory,   // ZMQ_ROUTER_MANDATORY
+
+    // Behavior
+    conflate,           // ZMQ_CONFLATE
+    immediate,          // ZMQ_IMMEDIATE
+
+    // TCP
+    tcp_keepalive,      // ZMQ_TCP_KEEPALIVE
+    // ...
+};
+```
+
+**Wire compatibility:**
+
+- ZMTP 3.1 protocol for interoperability with libzmq
+- Can communicate with libzmq peers over TCP
+- Same framing, commands, and handshake
+
+**Guarantees we maintain:**
+
+1. **Message ordering**: Messages from A to B arrive in send order
+2. **No message loss** (within HWM): If send succeeds, message will be delivered or linger timeout
+3. **Atomic multipart**: All frames of a multipart message delivered together or not at all
+4. **Backpressure propagation**: HWM on any socket eventually slows the sender
+5. **Graceful degradation**: Peer disconnect doesn't crash; reconnection is automatic
+
+---
+
+## Why Zig + ZIO
+
+### Why Zig?
+
+| Feature | Benefit for ZZMQ |
+|---------|------------------|
+| **Comptime** | Zero-cost pattern abstractions; inline small messages |
+| **No hidden allocations** | Predictable performance; custom allocators |
+| **Explicit error handling** | No surprise panics in library code |
+| **C interop** | Easy to expose C API for other languages |
+| **No runtime** | Minimal footprint; embeddable |
+| **Safety without GC** | Memory safety via conventions; no pause times |
 
 ### Why ZIO?
 
-ZIO provides:
-- **Stackful coroutines**: Write blocking-style code that's actually async
-- **Multi-backend I/O**: io_uring, epoll, kqueue, IOCP, poll
-- **Bounded channels with backpressure**: Maps directly to HWM semantics
-- **Structured concurrency**: Groups for managing connection lifecycles
-- **Select**: Multiplexing across multiple operations
+| Feature | Benefit for ZZMQ |
+|---------|------------------|
+| **Stackful coroutines** | Natural blocking-style API that's actually async |
+| **io_uring support** | Best-in-class Linux I/O performance |
+| **Cross-platform** | Same code works on Linux, macOS, Windows, BSDs |
+| **Bounded channels** | Direct mapping to HWM; built-in backpressure |
+| **Structured concurrency** | Clean connection lifecycle management |
+| **Select** | Multiplexing without callbacks or state machines |
 
-### Key Insight
+### Key Insight: ZIO Channels Are Our Pipes
 
-ZIO's `Channel(T)` with bounded capacity IS our pipe mechanism. A channel with capacity N naturally implements HWM=N with proper backpressure. This eliminates the need for custom lock-free queues (ypipe) - the ZIO runtime handles the coordination.
+libzmq's architecture centers on `ypipe_t`, a carefully crafted lock-free queue with:
+- Single-CAS synchronization
+- "Reader sleeping" detection via cursor==NULL
+- Chunked memory allocation
+- Separate signaler for cross-thread wakeup
+
+This was brilliant engineering for 2010. But ZIO gives us something better:
+
+```zig
+// libzmq: complex lock-free queue + signaler
+ypipe_t<msg_t> pipe;
+signaler_t signaler;
+// ... hundreds of lines of careful atomic code ...
+
+// ZZMQ: just use ZIO's channel
+outbound: zio.Channel(Message),  // capacity = HWM
+inbound: zio.Channel(Message),   // capacity = HWM
+```
+
+When HWM is reached:
+- libzmq: CAS fails, signaler notified, thread wakes, checks queue...
+- ZZMQ: `channel.send()` suspends coroutine. That's it.
+
+The ZIO runtime handles all the complexity of efficient wakeup. We don't need to think about it.
 
 ---
 
-## Design Principles
-
-1. **ZIO-native**: Embrace coroutines, not fight them. Blocking APIs backed by async I/O.
-
-2. **libzmq semantics**: Same behavior for HWM, linger, reconnection, patterns, etc.
-
-3. **ZMTP compatibility**: Wire-compatible with libzmq for interoperability.
-
-4. **Zero-copy where possible**: Reference-counted messages, avoid copies on hot paths.
-
-5. **Explicit resource management**: Zig-style `defer` cleanup, no hidden allocations.
-
-6. **Single runtime per context**: All sockets share one ZIO runtime (user-provided).
-
----
-
-## Architecture
+## Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
