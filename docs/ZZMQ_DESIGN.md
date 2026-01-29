@@ -6,26 +6,28 @@ A high-performance messaging library implementing ZeroMQ semantics, built idioma
 
 1. [Design Goals](#design-goals)
 2. [Why Zig + ZIO](#why-zig--zio)
-3. [Architecture Overview](#architecture-overview)
-4. [Core Types](#core-types)
-5. [Message System](#message-system)
-6. [Socket Architecture](#socket-architecture)
-7. [Pipe System](#pipe-system)
-8. [Select and Multiplexing](#select-and-multiplexing)
-9. [Connection Management](#connection-management)
-10. [Transport Layer](#transport-layer)
-11. [ZMTP Codec](#zmtp-codec)
-12. [Socket Patterns](#socket-patterns)
-13. [Options and Configuration](#options-and-configuration)
-14. [Error Handling](#error-handling)
-15. [API Design](#api-design)
-16. [Performance Considerations](#performance-considerations)
-17. [Monitoring and Events](#monitoring-and-events)
-18. [libzmq Reference: Critical Behaviors](#libzmq-reference-critical-behaviors-and-edge-cases)
-19. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
-20. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
-21. [Implementation Roadmap](#implementation-roadmap)
-22. [Summary](#summary)
+3. [ZIO Deep Dive](#zio-deep-dive-actual-apis-for-zzmq)
+4. [Architecture Overview](#architecture-overview)
+5. [Core Types](#core-types)
+6. [Message System](#message-system)
+7. [Socket Architecture](#socket-architecture)
+8. [Pipe System](#pipe-system)
+9. [Select and Multiplexing](#select-and-multiplexing)
+10. [Connection Management](#connection-management)
+11. [Transport Layer](#transport-layer)
+12. [ZMTP Codec](#zmtp-codec)
+13. [Socket Patterns](#socket-patterns)
+14. [Options and Configuration](#options-and-configuration)
+15. [Error Handling](#error-handling)
+16. [API Design](#api-design)
+17. [Performance Considerations: Hot Path Deep Dive](#performance-considerations-hot-path-deep-dive)
+18. [Monitoring and Events](#monitoring-and-events)
+19. [libzmq Reference: Critical Behaviors](#libzmq-reference-critical-behaviors-and-edge-cases)
+20. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
+21. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
+22. [libzmq Deep Dives: Protocol, Patterns, Internals](#libzmq-deep-dives-protocol-patterns-and-internals)
+23. [Implementation Roadmap](#implementation-roadmap)
+24. [Summary](#summary)
 
 ---
 
@@ -5420,6 +5422,375 @@ const fd = try socket.getFd();
 | ZMQ_EVENTS | `socket.getEvents()` returns current readiness |
 | Thread-safe signaling | Event signaler per socket |
 | Timer integration | ZIO timer integration in poll/select |
+
+---
+
+## libzmq Deep Dives: Protocol, Patterns, and Internals
+
+This section provides comprehensive analysis of critical libzmq subsystems, grounded in source code study.
+
+### ZMTP Wire Protocol (Encoder/Decoder)
+
+**Frame Format** (v2_protocol.hpp, v2_encoder.cpp, v2_decoder.cpp):
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Flags (1 byte)  │  Size (1 or 8 bytes)  │  Body (N bytes)  │
+└─────────────────────────────────────────────────────────────┘
+
+Flags byte:
+  bit 0 (0x01): MORE     - More frames follow in this message
+  bit 1 (0x02): LARGE    - Size is 8 bytes (not 1)
+  bit 2 (0x04): COMMAND  - This is a command frame, not data
+
+Size encoding:
+  - If LARGE flag clear: 1 byte, max 255
+  - If LARGE flag set:   8 bytes, network byte order (big-endian)
+```
+
+**Encoder State Machine** (v2_encoder.cpp):
+```
+State: message_ready
+  1. Encode flags byte (MORE | LARGE | COMMAND)
+  2. Encode size (1 or 8 bytes)
+  3. If subscribe/cancel: add 1-byte prefix (1=sub, 0=cancel)
+  4. Transition to: size_ready
+
+State: size_ready
+  1. Write message body directly from msg_t data
+  2. Transition to: message_ready (next message)
+```
+
+**Decoder State Machine** (v2_decoder.cpp):
+```
+State: flags_ready (read 1 byte)
+  1. Parse MORE, COMMAND flags
+  2. If LARGE: transition to eight_byte_size_ready
+  3. Else: transition to one_byte_size_ready
+
+State: one_byte_size_ready / eight_byte_size_ready
+  1. Parse size
+  2. Validate against max_msg_size
+  3. Allocate message (zero-copy if possible)
+  4. Transition to: message_ready
+
+State: message_ready
+  1. Body has been read into message
+  2. Return 1 to signal complete message
+  3. Transition to: flags_ready (next frame)
+```
+
+**ZMTP Greeting** (zmtp_engine.cpp):
+```
+Bytes 0-9:   Signature (0xFF, 8 bytes padding, 0x7F)
+Byte 10:     Revision (3 for ZMTP 3.x)
+Byte 11:     Minor version (1 for ZMTP 3.1)
+Bytes 12-31: Mechanism name (NULL-padded, e.g., "NULL", "PLAIN", "CURVE")
+Bytes 32-63: Filler (zeros)
+```
+
+**ZZMQ Implementation**:
+```zig
+pub const Frame = struct {
+    flags: Flags,
+    data: []const u8,
+
+    pub const Flags = packed struct {
+        more: bool = false,
+        large: bool = false,  // Computed from size
+        command: bool = false,
+        _reserved: u5 = 0,
+    };
+};
+
+pub const Encoder = struct {
+    pub fn encodeFrame(frame: Frame, writer: anytype) !void {
+        var flags: u8 = 0;
+        if (frame.flags.more) flags |= 0x01;
+        if (frame.data.len > 255) flags |= 0x02;
+        if (frame.flags.command) flags |= 0x04;
+
+        try writer.writeByte(flags);
+        if (frame.data.len > 255) {
+            try writer.writeInt(u64, frame.data.len, .big);
+        } else {
+            try writer.writeByte(@intCast(frame.data.len));
+        }
+        try writer.writeAll(frame.data);
+    }
+};
+```
+
+---
+
+### Socket Pattern State Machines
+
+**REQ Socket** (req.cpp) - Strict request-reply:
+```
+States:
+  _receiving_reply = false  → Can send, cannot receive
+  _receiving_reply = true   → Cannot send, can receive
+
+Send flow:
+  1. If _receiving_reply && _strict: return EFSM
+  2. If _message_begins:
+     a. Send delimiter frame (empty, MORE flag)
+     b. Drain any old replies (prevent stale reply matching)
+  3. Send user frames via DEALER
+  4. On final frame (!MORE): set _receiving_reply = true
+
+Receive flow:
+  1. If !_receiving_reply: return EFSM
+  2. Skip frames until delimiter found (empty frame with MORE)
+  3. Return subsequent frames to user
+  4. On final frame (!MORE): set _receiving_reply = false
+
+Options:
+  ZMQ_REQ_CORRELATE: Add request_id frame for matching
+  ZMQ_REQ_RELAXED:   Allow send without receiving reply
+```
+
+**REP Socket** (rep.cpp) - Mirrors REQ:
+```
+States:
+  _sending_reply = false  → Can receive, cannot send
+  _sending_reply = true   → Can send, cannot receive
+
+Receive flow:
+  1. If _sending_reply: return EFSM
+  2. Copy routing frames to reply pipe (identity, delimiter)
+  3. Return content frames to user
+  4. On final frame: set _sending_reply = true
+
+Send flow:
+  1. If !_sending_reply: return EFSM
+  2. Send frames via ROUTER (prepends copied routing)
+  3. On final frame: set _sending_reply = false
+```
+
+**ROUTER Socket** (router.cpp) - Routing by identity:
+```
+Identity assignment:
+  1. If peer sends identity frame: use it
+  2. Else: generate random 5-byte identity (0x00 prefix + 4 random bytes)
+  3. Store in _outpipes map: identity → pipe
+
+Send flow:
+  1. First frame MUST be routing identity
+  2. Lookup pipe by identity in _outpipes
+  3. If not found && _mandatory: return EHOSTUNREACH
+  4. If not found && !_mandatory: silently drop message
+  5. Send remaining frames to that pipe
+
+Receive flow:
+  1. Fair-queue from all pipes
+  2. Prepend identity frame (so user knows sender)
+  3. Return frames to user
+
+Options:
+  ZMQ_ROUTER_MANDATORY: Error if identity not found
+  ZMQ_ROUTER_HANDOVER:  Take over on duplicate identity
+```
+
+**PUB/XPUB Socket** (pub.cpp, xpub.cpp):
+```
+_subscriptions: mtrie_t storing prefix → set<pipe*>
+
+On subscriber connect:
+  1. Parse subscription: [0x01 | 0x00] + prefix
+  2. 0x01 = subscribe, 0x00 = unsubscribe
+  3. _subscriptions.add(prefix, pipe) or .rm(prefix, pipe)
+
+On publish:
+  1. Get message topic (first frame)
+  2. _subscriptions.match(topic, callback)
+  3. Callback writes message copy to each matching pipe
+```
+
+---
+
+### Subscription Matching (MTrie)
+
+**Data Structure** (generic_mtrie.hpp):
+```
+Multi-trie: Prefix tree where each node has set of pipes
+
+struct mtrie_node {
+    pipes_t* _pipes;      // Pipes subscribed at this prefix
+    unsigned char _min;   // Minimum character in children
+    unsigned short _count; // Number of child slots
+    union {
+        mtrie_node* node;   // Single child (optimization)
+        mtrie_node** table; // Array of children
+    } _next;
+};
+
+Operations:
+  add(prefix, pipe)  → O(prefix_length)
+  rm(prefix, pipe)   → O(prefix_length)
+  match(topic, cb)   → O(topic_length), calls cb for each matching pipe
+```
+
+**Match Algorithm**:
+```
+match(topic):
+  node = root
+  callback(root.pipes)  // Empty prefix matches all
+
+  for each char c in topic:
+    if c not in node.children: break
+    node = node.children[c]
+    callback(node.pipes)
+```
+
+---
+
+### Multipart Message Atomicity
+
+**Rollback Mechanism** (pipe.cpp:236):
+```cpp
+void pipe_t::rollback() {
+    // Remove incomplete message from outbound pipe
+    msg_t msg;
+    while (_out_pipe->unwrite(&msg)) {
+        zmq_assert(msg.flags() & msg_t::more);  // Only MORE frames
+        msg.close();
+    }
+}
+```
+
+**How It Works**:
+1. `ypipe::unwrite()` removes last unflushed item
+2. `flush()` only called on complete message (no MORE flag)
+3. Incomplete messages can always be rolled back
+
+**ZZMQ Approach**:
+```zig
+pub const Pipe = struct {
+    pending_multipart: std.ArrayList(Message),
+
+    pub fn write(self: *Pipe, msg: Message) !void {
+        self.pending_multipart.append(msg);
+        if (!msg.hasMore()) {
+            // Flush all pending frames atomically
+            for (self.pending_multipart.items) |frame| {
+                try self.outbound.send(self.rt, frame);
+            }
+            self.pending_multipart.clearRetainingCapacity();
+        }
+    }
+
+    pub fn rollback(self: *Pipe) void {
+        for (self.pending_multipart.items) |*frame| frame.deinit();
+        self.pending_multipart.clearRetainingCapacity();
+    }
+};
+```
+
+---
+
+### Inproc Transport
+
+**Mechanism** (ctx.cpp):
+
+```
+On connect("inproc://name") before bind:
+  → Store in _pending_connections[name]
+
+On bind("inproc://name"):
+  → Register endpoint
+  → Connect all pending connections
+  → connect_inproc_sockets():
+      - Set HWM = connector_sndhwm + binder_rcvhwm
+      - Create bidirectional pipe pair
+      - Attach to both sockets
+
+Key insight: No network I/O, no encoder/decoder, just direct pipe
+```
+
+---
+
+### PLAIN Security Mechanism
+
+**Handshake Flow**:
+```
+Client                              Server
+   │                                   │
+   │ ─── HELLO (user+pass) ────────►  │
+   │                                   │  [ZAP auth]
+   │ ◄─── WELCOME ──────────────────  │
+   │                                   │
+   │ ─── INITIATE (metadata) ──────►  │
+   │                                   │
+   │ ◄─── READY (metadata) ─────────  │
+   │                                   │
+```
+
+**Command Formats**:
+```
+HELLO:    "\x05HELLO" + len(1) + username + len(1) + password
+WELCOME:  "\x07WELCOME"
+INITIATE: "\x08INITIATE" + metadata
+READY:    "\x05READY" + metadata
+ERROR:    "\x05ERROR" + len(1) + reason
+
+Metadata: [len(1) + key + len(4,big) + value]*
+  Standard keys: "Socket-Type", "Identity"
+```
+
+---
+
+### Linger and Graceful Shutdown
+
+**Linger Values**:
+- `0`: Immediately discard pending messages
+- `>0`: Wait up to N milliseconds for delivery
+- `-1`: Wait forever
+
+**Shutdown Sequence**:
+```
+1. zmq_close(socket)
+   └─► send REAP to reaper thread
+
+2. Reaper: process_term(linger)
+   └─► For each pipe: terminate(linger > 0)
+
+3. If linger > 0:
+   └─► Start linger timer
+   └─► Allow messages to drain
+
+4. On timer expiry OR all messages sent:
+   └─► Force terminate
+   └─► send_term_ack() up the ownership tree
+
+5. Context waits for all sockets reaped
+```
+
+---
+
+### Error Recovery
+
+**Error Types**:
+```
+connection_error → Reconnect (network failure)
+protocol_error   → Terminate (ZMTP violation)
+timeout_error    → Reconnect (heartbeat timeout)
+```
+
+**Reconnection Backoff** (stream_connecter_base.cpp):
+```
+delay = current_interval
+current_interval = min(current_interval * 2, max_interval)
+delay += random_jitter(±25%)
+schedule_reconnect(delay)
+```
+
+**On Reconnect (SUB socket)**:
+```
+session->reconnect()
+  └─► pipe->hiccup()
+      └─► Socket resends all subscriptions
+```
 
 ---
 
