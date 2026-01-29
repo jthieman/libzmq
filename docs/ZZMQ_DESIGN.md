@@ -26,8 +26,9 @@ A high-performance messaging library implementing ZeroMQ semantics, built idioma
 20. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
 21. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
 22. [libzmq Deep Dives: Protocol, Patterns, Internals](#libzmq-deep-dives-protocol-patterns-and-internals)
-23. [Implementation Roadmap](#implementation-roadmap)
-24. [Summary](#summary)
+23. [Testing Strategy and Coverage](#testing-strategy-and-coverage)
+24. [Implementation Roadmap](#implementation-roadmap)
+25. [Summary](#summary)
 
 ---
 
@@ -5791,6 +5792,791 @@ session->reconnect()
   └─► pipe->hiccup()
       └─► Socket resends all subscriptions
 ```
+
+---
+
+## Testing Strategy and Coverage
+
+This section defines the comprehensive test suite required to validate ZZMQ against libzmq semantics. Tests are organized by category with specific test cases that verify correctness, edge cases, and semantic equivalence.
+
+### Message System Tests
+
+**Basic Message Operations:**
+```zig
+test "message init with data" {
+    var msg = try Message.init(allocator, "hello");
+    defer msg.deinit();
+    try testing.expectEqualStrings("hello", msg.data());
+}
+
+test "message move transfers ownership" {
+    var msg1 = try Message.init(allocator, "data");
+    var msg2 = msg1.move();
+    defer msg2.deinit();
+    try testing.expect(msg1.size() == 0);
+    try testing.expectEqualStrings("data", msg2.data());
+}
+
+test "message copy creates shared reference" {
+    var msg1 = try Message.init(allocator, "shared");
+    defer msg1.deinit();
+    var msg2 = try msg1.copy();
+    defer msg2.deinit();
+    try testing.expectEqual(msg1.data().ptr, msg2.data().ptr);
+}
+```
+
+**Storage Class Tests:**
+| Test Case | Verification |
+|-----------|--------------|
+| VSM (≤24 bytes) | Message stored inline, no heap allocation |
+| Small heap (25-255 bytes) | Single allocation, owned storage |
+| Large message (>255 bytes) | Owned storage with proper alignment |
+| External buffer | Zero-copy wrapping, proper lifecycle |
+| Refcounted sharing | Copy increments refcount, deinit decrements |
+| Refcount to zero | Memory freed when last reference released |
+
+**Multipart Message Tests:**
+```zig
+test "multipart message MORE flag" {
+    var frame1 = try Message.init(allocator, "part1");
+    frame1.setMore(true);
+    var frame2 = try Message.init(allocator, "part2");
+
+    try testing.expect(frame1.hasMore());
+    try testing.expect(!frame2.hasMore());
+}
+
+test "multipart atomicity on send" {
+    // 3-part message should be buffered until complete
+    try socket.send(part1);  // MORE=1, buffered
+    try socket.send(part2);  // MORE=1, buffered
+    try socket.send(part3);  // MORE=0, all 3 flushed atomically
+}
+
+test "multipart atomicity on receive" {
+    // Partial multipart not visible to receiver
+    // All parts available only after final frame arrives
+}
+```
+
+### HWM and Flow Control Tests
+
+**High Water Mark Semantics:**
+```zig
+test "HWM blocks sender when full" {
+    socket.setOption(.sndhwm, 10);
+
+    // Fill to HWM
+    for (0..10) |_| {
+        try socket.send(msg);  // Should succeed
+    }
+
+    // 11th message should block (suspend coroutine)
+    // Verify with timeout or concurrent receiver
+}
+
+test "HWM zero means unlimited" {
+    socket.setOption(.sndhwm, 0);
+    // Should never block due to HWM (only memory limits)
+}
+
+test "HWM applies per-pipe" {
+    // Each connected peer has independent HWM tracking
+}
+```
+
+**Drop Behavior by Socket Type:**
+| Socket Type | On HWM | Test Verification |
+|-------------|--------|-------------------|
+| PUSH | Block | Sender suspends until space available |
+| PUB | Drop | Messages silently dropped, sender continues |
+| DEALER | Block | Sender suspends |
+| ROUTER | Drop | Messages to specific peer dropped |
+| REQ/REP | Block | Strict alternation maintained |
+
+**Backpressure Tests:**
+```zig
+test "slow consumer causes sender backpressure" {
+    // Fast sender, slow receiver
+    // Verify sender blocks at HWM, resumes when space available
+}
+
+test "pipe backpressure propagates to socket" {
+    // Multiple peers, one slow
+    // Verify correct peer-specific backpressure
+}
+```
+
+### Socket Pattern Tests
+
+#### PUSH/PULL Tests
+```zig
+test "PUSH round-robins across connected PULLs" {
+    var push = try ctx.socket(.push);
+    var pull1 = try ctx.socket(.pull);
+    var pull2 = try ctx.socket(.pull);
+
+    try push.connect("inproc://rr");
+    try pull1.bind("inproc://rr");
+    try pull2.bind("inproc://rr");
+
+    // Send 4 messages
+    for (0..4) |i| try push.send(msg(i));
+
+    // Each PULL should receive 2 messages
+    try testing.expectEqual(@as(u32, 0), pull1.recv().asInt());
+    try testing.expectEqual(@as(u32, 2), pull1.recv().asInt());
+    try testing.expectEqual(@as(u32, 1), pull2.recv().asInt());
+    try testing.expectEqual(@as(u32, 3), pull2.recv().asInt());
+}
+
+test "PUSH blocks when all PULLs at HWM" {
+    // All peers at HWM, send should block
+}
+
+test "PULL fair-queues from multiple PUSHs" {
+    // Multiple senders, verify interleaved reception
+}
+```
+
+#### REQ/REP Tests
+```zig
+test "REQ/REP strict alternation" {
+    // REQ: send then recv
+    try req.send(request);
+    const reply = try req.recv();
+
+    // REP: recv then send
+    const request = try rep.recv();
+    try rep.send(reply);
+}
+
+test "REQ double send fails with EFSM" {
+    try req.send(msg1);
+    const result = req.send(msg2);
+    try testing.expectError(error.EFSM, result);
+}
+
+test "REP double recv fails with EFSM" {
+    const msg = try rep.recv();
+    const result = rep.recv();
+    try testing.expectError(error.EFSM, result);
+}
+
+test "REQ/REP preserves envelope on reply" {
+    // Multipart: [identity][empty][payload]
+    // REP must return reply to correct REQ
+}
+
+test "REQ retry on disconnect" {
+    // REQ_RELAXED: can send new request after disconnect
+    // Default: must receive reply before next send
+}
+```
+
+#### DEALER/ROUTER Tests
+```zig
+test "ROUTER prepends identity frame" {
+    var dealer = try ctx.socket(.dealer);
+    dealer.setOption(.identity, "client-1");
+
+    var router = try ctx.socket(.router);
+    // ... connect ...
+
+    try dealer.send(payload);
+
+    const id_frame = try router.recv();
+    try testing.expectEqualStrings("client-1", id_frame.data());
+    try testing.expect(id_frame.hasMore());
+
+    const payload_frame = try router.recv();
+    // ...
+}
+
+test "ROUTER routes by identity" {
+    // Send to specific peer by prepending identity frame
+}
+
+test "ROUTER drops message for unknown identity" {
+    // ZMQ_ROUTER_MANDATORY = 0: silent drop
+    // ZMQ_ROUTER_MANDATORY = 1: return EHOSTUNREACH
+}
+
+test "DEALER round-robins sends" {
+    // Like PUSH but for request-reply patterns
+}
+
+test "DEALER fair-queues receives" {
+    // Like PULL
+}
+```
+
+#### PUB/SUB Tests
+```zig
+test "SUB receives only matching subscriptions" {
+    try sub.setOption(.subscribe, "weather.");
+
+    try pub.send(msg("weather.nyc sunny"));   // Received
+    try pub.send(msg("weather.la cloudy"));   // Received
+    try pub.send(msg("stocks.aapl 150"));     // NOT received
+
+    try testing.expectEqualStrings("weather.nyc sunny", (try sub.recv()).data());
+    try testing.expectEqualStrings("weather.la cloudy", (try sub.recv()).data());
+    try testing.expect(sub.hasIn() == false);
+}
+
+test "SUB empty subscription receives all" {
+    try sub.setOption(.subscribe, "");
+    // All messages received
+}
+
+test "SUB multiple subscriptions" {
+    try sub.setOption(.subscribe, "A");
+    try sub.setOption(.subscribe, "B");
+    // Messages starting with A or B received
+}
+
+test "SUB unsubscribe" {
+    try sub.setOption(.subscribe, "X");
+    try sub.setOption(.unsubscribe, "X");
+    // Messages starting with X no longer received
+}
+
+test "PUB drops when SUB at HWM" {
+    // No backpressure to publisher
+    // Slow subscriber loses messages
+}
+
+test "XSUB/XPUB subscription forwarding" {
+    // XSUB sends subscription messages upstream
+    // XPUB receives and processes subscriptions
+}
+```
+
+### Connection Lifecycle Tests
+
+**Bind/Connect Semantics:**
+```zig
+test "bind before connect" {
+    try server.bind("tcp://127.0.0.1:5555");
+    try client.connect("tcp://127.0.0.1:5555");
+    // Connection established
+}
+
+test "connect before bind (late bind)" {
+    try client.connect("tcp://127.0.0.1:5556");
+    // Client queues messages or blocks
+    try server.bind("tcp://127.0.0.1:5556");
+    // Messages delivered after bind
+}
+
+test "multiple binds same socket" {
+    try socket.bind("tcp://127.0.0.1:5555");
+    try socket.bind("tcp://127.0.0.1:5556");
+    // Socket accepts on both endpoints
+}
+
+test "multiple connects same socket" {
+    try socket.connect("tcp://host1:5555");
+    try socket.connect("tcp://host2:5555");
+    // Socket connected to both peers
+}
+
+test "bind to wildcard port" {
+    try socket.bind("tcp://127.0.0.1:*");
+    const endpoint = socket.lastEndpoint();
+    // Returns actual bound port
+}
+```
+
+**Disconnect and Unbind:**
+```zig
+test "disconnect removes peer" {
+    try socket.connect("tcp://127.0.0.1:5555");
+    try socket.disconnect("tcp://127.0.0.1:5555");
+    // Peer removed, no reconnection attempts
+}
+
+test "unbind stops accepting" {
+    try socket.bind("tcp://127.0.0.1:5555");
+    try socket.unbind("tcp://127.0.0.1:5555");
+    // Port released, new connections rejected
+}
+```
+
+### Reconnection and Error Recovery Tests
+
+```zig
+test "automatic reconnection on disconnect" {
+    try client.connect("tcp://127.0.0.1:5555");
+    // Server crashes or disconnects
+    // Client automatically attempts reconnection
+}
+
+test "reconnection with exponential backoff" {
+    socket.setOption(.reconnect_ivl, 100);      // 100ms initial
+    socket.setOption(.reconnect_ivl_max, 5000); // 5s max
+
+    // Verify backoff: 100, 200, 400, 800, 1600, 3200, 5000, 5000...
+}
+
+test "reconnection preserves subscriptions" {
+    try sub.setOption(.subscribe, "topic");
+    // Disconnect and reconnect
+    // Subscriptions automatically resent to new peer
+}
+
+test "no reconnection after explicit disconnect" {
+    try socket.disconnect("tcp://...");
+    // Should not attempt to reconnect
+}
+
+test "connection timeout" {
+    socket.setOption(.connect_timeout, 1000);  // 1 second
+    try socket.connect("tcp://unreachable:5555");
+    // Should timeout and trigger reconnect cycle
+}
+```
+
+### Inproc Transport Tests
+
+```zig
+test "inproc connect before bind" {
+    // Unlike TCP, inproc can handle connect-before-bind
+    try client.connect("inproc://test");
+    try server.bind("inproc://test");
+    // Connection established
+}
+
+test "inproc zero-copy transfer" {
+    // Messages passed by reference, not copied
+    var msg = try Message.init(allocator, large_data);
+    const ptr_before = msg.data().ptr;
+    try push.send(msg);
+    const received = try pull.recv();
+    try testing.expectEqual(ptr_before, received.data().ptr);
+}
+
+test "inproc between sockets in same context only" {
+    var ctx1 = try Context.init(...);
+    var ctx2 = try Context.init(...);
+    var s1 = try ctx1.socket(.push);
+    var s2 = try ctx2.socket(.pull);
+
+    try s1.bind("inproc://test");
+    const result = s2.connect("inproc://test");
+    try testing.expectError(error.ENOENT, result);
+}
+
+test "inproc endpoint names are context-scoped" {
+    // Same name in different contexts = different endpoints
+}
+```
+
+### ZMTP Protocol Compatibility Tests
+
+**Greeting and Handshake:**
+```zig
+test "ZMTP greeting exchange" {
+    // Verify: signature (0xFF, 8 bytes, 0x7F)
+    // Version: 3.1
+    // Mechanism: NULL/PLAIN
+    // as-server flag
+}
+
+test "ZMTP NULL mechanism handshake" {
+    // READY command exchange
+    // Socket-Type property
+    // Identity property (if set)
+}
+
+test "ZMTP version negotiation" {
+    // Connect to ZMTP 3.0 peer
+    // Should negotiate to common version
+}
+```
+
+**Frame Encoding:**
+```zig
+test "short frame encoding (size < 255)" {
+    // flags:1 + size:1 + body:N
+    const wire = encodeFrame(flags, data);
+    try testing.expectEqual(@as(u8, 0), wire[0] & 0x02);  // Not LARGE
+}
+
+test "long frame encoding (size >= 255)" {
+    // flags:1 + size:8 (network byte order) + body:N
+    const wire = encodeFrame(flags, large_data);
+    try testing.expect(wire[0] & 0x02 != 0);  // LARGE flag
+}
+
+test "MORE flag in multipart" {
+    // First frame: MORE=1
+    // Last frame: MORE=0
+}
+
+test "COMMAND flag for control messages" {
+    // SUBSCRIBE, CANCEL, PING, PONG
+}
+```
+
+**Wire Compatibility:**
+```zig
+test "interop with libzmq" {
+    // ZZMQ server, libzmq client
+    // libzmq server, ZZMQ client
+    // Verify messages decoded correctly
+}
+```
+
+### PLAIN Security Tests
+
+```zig
+test "PLAIN authentication success" {
+    server.setOption(.plain_server, true);
+    server.setOption(.plain_username, "admin");
+    server.setOption(.plain_password, "secret");
+
+    client.setOption(.plain_username, "admin");
+    client.setOption(.plain_password, "secret");
+
+    // Connection established, messages flow
+}
+
+test "PLAIN authentication failure" {
+    // Wrong password
+    client.setOption(.plain_password, "wrong");
+    // Connection rejected with 400 error
+}
+
+test "PLAIN mechanism in greeting" {
+    // Verify greeting contains "PLAIN" mechanism
+}
+
+test "PLAIN command sequence" {
+    // Client: HELLO (username, password)
+    // Server: WELCOME or ERROR
+    // Client: INITIATE (metadata)
+    // Server: READY (metadata)
+}
+```
+
+### Linger and Shutdown Tests
+
+```zig
+test "linger=0 immediate close" {
+    socket.setOption(.linger, 0);
+    try socket.send(msg);  // Queued
+    socket.close();        // Immediate, message may be lost
+}
+
+test "linger>0 waits to drain" {
+    socket.setOption(.linger, 1000);  // 1 second
+    try socket.send(msg);
+    socket.close();  // Waits up to 1s for message delivery
+}
+
+test "linger=-1 waits forever" {
+    socket.setOption(.linger, -1);
+    // Close blocks until all messages delivered
+    // (or peer disconnects)
+}
+
+test "context termination waits for sockets" {
+    var socket = try ctx.socket(.push);
+    socket.setOption(.linger, 5000);
+    try socket.send(msg);
+
+    // In another coroutine:
+    ctx.term();  // Blocks until socket closes and lingers complete
+}
+
+test "graceful shutdown sequence" {
+    // 1. Stop accepting new connections
+    // 2. Drain pending messages (per linger)
+    // 3. Close pipes
+    // 4. Release resources
+}
+```
+
+### Subscription Matching Tests
+
+**Prefix Matching:**
+```zig
+test "exact prefix match" {
+    try sub.subscribe("foo");
+    try testing.expect(matches("foo", "foobar"));
+    try testing.expect(matches("foo", "foo"));
+    try testing.expect(!matches("foo", "fo"));
+    try testing.expect(!matches("foo", "bar"));
+}
+
+test "empty subscription matches all" {
+    try sub.subscribe("");
+    try testing.expect(matches("", "anything"));
+}
+
+test "binary prefix matching" {
+    // Subscriptions are byte sequences, not strings
+    try sub.subscribe(&[_]u8{0x00, 0x01});
+    // Matches messages starting with those bytes
+}
+```
+
+**MTrie Subscription Tests:**
+```zig
+test "overlapping subscriptions" {
+    try sub.subscribe("foo");
+    try sub.subscribe("foobar");
+    // Message "foobarbaz" matches both, delivered once
+}
+
+test "subscription add/remove" {
+    try sub.subscribe("A");
+    try sub.subscribe("B");
+    try sub.unsubscribe("A");
+    // Only "B" matches now
+}
+
+test "multiple subscribers same prefix" {
+    try sub1.subscribe("X");
+    try sub2.subscribe("X");
+    // Both receive messages starting with "X"
+}
+
+test "subscription reference counting" {
+    // Internal: ensure mtrie tracks subscription counts
+    // Unsubscribe removes only when count reaches zero
+}
+```
+
+### Polling and Readiness Tests
+
+```zig
+test "poll single socket readable" {
+    try push.send(msg);
+
+    var items = [_]PollItem{
+        .{ .socket = pull, .events = .{ .pollin = true } },
+    };
+
+    const ready = try poll(&items, 1000);
+    try testing.expectEqual(@as(usize, 1), ready);
+    try testing.expect(items[0].revents.pollin);
+}
+
+test "poll multiple sockets" {
+    var items = [_]PollItem{
+        .{ .socket = socket1, .events = .{ .pollin = true } },
+        .{ .socket = socket2, .events = .{ .pollin = true } },
+        .{ .socket = socket3, .events = .{ .pollout = true } },
+    };
+
+    const ready = try poll(&items, 100);
+    // Check which sockets are ready
+}
+
+test "poll timeout" {
+    var items = [_]PollItem{...};
+    const ready = try poll(&items, 100);  // 100ms timeout
+    try testing.expectEqual(@as(usize, 0), ready);  // Nothing ready
+}
+
+test "poll immediate (timeout=0)" {
+    const ready = try poll(&items, 0);
+    // Returns immediately with current state
+}
+
+test "poll indefinite (timeout=-1)" {
+    // Blocks until at least one socket ready
+}
+
+test "hasIn and hasOut" {
+    try push.send(msg);
+    try testing.expect(pull.hasIn());
+    try testing.expect(push.hasOut());  // Not at HWM
+}
+
+test "getFd for external event loop" {
+    const fd = socket.getFd();
+    // Add to epoll/kqueue
+    // When signaled, call socket.getEvents() or hasIn()/hasOut()
+}
+```
+
+### Identity and Routing Tests
+
+```zig
+test "socket identity" {
+    socket.setOption(.identity, "my-id");
+    const id = socket.getOption(.identity);
+    try testing.expectEqualStrings("my-id", id);
+}
+
+test "generated identity for anonymous sockets" {
+    // ROUTER generates UUID-like identity for connecting sockets
+}
+
+test "identity uniqueness" {
+    // ROUTER rejects duplicate identities (ZMQ_ROUTER_HANDOVER = 0)
+    // Or takes over connection (ZMQ_ROUTER_HANDOVER = 1)
+}
+
+test "routing table maintenance" {
+    // Identities removed when peer disconnects
+    // Identities added when peer connects
+}
+```
+
+### Edge Cases and Error Handling
+
+```zig
+test "send on closed socket" {
+    socket.close();
+    const result = socket.send(msg);
+    try testing.expectError(error.ENOTSOCK, result);
+}
+
+test "recv on closed socket" {
+    socket.close();
+    const result = socket.recv();
+    try testing.expectError(error.ENOTSOCK, result);
+}
+
+test "operations on terminated context" {
+    ctx.term();
+    const result = socket.send(msg);
+    try testing.expectError(error.ETERM, result);
+}
+
+test "invalid endpoint format" {
+    const result = socket.connect("invalid://endpoint");
+    try testing.expectError(error.EINVAL, result);
+}
+
+test "bind to already-bound port" {
+    try socket1.bind("tcp://127.0.0.1:5555");
+    const result = socket2.bind("tcp://127.0.0.1:5555");
+    try testing.expectError(error.EADDRINUSE, result);
+}
+
+test "message too large" {
+    socket.setOption(.maxmsgsize, 1024);
+    const result = socket.recv();  // Peer sends >1024 bytes
+    try testing.expectError(error.EMSGSIZE, result);
+}
+```
+
+### Concurrency and Thread Safety Tests
+
+```zig
+test "context shared across coroutines" {
+    // Multiple coroutines creating sockets from same context
+    const ctx = try Context.init(...);
+
+    var group = try Group.init(allocator);
+    try group.spawn(worker1, .{ctx});
+    try group.spawn(worker2, .{ctx});
+    try group.await();
+}
+
+test "socket not shared across coroutines" {
+    // Sockets must not be used from multiple coroutines
+    // (unless explicitly synchronized)
+}
+
+test "message ownership transfer" {
+    // After send, message belongs to socket
+    // Caller must not access message data
+}
+```
+
+### Performance and Stress Tests
+
+```zig
+test "throughput benchmark" {
+    const msg_count = 1_000_000;
+    const msg_size = 100;
+
+    // Measure messages per second
+    // Compare against libzmq baseline
+}
+
+test "latency benchmark" {
+    // REQ/REP round-trip
+    // Measure p50, p99, p99.9 latencies
+}
+
+test "many connections" {
+    // 1000+ concurrent connections
+    // Verify no resource exhaustion
+}
+
+test "large message handling" {
+    // 1GB message
+    // Verify memory efficiency (streaming, not full copy)
+}
+
+test "long-running stability" {
+    // Hours of continuous operation
+    // Verify no memory leaks, handle exhaustion
+}
+```
+
+### Test Matrix Summary
+
+| Category | Test Count | Priority |
+|----------|------------|----------|
+| Message System | 12 | P0 - Critical |
+| HWM/Flow Control | 8 | P0 - Critical |
+| PUSH/PULL Pattern | 6 | P0 - Critical |
+| REQ/REP Pattern | 8 | P0 - Critical |
+| DEALER/ROUTER Pattern | 8 | P1 - High |
+| PUB/SUB Pattern | 10 | P0 - Critical |
+| Connection Lifecycle | 10 | P0 - Critical |
+| Reconnection | 8 | P1 - High |
+| Inproc Transport | 6 | P1 - High |
+| ZMTP Protocol | 10 | P0 - Critical |
+| PLAIN Security | 6 | P2 - Medium |
+| Linger/Shutdown | 8 | P1 - High |
+| Subscription Matching | 8 | P0 - Critical |
+| Polling/Readiness | 10 | P0 - Critical |
+| Identity/Routing | 6 | P1 - High |
+| Edge Cases | 10 | P1 - High |
+| Concurrency | 6 | P1 - High |
+| Performance | 8 | P2 - Medium |
+
+**Total: ~140 test cases**
+
+### Compatibility Testing with libzmq
+
+For semantic equivalence, run parallel tests against both implementations:
+
+```zig
+// Test harness that runs same test against ZZMQ and libzmq
+fn compatTest(comptime testFn: fn (*Socket, *Socket) anyerror!void) !void {
+    // Run with ZZMQ
+    var zzmq_push = try zzmq.Context.socket(.push);
+    var zzmq_pull = try zzmq.Context.socket(.pull);
+    try testFn(&zzmq_push, &zzmq_pull);
+
+    // Run with libzmq (via C bindings)
+    var zmq_push = c_zmq_socket(ctx, ZMQ_PUSH);
+    var zmq_pull = c_zmq_socket(ctx, ZMQ_PULL);
+    try testFn(&zmq_push, &zmq_pull);
+
+    // Both should behave identically
+}
+```
+
+### Continuous Integration
+
+- Run full test suite on every PR
+- Performance regression tests (flag if >5% slower)
+- Memory leak detection (valgrind/sanitizers)
+- Cross-platform testing (Linux, macOS, Windows)
+- Interoperability tests with libzmq binaries
 
 ---
 
