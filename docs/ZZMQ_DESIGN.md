@@ -3533,6 +3533,585 @@ pub const Router = struct {
 };
 ```
 
+### XPUB/XSUB Patterns
+
+XPUB and XSUB are the "extended" versions of PUB and SUB that expose subscription messages to the application layer, enabling subscription forwarding through intermediary proxies.
+
+#### libzmq XPUB/XSUB Reference
+
+From `src/xpub.cpp` and `src/xsub.cpp`:
+
+**XPUB (Extended Publisher):**
+- Receives subscription messages from subscribers as readable messages
+- Format: `[0x01][prefix]` for subscribe, `[0x00][prefix]` for unsubscribe
+- `_subscriptions` mtrie tracks which pipes subscribe to which prefixes
+- On send: matches topic against subscriptions, distributes to matching pipes
+- Options:
+  - `ZMQ_XPUB_VERBOSE`: Report all subscribe/unsubscribe (not just first/last)
+  - `ZMQ_XPUB_VERBOSER`: Also report unsubscribes verbosely
+  - `ZMQ_XPUB_MANUAL`: Application controls subscription acceptance
+  - `ZMQ_XPUB_NODROP`: Block instead of drop when HWM reached
+  - `ZMQ_XPUB_WELCOME_MSG`: Send message to new subscribers
+
+**XSUB (Extended Subscriber):**
+- Sends subscription messages upstream (instead of setsockopt)
+- Format: same `[0x01][prefix]` / `[0x00][prefix]` wire format
+- Caches subscriptions locally in `_subscriptions` trie
+- On reconnect (`xhiccuped`): resends all cached subscriptions
+- Filters incoming messages against local subscriptions
+
+**Key Insight**: XPUB/XSUB enable building subscription-forwarding proxies. The proxy receives subscription messages from XPUB, forwards them to XSUB, which sends them upstream to the real publisher.
+
+#### ZZMQ XPUB Implementation
+
+```zig
+pub const XPub = struct {
+    /// Subscription trie: prefix → set of subscribed pipes
+    subscriptions: SubscriptionTrie,
+
+    /// Pending subscription notifications to deliver via recv()
+    pending_notifications: std.ArrayList(SubscriptionNotification),
+
+    /// Distributor for fan-out
+    dist: Distributor,
+
+    /// Options
+    verbose_subs: bool = false,
+    verbose_unsubs: bool = false,
+    manual_mode: bool = false,
+    lossy: bool = true,  // Drop on HWM (false = block)
+    welcome_msg: ?Message = null,
+
+    /// Currently sending multipart
+    more_send: bool = false,
+
+    const SubscriptionNotification = struct {
+        subscribe: bool,  // true=subscribe, false=unsubscribe
+        prefix: []const u8,
+        pipe: ?*Pipe,  // For manual mode
+    };
+
+    pub fn init(allocator: std.mem.Allocator) XPub {
+        return .{
+            .subscriptions = SubscriptionTrie.init(allocator),
+            .pending_notifications = std.ArrayList(SubscriptionNotification).init(allocator),
+            .dist = Distributor.init(allocator),
+        };
+    }
+
+    /// Called when new pipe attaches (subscriber connects)
+    pub fn attachPipe(self: *XPub, pipe: *Pipe) void {
+        self.dist.attach(pipe);
+
+        // Send welcome message if configured
+        if (self.welcome_msg) |*welcome| {
+            var copy = welcome.copy() catch return;
+            pipe.write(copy) catch return;
+            pipe.flush();
+        }
+
+        // Process any subscription messages from this pipe
+        self.processSubscriptions(pipe);
+    }
+
+    /// Process incoming subscription messages from a pipe
+    fn processSubscriptions(self: *XPub, pipe: *Pipe) void {
+        while (pipe.tryRead()) |msg| {
+            defer msg.deinit();
+
+            // Parse subscription message: [0x00|0x01][prefix]
+            const data = msg.data();
+            if (data.len == 0) continue;
+
+            const is_subscribe = data[0] == 0x01;
+            const prefix = data[1..];
+
+            if (self.manual_mode) {
+                // Queue for application to approve via setsockopt
+                self.pending_notifications.append(.{
+                    .subscribe = is_subscribe,
+                    .prefix = prefix,
+                    .pipe = pipe,
+                }) catch continue;
+            } else {
+                // Auto-accept subscription
+                const notify = if (is_subscribe) blk: {
+                    const first_added = self.subscriptions.add(prefix, pipe);
+                    break :blk first_added or self.verbose_subs;
+                } else blk: {
+                    const result = self.subscriptions.remove(prefix, pipe);
+                    break :blk result != .values_remain or self.verbose_unsubs;
+                };
+
+                // Queue notification for recv()
+                if (notify) {
+                    self.pending_notifications.append(.{
+                        .subscribe = is_subscribe,
+                        .prefix = prefix,
+                        .pipe = null,
+                    }) catch continue;
+                }
+            }
+        }
+    }
+
+    /// Send message to matching subscribers
+    pub fn send(
+        self: *XPub,
+        msg: *Message,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        // For first frame, find matching pipes
+        if (!self.more_send) {
+            self.dist.unmatch();
+            self.subscriptions.match(msg.data(), markAsMatching, self);
+        }
+
+        // Check HWM
+        if (!self.lossy and !self.dist.checkHwm()) {
+            return error.WouldBlock;
+        }
+
+        // Send to matching pipes
+        try self.dist.sendToMatching(msg, rt);
+
+        self.more_send = msg.hasMore();
+        if (!self.more_send) {
+            self.dist.unmatch();
+        }
+    }
+
+    /// Receive subscription notification
+    pub fn recv(self: *XPub) RecvError!Message {
+        if (self.pending_notifications.items.len == 0) {
+            return error.WouldBlock;
+        }
+
+        const notif = self.pending_notifications.orderedRemove(0);
+
+        // Create notification message: [0x00|0x01][prefix]
+        var msg = try Message.initSize(1 + notif.prefix.len);
+        msg.data()[0] = if (notif.subscribe) 0x01 else 0x00;
+        @memcpy(msg.data()[1..], notif.prefix);
+
+        return msg;
+    }
+
+    pub fn hasIn(self: *XPub) bool {
+        return self.pending_notifications.items.len > 0;
+    }
+
+    fn markAsMatching(pipe: *Pipe, ctx: *anyopaque) void {
+        const self: *XPub = @ptrCast(@alignCast(ctx));
+        self.dist.match(pipe);
+    }
+};
+```
+
+#### ZZMQ XSUB Implementation
+
+```zig
+pub const XSub = struct {
+    /// Local subscription cache (for reconnect replay)
+    subscriptions: SubscriptionSet,
+
+    /// Fair queue for receiving messages
+    fq: FairQueue,
+
+    /// Distributor for sending subscriptions upstream
+    dist: Distributor,
+
+    /// Currently receiving multipart
+    more_recv: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) XSub {
+        return .{
+            .subscriptions = SubscriptionSet.init(allocator),
+            .fq = FairQueue.init(allocator),
+            .dist = Distributor.init(allocator),
+        };
+    }
+
+    /// Called when new pipe attaches
+    pub fn attachPipe(self: *XSub, pipe: *Pipe) void {
+        self.fq.attach(pipe);
+        self.dist.attach(pipe);
+
+        // Send all cached subscriptions to new upstream peer
+        self.replaySubscriptions(pipe);
+    }
+
+    /// Called on reconnect (pipe hiccup)
+    pub fn onHiccup(self: *XSub, pipe: *Pipe) void {
+        // Resend all subscriptions to reconnected peer
+        self.replaySubscriptions(pipe);
+    }
+
+    fn replaySubscriptions(self: *XSub, pipe: *Pipe) void {
+        var iter = self.subscriptions.iterator();
+        while (iter.next()) |prefix| {
+            var msg = Message.initSize(1 + prefix.len) catch continue;
+            msg.data()[0] = 0x01;  // Subscribe
+            @memcpy(msg.data()[1..], prefix);
+
+            pipe.write(msg) catch {
+                msg.deinit();
+                continue;
+            };
+        }
+        pipe.flush();
+    }
+
+    /// Send subscription message upstream (or user data)
+    pub fn send(
+        self: *XSub,
+        msg: *Message,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        const data = msg.data();
+
+        // Check if this is a subscription message
+        if (data.len > 0 and (data[0] == 0x00 or data[0] == 0x01)) {
+            const is_subscribe = data[0] == 0x01;
+            const prefix = data[1..];
+
+            // Update local cache
+            if (is_subscribe) {
+                try self.subscriptions.add(prefix);
+            } else {
+                _ = self.subscriptions.remove(prefix);
+            }
+        }
+
+        // Forward upstream to XPUB/PUB
+        try self.dist.sendToAll(msg, rt);
+    }
+
+    /// Receive message (filtered by subscriptions)
+    pub fn recv(
+        self: *XSub,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        while (true) {
+            const msg = try self.fq.recv(rt);
+
+            // Pass through if:
+            // - Continuation of multipart (more_recv)
+            // - Matches subscription
+            if (self.more_recv or self.subscriptions.matches(msg.data())) {
+                self.more_recv = msg.hasMore();
+                return msg;
+            }
+
+            // Doesn't match - skip entire multipart
+            msg.deinit();
+            while (msg.hasMore()) {
+                const part = try self.fq.recv(rt);
+                part.deinit();
+            }
+        }
+    }
+
+    pub fn hasOut(self: *XSub) bool {
+        _ = self;
+        return true;  // Subscriptions can always be sent
+    }
+};
+```
+
+#### Subscription Message Format
+
+```
+Subscribe:   [0x01][prefix bytes...]
+Unsubscribe: [0x00][prefix bytes...]
+
+Examples:
+  Subscribe to "weather.":  0x01 0x77 0x65 0x61 0x74 0x68 0x65 0x72 0x2e
+  Unsubscribe from "":      0x00
+  Subscribe to all:         0x01  (empty prefix)
+```
+
+#### XPUB/XSUB Use Cases
+
+1. **Subscription Forwarding Proxy**: XSUB receives publications, XPUB sends to subscribers, subscriptions flow in reverse
+2. **Subscription Logging**: Application can see all subscribe/unsubscribe events
+3. **Manual Subscription Approval**: Application validates subscriptions before accepting
+4. **Dynamic Topic Discovery**: Query active subscriptions via `ZMQ_TOPICS_COUNT`
+
+---
+
+## Proxy Pattern
+
+The proxy (also called "device" or "forwarder") is a built-in message forwarding pattern that connects two sockets bidirectionally, optionally capturing all messages.
+
+### libzmq Proxy Reference
+
+From `src/proxy.cpp`:
+
+**Basic Proxy**:
+```
+zmq_proxy(frontend, backend, capture)
+```
+- Forwards messages: frontend → backend and backend → frontend
+- Preserves multipart atomicity (all parts forwarded together)
+- Optional capture socket receives copy of all messages
+- Blocks until context terminated
+
+**Steerable Proxy**:
+```
+zmq_proxy_steerable(frontend, backend, capture, control)
+```
+- Same as basic proxy plus control socket
+- Control commands: `PAUSE`, `RESUME`, `TERMINATE`, `STATISTICS`
+- Statistics returns 8-part message with counts and bytes
+
+**Key Implementation Details**:
+- Uses `zmq_poll` (or socket_poller) for event multiplexing
+- `forward()` function handles burst of messages (up to `proxy_burst_size`)
+- Careful handling of POLLIN/POLLOUT to avoid blocking
+- When one direction is blocked (HWM), disables polling for input from that direction
+
+### ZZMQ Proxy Implementation
+
+```zig
+pub const Proxy = struct {
+    frontend: *Socket,
+    backend: *Socket,
+    capture: ?*Socket,
+    control: ?*Socket,
+
+    state: State = .active,
+    stats: Statistics = .{},
+
+    const State = enum { active, paused, terminated };
+
+    const Statistics = struct {
+        frontend_recv: EndpointStats = .{},
+        frontend_send: EndpointStats = .{},
+        backend_recv: EndpointStats = .{},
+        backend_send: EndpointStats = .{},
+
+        const EndpointStats = struct {
+            count: u64 = 0,
+            bytes: u64 = 0,
+        };
+    };
+
+    pub fn init(
+        frontend: *Socket,
+        backend: *Socket,
+        capture: ?*Socket,
+        control: ?*Socket,
+    ) Proxy {
+        return .{
+            .frontend = frontend,
+            .backend = backend,
+            .capture = capture,
+            .control = control,
+        };
+    }
+
+    /// Run the proxy (blocks until terminated)
+    pub fn run(self: *Proxy, rt: *zio.Runtime) !void {
+        while (self.state != .terminated) {
+            // Build poll items
+            var items = std.BoundedArray(zzmq.PollItem, 4){};
+
+            try items.append(.{ .socket = self.frontend, .events = .{ .pollin = true, .pollout = true } });
+            try items.append(.{ .socket = self.backend, .events = .{ .pollin = true, .pollout = true } });
+            if (self.control) |ctrl| {
+                try items.append(.{ .socket = ctrl, .events = .{ .pollin = true } });
+            }
+
+            // Poll for events
+            const ready = try zzmq.poll(items.slice(), -1);
+            if (ready == 0) continue;
+
+            // Check control socket first
+            if (self.control) |ctrl| {
+                if (items.get(2).revents.pollin) {
+                    try self.handleControl(ctrl, rt);
+                }
+            }
+
+            if (self.state != .active) continue;
+
+            // Forward frontend → backend
+            if (items.get(0).revents.pollin and items.get(1).revents.pollout) {
+                try self.forward(self.frontend, self.backend, &self.stats.frontend_recv, &self.stats.backend_send, rt);
+            }
+
+            // Forward backend → frontend
+            if (items.get(1).revents.pollin and items.get(0).revents.pollout) {
+                try self.forward(self.backend, self.frontend, &self.stats.backend_recv, &self.stats.frontend_send, rt);
+            }
+        }
+    }
+
+    /// Forward messages from one socket to another
+    fn forward(
+        self: *Proxy,
+        from: *Socket,
+        to: *Socket,
+        recv_stats: *Statistics.EndpointStats,
+        send_stats: *Statistics.EndpointStats,
+        rt: *zio.Runtime,
+    ) !void {
+        // Forward burst of messages
+        const burst_size = 8;
+
+        for (0..burst_size) |_| {
+            // Forward all parts of one message
+            while (true) {
+                var msg = from.tryRecv() orelse return;  // No more messages
+                defer if (msg.needsDeinit()) msg.deinit();
+
+                const nbytes = msg.size();
+                recv_stats.count += 1;
+                recv_stats.bytes += nbytes;
+
+                const has_more = msg.hasMore();
+
+                // Copy to capture socket if present
+                if (self.capture) |capture| {
+                    var copy = try msg.copy();
+                    try capture.send(&copy, if (has_more) .{ .sndmore = true } else .{});
+                }
+
+                // Forward to destination
+                try to.send(&msg, if (has_more) .{ .sndmore = true } else .{});
+                send_stats.count += 1;
+                send_stats.bytes += nbytes;
+
+                if (!has_more) break;
+            }
+        }
+    }
+
+    fn handleControl(self: *Proxy, control: *Socket, rt: *zio.Runtime) !void {
+        var msg = try control.recv(rt);
+        defer msg.deinit();
+
+        const cmd = msg.data();
+
+        if (std.mem.eql(u8, cmd, "PAUSE")) {
+            self.state = .paused;
+        } else if (std.mem.eql(u8, cmd, "RESUME")) {
+            self.state = .active;
+        } else if (std.mem.eql(u8, cmd, "TERMINATE")) {
+            self.state = .terminated;
+        } else if (std.mem.eql(u8, cmd, "STATISTICS")) {
+            // Send 8-part reply with statistics
+            const stat_values = [8]u64{
+                self.stats.frontend_recv.count,
+                self.stats.frontend_recv.bytes,
+                self.stats.frontend_send.count,
+                self.stats.frontend_send.bytes,
+                self.stats.backend_recv.count,
+                self.stats.backend_recv.bytes,
+                self.stats.backend_send.count,
+                self.stats.backend_send.bytes,
+            };
+
+            for (stat_values, 0..) |value, i| {
+                var reply = try Message.initSize(@sizeOf(u64));
+                std.mem.writeInt(u64, reply.data()[0..8], value, .little);
+                try control.send(&reply, if (i < 7) .{ .sndmore = true } else .{});
+            }
+            return;
+        }
+
+        // For REP socket, send empty reply
+        if (control.getSocketType() == .rep) {
+            var reply = Message.init();
+            try control.send(&reply, .{});
+        }
+    }
+};
+
+/// Convenience function matching libzmq API
+pub fn proxy(frontend: *Socket, backend: *Socket, capture: ?*Socket) !void {
+    var p = Proxy.init(frontend, backend, capture, null);
+    try p.run(frontend.runtime);
+}
+
+/// Steerable proxy with control socket
+pub fn proxySteerable(
+    frontend: *Socket,
+    backend: *Socket,
+    capture: ?*Socket,
+    control: *Socket,
+) !void {
+    var p = Proxy.init(frontend, backend, capture, control);
+    try p.run(frontend.runtime);
+}
+```
+
+### Proxy Use Cases
+
+**1. PUB/SUB Forwarder (XPUB-XSUB)**:
+```zig
+// Publishers connect to frontend (XSUB)
+// Subscribers connect to backend (XPUB)
+// Subscriptions flow: XPUB → proxy → XSUB → publisher
+var frontend = try ctx.socket(.xsub);
+var backend = try ctx.socket(.xpub);
+
+try frontend.connect("tcp://publisher:5555");
+try backend.bind("tcp://*:5556");
+
+try zzmq.proxy(&frontend, &backend, null);
+```
+
+**2. Request/Reply Broker (ROUTER-DEALER)**:
+```zig
+// Clients connect to frontend (ROUTER)
+// Workers connect to backend (DEALER)
+var frontend = try ctx.socket(.router);
+var backend = try ctx.socket(.dealer);
+
+try frontend.bind("tcp://*:5555");
+try backend.bind("tcp://*:5556");
+
+try zzmq.proxy(&frontend, &backend, null);
+```
+
+**3. Load Balancer (ROUTER-ROUTER)**:
+```zig
+// More control over routing
+var frontend = try ctx.socket(.router);
+var backend = try ctx.socket(.router);
+// Custom routing logic in between
+```
+
+**4. Tap/Monitor (with capture)**:
+```zig
+var capture = try ctx.socket(.pub);
+try capture.bind("tcp://*:5557");
+
+// All proxied messages also sent to capture socket
+try zzmq.proxy(&frontend, &backend, &capture);
+```
+
+### Proxy Flow Diagram
+
+```
+                    ┌─────────────────────────────────────┐
+                    │             PROXY                   │
+                    │                                     │
+  Clients ──────────┼─► Frontend ────────► Backend ──────┼──► Workers
+                    │      ▲                    │         │
+                    │      │                    ▼         │
+  Workers ──────────┼─► Backend ─────────► Frontend ─────┼──► Clients
+                    │                                     │
+                    │      │         Capture              │
+                    │      └──────────┬──────────         │
+                    └─────────────────┼───────────────────┘
+                                      │
+                                      ▼
+                               Monitor/Tap
+```
+
 ---
 
 ## Options and Configuration
