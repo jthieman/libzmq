@@ -20,15 +20,16 @@ A high-performance messaging library implementing ZeroMQ semantics, built idioma
 14. [Options and Configuration](#options-and-configuration)
 15. [Error Handling](#error-handling)
 16. [API Design](#api-design)
-17. [Performance Considerations: Hot Path Deep Dive](#performance-considerations-hot-path-deep-dive)
-18. [Monitoring and Events](#monitoring-and-events)
-19. [libzmq Reference: Critical Behaviors](#libzmq-reference-critical-behaviors-and-edge-cases)
-20. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
-21. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
-22. [libzmq Deep Dives: Protocol, Patterns, Internals](#libzmq-deep-dives-protocol-patterns-and-internals)
-23. [Testing Strategy and Coverage](#testing-strategy-and-coverage)
-24. [Implementation Roadmap](#implementation-roadmap)
-25. [Summary](#summary)
+17. [C FFI Layer](#c-ffi-layer)
+18. [Performance Considerations: Hot Path Deep Dive](#performance-considerations-hot-path-deep-dive)
+19. [Monitoring and Events](#monitoring-and-events)
+20. [libzmq Reference: Critical Behaviors](#libzmq-reference-critical-behaviors-and-edge-cases)
+21. [libzmq Reference: Signaling, Connection, Heartbeat](#libzmq-reference-signaling-connection-readiness-heartbeat-disconnect)
+22. [libzmq Reference: Level vs Edge Triggering and Polling](#libzmq-reference-level-vs-edge-triggering-and-polling)
+23. [libzmq Deep Dives: Protocol, Patterns, Internals](#libzmq-deep-dives-protocol-patterns-and-internals)
+24. [Testing Strategy and Coverage](#testing-strategy-and-coverage)
+25. [Implementation Roadmap](#implementation-roadmap)
+26. [Summary](#summary)
 
 ---
 
@@ -101,7 +102,7 @@ ZZMQ should match or exceed libzmq's throughput and latency.
 
 3. **Simpler architecture**: libzmq has separate I/O threads, mailboxes, and command queues. We have coroutines on a single runtime - less cross-thread coordination.
 
-4. **Inline small messages**: Messages ≤48 bytes are stored inline in the Message struct. No allocation, no indirection.
+4. **Inline small messages**: Messages ≤48 bytes are stored inline in the Message struct. No allocation, no indirection. (libzmq uses ~30 bytes; ZZMQ increases this for better small-message performance.)
 
 5. **No hidden allocations**: Every allocation is explicit and can use custom allocators. libzmq allocates internally with global malloc.
 
@@ -746,6 +747,9 @@ Messages are the unit of data transfer. Design goals:
 
 ```zig
 /// Maximum inline data size (avoid allocation for small messages)
+/// libzmq's max_vsm_size is ~30 bytes (platform-dependent). ZZMQ uses 48 bytes
+/// because: (1) many real-world messages are 32-64 bytes, (2) the Message struct
+/// is 64 bytes anyway for cache alignment, (3) larger inline = fewer allocations.
 const INLINE_SIZE = 48;
 
 /// A single message (may be part of multipart)
@@ -2398,6 +2402,262 @@ pub const TcpEndpoint = struct {
 };
 ```
 
+### IPC Transport (Unix Domain Sockets)
+
+IPC transport uses Unix domain sockets for efficient local inter-process communication. This transport is significantly faster than TCP for same-machine communication as it bypasses the network stack.
+
+#### libzmq IPC Reference
+
+From `src/ipc_address.cpp`:
+- Uses `struct sockaddr_un` with `AF_UNIX` family
+- Path stored in `sun_path` (max 108 bytes on Linux, varies by platform)
+- **Abstract sockets**: Path starting with `@` is converted to `\0` prefix (Linux-only, no filesystem entry)
+- **Wildcard binding**: Path `*` creates temp directory with unique socket file
+
+From `src/ipc_listener.cpp`:
+- **File cleanup**: `unlink()` before bind to remove stale socket files
+- **Peer credentials**: `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (BSD) for UID/GID/PID filtering
+- Socket file deleted on close (unless using `ZMQ_USE_FD`)
+
+#### ZZMQ IPC Implementation
+
+```zig
+pub const IpcEndpoint = struct {
+    path: []const u8,
+    is_abstract: bool,
+
+    /// Maximum path length (platform-dependent)
+    pub const MAX_PATH_LEN = 108; // Linux sockaddr_un.sun_path
+
+    pub fn parse(path: []const u8) !IpcEndpoint {
+        if (path.len == 0) return error.InvalidEndpoint;
+
+        // Check for abstract socket prefix
+        if (path[0] == '@') {
+            if (path.len == 1) return error.InvalidEndpoint; // "@" alone invalid
+            if (path.len > MAX_PATH_LEN) return error.PathTooLong;
+            return .{ .path = path[1..], .is_abstract = true };
+        }
+
+        if (path.len >= MAX_PATH_LEN) return error.PathTooLong;
+        return .{ .path = path, .is_abstract = false };
+    }
+
+    pub fn connect(self: IpcEndpoint, rt: *zio.Runtime) !zio.net.Stream {
+        const addr = self.toSocketAddress();
+        return try zio.net.Stream.connect(rt, .{ .unix = addr });
+    }
+
+    pub fn listen(self: IpcEndpoint, rt: *zio.Runtime, options: ListenOptions) !IpcListener {
+        return try IpcListener.init(rt, self, options);
+    }
+
+    fn toSocketAddress(self: IpcEndpoint) std.os.sockaddr.un {
+        var addr: std.os.sockaddr.un = .{
+            .family = std.os.AF.UNIX,
+            .path = undefined,
+        };
+
+        if (self.is_abstract) {
+            // Abstract socket: first byte is NUL
+            addr.path[0] = 0;
+            @memcpy(addr.path[1..][0..self.path.len], self.path);
+        } else {
+            @memcpy(addr.path[0..self.path.len], self.path);
+            addr.path[self.path.len] = 0; // NUL terminate
+        }
+
+        return addr;
+    }
+};
+
+pub const IpcListener = struct {
+    server: zio.net.Server,
+    endpoint: IpcEndpoint,
+    owns_file: bool,
+    temp_dir: ?[]const u8,
+    allocator: std.mem.Allocator,
+
+    pub const ListenOptions = struct {
+        /// Pre-created socket FD (for systemd socket activation)
+        use_fd: ?std.os.fd_t = null,
+        /// Backlog for listen()
+        backlog: u31 = 128,
+        /// UID filter (empty = accept all)
+        uid_filter: []const std.os.uid_t = &.{},
+        /// GID filter (empty = accept all)
+        gid_filter: []const std.os.gid_t = &.{},
+        /// PID filter (empty = accept all) - Linux only
+        pid_filter: []const std.os.pid_t = &.{},
+    };
+
+    pub fn init(
+        rt: *zio.Runtime,
+        endpoint: IpcEndpoint,
+        options: ListenOptions,
+    ) !IpcListener {
+        var self = IpcListener{
+            .server = undefined,
+            .endpoint = endpoint,
+            .owns_file = false,
+            .temp_dir = null,
+            .allocator = rt.allocator,
+        };
+
+        if (options.use_fd) |fd| {
+            // Use pre-created FD (systemd socket activation)
+            self.server = zio.net.Server.fromFd(fd);
+            self.owns_file = false;
+        } else {
+            // Handle wildcard binding
+            var actual_path = endpoint.path;
+            if (std.mem.eql(u8, endpoint.path, "*")) {
+                const temp = try self.createWildcardSocket();
+                actual_path = temp.path;
+                self.temp_dir = temp.dir;
+            }
+
+            // Remove stale socket file (like libzmq)
+            if (!endpoint.is_abstract) {
+                std.fs.cwd().deleteFile(actual_path) catch {};
+            }
+
+            // Bind and listen
+            const addr = (IpcEndpoint{ .path = actual_path, .is_abstract = endpoint.is_abstract }).toSocketAddress();
+            self.server = try zio.net.Server.init(rt, .{ .unix = addr }, .{
+                .backlog = options.backlog,
+            });
+            self.owns_file = !endpoint.is_abstract;
+        }
+
+        return self;
+    }
+
+    pub fn accept(self: *IpcListener, rt: *zio.Runtime) !zio.net.Stream {
+        while (true) {
+            const stream = try self.server.accept(rt);
+
+            // Apply peer credential filters
+            if (try self.filterConnection(stream)) {
+                return stream;
+            }
+
+            // Connection rejected by filter
+            stream.close();
+        }
+    }
+
+    fn filterConnection(self: *IpcListener, stream: zio.net.Stream) !bool {
+        // No filters = accept all
+        if (self.options.uid_filter.len == 0 and
+            self.options.gid_filter.len == 0 and
+            self.options.pid_filter.len == 0)
+        {
+            return true;
+        }
+
+        // Get peer credentials (platform-specific)
+        const creds = try getPeerCredentials(stream.handle);
+
+        // Check UID
+        for (self.options.uid_filter) |allowed_uid| {
+            if (creds.uid == allowed_uid) return true;
+        }
+
+        // Check GID
+        for (self.options.gid_filter) |allowed_gid| {
+            if (creds.gid == allowed_gid) return true;
+        }
+
+        // Check PID (Linux only)
+        for (self.options.pid_filter) |allowed_pid| {
+            if (creds.pid == allowed_pid) return true;
+        }
+
+        return false;
+    }
+
+    pub fn deinit(self: *IpcListener) void {
+        self.server.deinit();
+
+        // Clean up socket file
+        if (self.owns_file) {
+            std.fs.cwd().deleteFile(self.endpoint.path) catch {};
+        }
+
+        // Clean up temp directory for wildcard sockets
+        if (self.temp_dir) |dir| {
+            std.fs.cwd().deleteTree(dir) catch {};
+            self.allocator.free(dir);
+        }
+    }
+
+    fn createWildcardSocket(self: *IpcListener) !struct { path: []const u8, dir: []const u8 } {
+        // Create unique temp directory like libzmq
+        const template = "/tmp/zzmq-XXXXXX";
+        const dir = try std.fs.makeTempDir(self.allocator, template);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/socket", .{dir});
+        return .{ .path = path, .dir = dir };
+    }
+};
+
+/// Get peer credentials from Unix socket (platform-specific)
+fn getPeerCredentials(fd: std.os.fd_t) !PeerCredentials {
+    if (@hasDecl(std.os, "SO") and @hasDecl(std.os.SO, "PEERCRED")) {
+        // Linux: SO_PEERCRED
+        var cred: extern struct {
+            pid: std.os.pid_t,
+            uid: std.os.uid_t,
+            gid: std.os.gid_t,
+        } = undefined;
+        var len: std.os.socklen_t = @sizeOf(@TypeOf(cred));
+
+        try std.os.getsockopt(fd, std.os.SOL.SOCKET, std.os.SO.PEERCRED, std.mem.asBytes(&cred), &len);
+
+        return .{ .pid = cred.pid, .uid = cred.uid, .gid = cred.gid };
+    } else if (comptime @hasDecl(std.os, "LOCAL_PEERCRED")) {
+        // BSD: LOCAL_PEERCRED
+        // ... BSD-specific implementation
+    }
+
+    return error.PeerCredentialsNotSupported;
+}
+
+pub const PeerCredentials = struct {
+    uid: std.os.uid_t,
+    gid: std.os.gid_t,
+    pid: ?std.os.pid_t = null, // Linux only
+};
+```
+
+#### IPC Transport Features
+
+| Feature | libzmq | ZZMQ |
+|---------|--------|------|
+| Regular socket path | `ipc:///tmp/sock` | ✓ Same |
+| Abstract sockets | `ipc://@abstract` | ✓ `@` prefix → `\0` prefix |
+| Wildcard binding | `ipc://*` | ✓ Temp dir + unique socket |
+| File cleanup | Unlink before bind, on close | ✓ Same |
+| UID filtering | `ZMQ_IPC_FILTER_UID` | ✓ `ListenOptions.uid_filter` |
+| GID filtering | `ZMQ_IPC_FILTER_GID` | ✓ `ListenOptions.gid_filter` |
+| PID filtering | `ZMQ_IPC_FILTER_PID` | ✓ `ListenOptions.pid_filter` (Linux) |
+| Socket activation | `ZMQ_USE_FD` | ✓ `ListenOptions.use_fd` |
+
+#### Platform Considerations
+
+**Linux:**
+- Full support for abstract sockets (no filesystem entry)
+- `SO_PEERCRED` provides pid, uid, gid
+
+**macOS/BSD:**
+- No abstract sockets (use regular paths)
+- `LOCAL_PEERCRED` provides uid, gid (no pid)
+
+**Windows:**
+- AF_UNIX supported since Windows 10 1803
+- No peer credentials available
+- Path format: `ipc://C:\Users\...\socket`
+
 ### Inproc Transport
 
 Inproc bypasses network entirely - just connects pipes directly:
@@ -3493,6 +3753,649 @@ fn subscriber(ctx: *zzmq.Context) !void {
 
 ---
 
+## C FFI Layer
+
+ZZMQ provides a C-compatible API layer for interoperability with existing ZeroMQ language bindings and applications. The goal is source-level compatibility with libzmq's public API.
+
+### Design Principles
+
+1. **Opaque Handles**: All objects (context, socket, message) are opaque `void*` pointers
+2. **Error Codes**: Return -1 on error, set errno (via thread-local storage)
+3. **Memory Ownership**: Clear ownership semantics matching libzmq exactly
+4. **ABI Stability**: Struct layouts and function signatures match libzmq 4.3.x
+5. **Zero-Copy Bridge**: Minimal overhead when crossing FFI boundary
+
+### C Header (zzmq.h)
+
+```c
+/* ZZMQ - ZeroMQ-compatible messaging for Zig/ZIO */
+/* API-compatible with libzmq 4.3.x */
+
+#ifndef __ZZMQ_H_INCLUDED__
+#define __ZZMQ_H_INCLUDED__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stddef.h>
+#include <stdint.h>
+
+/*  Version macros                                                            */
+#define ZZMQ_VERSION_MAJOR 1
+#define ZZMQ_VERSION_MINOR 0
+#define ZZMQ_VERSION_PATCH 0
+
+/*  For libzmq compatibility, also define ZMQ_VERSION                         */
+#define ZMQ_VERSION_MAJOR 4
+#define ZMQ_VERSION_MINOR 3
+#define ZMQ_VERSION_PATCH 6
+
+/*  Symbol visibility                                                         */
+#if defined _WIN32
+#  if defined ZZMQ_STATIC
+#    define ZZMQ_EXPORT
+#  elif defined ZZMQ_BUILD
+#    define ZZMQ_EXPORT __declspec(dllexport)
+#  else
+#    define ZZMQ_EXPORT __declspec(dllimport)
+#  endif
+#else
+#  define ZZMQ_EXPORT __attribute__((visibility("default")))
+#endif
+
+/*  For libzmq compatibility                                                  */
+#define ZMQ_EXPORT ZZMQ_EXPORT
+
+/******************************************************************************/
+/*  Error codes                                                               */
+/******************************************************************************/
+
+/*  Native ZZMQ/ZMQ error codes                                               */
+#define ZZMQ_HAUSNUMERO 156384712
+#define EFSM            (ZZMQ_HAUSNUMERO + 51)
+#define ENOCOMPATPROTO  (ZZMQ_HAUSNUMERO + 52)
+#define ETERM           (ZZMQ_HAUSNUMERO + 53)
+#define EMTHREAD        (ZZMQ_HAUSNUMERO + 54)
+
+ZZMQ_EXPORT int zmq_errno(void);
+ZZMQ_EXPORT const char *zmq_strerror(int errnum);
+ZZMQ_EXPORT void zmq_version(int *major, int *minor, int *patch);
+
+/******************************************************************************/
+/*  Context                                                                   */
+/******************************************************************************/
+
+#define ZMQ_IO_THREADS          1
+#define ZMQ_MAX_SOCKETS         2
+#define ZMQ_SOCKET_LIMIT        3
+#define ZMQ_THREAD_PRIORITY     3
+#define ZMQ_THREAD_SCHED_POLICY 4
+#define ZMQ_MAX_MSGSZ           5
+#define ZMQ_MSG_T_SIZE          6
+
+ZZMQ_EXPORT void *zmq_ctx_new(void);
+ZZMQ_EXPORT int zmq_ctx_term(void *context);
+ZZMQ_EXPORT int zmq_ctx_shutdown(void *context);
+ZZMQ_EXPORT int zmq_ctx_set(void *context, int option, int optval);
+ZZMQ_EXPORT int zmq_ctx_get(void *context, int option);
+
+/*  Legacy aliases                                                            */
+ZZMQ_EXPORT void *zmq_init(int io_threads);
+ZZMQ_EXPORT int zmq_term(void *context);
+#define zmq_ctx_destroy zmq_ctx_term
+
+/******************************************************************************/
+/*  Message                                                                   */
+/******************************************************************************/
+
+/*  Message struct - must match libzmq's 64-byte layout                       */
+typedef struct zmq_msg_t {
+    unsigned char _[64] __attribute__((aligned(sizeof(void *))));
+} zmq_msg_t;
+
+typedef void(zmq_free_fn)(void *data, void *hint);
+
+ZZMQ_EXPORT int zmq_msg_init(zmq_msg_t *msg);
+ZZMQ_EXPORT int zmq_msg_init_size(zmq_msg_t *msg, size_t size);
+ZZMQ_EXPORT int zmq_msg_init_data(zmq_msg_t *msg, void *data, size_t size,
+                                   zmq_free_fn *ffn, void *hint);
+ZZMQ_EXPORT int zmq_msg_send(zmq_msg_t *msg, void *socket, int flags);
+ZZMQ_EXPORT int zmq_msg_recv(zmq_msg_t *msg, void *socket, int flags);
+ZZMQ_EXPORT int zmq_msg_close(zmq_msg_t *msg);
+ZZMQ_EXPORT int zmq_msg_move(zmq_msg_t *dest, zmq_msg_t *src);
+ZZMQ_EXPORT int zmq_msg_copy(zmq_msg_t *dest, zmq_msg_t *src);
+ZZMQ_EXPORT void *zmq_msg_data(zmq_msg_t *msg);
+ZZMQ_EXPORT size_t zmq_msg_size(const zmq_msg_t *msg);
+ZZMQ_EXPORT int zmq_msg_more(const zmq_msg_t *msg);
+ZZMQ_EXPORT int zmq_msg_get(const zmq_msg_t *msg, int property);
+ZZMQ_EXPORT int zmq_msg_set(zmq_msg_t *msg, int property, int optval);
+ZZMQ_EXPORT const char *zmq_msg_gets(const zmq_msg_t *msg, const char *property);
+
+/*  Message properties                                                        */
+#define ZMQ_MORE   1
+#define ZMQ_SHARED 3
+
+/******************************************************************************/
+/*  Socket                                                                    */
+/******************************************************************************/
+
+/*  Socket types                                                              */
+#define ZMQ_PAIR   0
+#define ZMQ_PUB    1
+#define ZMQ_SUB    2
+#define ZMQ_REQ    3
+#define ZMQ_REP    4
+#define ZMQ_DEALER 5
+#define ZMQ_ROUTER 6
+#define ZMQ_PULL   7
+#define ZMQ_PUSH   8
+#define ZMQ_XPUB   9
+#define ZMQ_XSUB   10
+#define ZMQ_STREAM 11
+
+/*  Socket options (subset - full list in implementation)                     */
+#define ZMQ_SNDHWM          23
+#define ZMQ_RCVHWM          24
+#define ZMQ_ROUTING_ID      5
+#define ZMQ_SUBSCRIBE       6
+#define ZMQ_UNSUBSCRIBE     7
+#define ZMQ_LINGER          17
+#define ZMQ_RECONNECT_IVL   18
+#define ZMQ_RCVTIMEO        27
+#define ZMQ_SNDTIMEO        28
+#define ZMQ_FD              14
+#define ZMQ_EVENTS          15
+
+/*  Send/recv flags                                                           */
+#define ZMQ_DONTWAIT 1
+#define ZMQ_SNDMORE  2
+
+ZZMQ_EXPORT void *zmq_socket(void *context, int type);
+ZZMQ_EXPORT int zmq_close(void *socket);
+ZZMQ_EXPORT int zmq_setsockopt(void *socket, int option, const void *optval,
+                                size_t optvallen);
+ZZMQ_EXPORT int zmq_getsockopt(void *socket, int option, void *optval,
+                                size_t *optvallen);
+ZZMQ_EXPORT int zmq_bind(void *socket, const char *addr);
+ZZMQ_EXPORT int zmq_connect(void *socket, const char *addr);
+ZZMQ_EXPORT int zmq_unbind(void *socket, const char *addr);
+ZZMQ_EXPORT int zmq_disconnect(void *socket, const char *addr);
+ZZMQ_EXPORT int zmq_send(void *socket, const void *buf, size_t len, int flags);
+ZZMQ_EXPORT int zmq_recv(void *socket, void *buf, size_t len, int flags);
+ZZMQ_EXPORT int zmq_socket_monitor(void *socket, const char *addr, int events);
+
+/******************************************************************************/
+/*  Polling                                                                   */
+/******************************************************************************/
+
+#define ZMQ_POLLIN  1
+#define ZMQ_POLLOUT 2
+#define ZMQ_POLLERR 4
+#define ZMQ_POLLPRI 8
+
+typedef int zmq_fd_t;
+
+typedef struct zmq_pollitem_t {
+    void *socket;
+    zmq_fd_t fd;
+    short events;
+    short revents;
+} zmq_pollitem_t;
+
+ZZMQ_EXPORT int zmq_poll(zmq_pollitem_t *items, int nitems, long timeout);
+
+/******************************************************************************/
+/*  Proxy                                                                     */
+/******************************************************************************/
+
+ZZMQ_EXPORT int zmq_proxy(void *frontend, void *backend, void *capture);
+ZZMQ_EXPORT int zmq_proxy_steerable(void *frontend, void *backend,
+                                     void *capture, void *control);
+
+/******************************************************************************/
+/*  Capability probing                                                        */
+/******************************************************************************/
+
+ZZMQ_EXPORT int zmq_has(const char *capability);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __ZZMQ_H_INCLUDED__ */
+```
+
+### Zig FFI Implementation
+
+```zig
+// src/c_api.zig - C FFI layer implementation
+
+const std = @import("std");
+const zzmq = @import("zzmq.zig");
+
+/// Thread-local errno for C API
+threadlocal var c_errno: c_int = 0;
+
+/// Opaque handle wrapper
+fn Handle(comptime T: type) type {
+    return struct {
+        ptr: *T,
+
+        pub fn fromOpaque(opaque: ?*anyopaque) ?@This() {
+            const p = opaque orelse return null;
+            return .{ .ptr = @ptrCast(@alignCast(p)) };
+        }
+
+        pub fn toOpaque(self: @This()) *anyopaque {
+            return @ptrCast(self.ptr);
+        }
+    };
+}
+
+const ContextHandle = Handle(zzmq.Context);
+const SocketHandle = Handle(zzmq.Socket);
+
+// ============================================================================
+// Error handling
+// ============================================================================
+
+export fn zmq_errno() c_int {
+    return c_errno;
+}
+
+export fn zmq_strerror(errnum: c_int) [*:0]const u8 {
+    return switch (errnum) {
+        @intFromEnum(std.os.E.EFSM) => "Operation cannot be accomplished in current state",
+        @intFromEnum(std.os.E.ETERM) => "Context was terminated",
+        @intFromEnum(std.os.E.EMTHREAD) => "No thread available",
+        @intFromEnum(std.os.E.ENOCOMPATPROTO) => "Protocol not compatible with socket type",
+        else => std.os.strerror(@enumFromInt(errnum)),
+    };
+}
+
+export fn zmq_version(major: *c_int, minor: *c_int, patch: *c_int) void {
+    major.* = 4;  // libzmq compatibility
+    minor.* = 3;
+    patch.* = 6;
+}
+
+// ============================================================================
+// Context
+// ============================================================================
+
+export fn zmq_ctx_new() ?*anyopaque {
+    const ctx = zzmq.Context.init(.{}) catch |err| {
+        c_errno = errToErrno(err);
+        return null;
+    };
+    return ctx.toOpaque();
+}
+
+export fn zmq_ctx_term(context: ?*anyopaque) c_int {
+    const ctx = ContextHandle.fromOpaque(context) orelse {
+        c_errno = @intFromEnum(std.os.E.EFAULT);
+        return -1;
+    };
+    ctx.ptr.deinit() catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_ctx_set(context: ?*anyopaque, option: c_int, optval: c_int) c_int {
+    const ctx = ContextHandle.fromOpaque(context) orelse {
+        c_errno = @intFromEnum(std.os.E.EFAULT);
+        return -1;
+    };
+    ctx.ptr.setOption(@enumFromInt(option), optval) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_ctx_get(context: ?*anyopaque, option: c_int) c_int {
+    const ctx = ContextHandle.fromOpaque(context) orelse {
+        c_errno = @intFromEnum(std.os.E.EFAULT);
+        return -1;
+    };
+    return ctx.ptr.getOption(@enumFromInt(option)) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+}
+
+// ============================================================================
+// Socket
+// ============================================================================
+
+export fn zmq_socket(context: ?*anyopaque, socket_type: c_int) ?*anyopaque {
+    const ctx = ContextHandle.fromOpaque(context) orelse {
+        c_errno = @intFromEnum(std.os.E.EFAULT);
+        return null;
+    };
+
+    const sock_type: zzmq.SocketType = @enumFromInt(socket_type);
+    const socket = ctx.ptr.socket(sock_type) catch |err| {
+        c_errno = errToErrno(err);
+        return null;
+    };
+
+    return socket.toOpaque();
+}
+
+export fn zmq_close(socket: ?*anyopaque) c_int {
+    const sock = SocketHandle.fromOpaque(socket) orelse {
+        c_errno = @intFromEnum(std.os.E.ENOTSOCK);
+        return -1;
+    };
+    sock.ptr.close() catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_bind(socket: ?*anyopaque, addr: [*:0]const u8) c_int {
+    const sock = SocketHandle.fromOpaque(socket) orelse {
+        c_errno = @intFromEnum(std.os.E.ENOTSOCK);
+        return -1;
+    };
+    sock.ptr.bind(std.mem.sliceTo(addr, 0)) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_connect(socket: ?*anyopaque, addr: [*:0]const u8) c_int {
+    const sock = SocketHandle.fromOpaque(socket) orelse {
+        c_errno = @intFromEnum(std.os.E.ENOTSOCK);
+        return -1;
+    };
+    sock.ptr.connect(std.mem.sliceTo(addr, 0)) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_send(
+    socket: ?*anyopaque,
+    buf: [*]const u8,
+    len: usize,
+    flags: c_int,
+) c_int {
+    const sock = SocketHandle.fromOpaque(socket) orelse {
+        c_errno = @intFromEnum(std.os.E.ENOTSOCK);
+        return -1;
+    };
+
+    const dontwait = (flags & 1) != 0;
+    const sndmore = (flags & 2) != 0;
+
+    var msg = zzmq.Message.initFromSlice(buf[0..len]) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+
+    if (sndmore) msg.setMore(true);
+
+    if (dontwait) {
+        if (!sock.ptr.trySend(&msg)) {
+            c_errno = @intFromEnum(std.os.E.EAGAIN);
+            return -1;
+        }
+    } else {
+        sock.ptr.send(&msg) catch |err| {
+            c_errno = errToErrno(err);
+            return -1;
+        };
+    }
+
+    return @intCast(len);
+}
+
+export fn zmq_recv(
+    socket: ?*anyopaque,
+    buf: [*]u8,
+    len: usize,
+    flags: c_int,
+) c_int {
+    const sock = SocketHandle.fromOpaque(socket) orelse {
+        c_errno = @intFromEnum(std.os.E.ENOTSOCK);
+        return -1;
+    };
+
+    const dontwait = (flags & 1) != 0;
+
+    var msg: zzmq.Message = undefined;
+    if (dontwait) {
+        msg = sock.ptr.tryRecv() orelse {
+            c_errno = @intFromEnum(std.os.E.EAGAIN);
+            return -1;
+        };
+    } else {
+        msg = sock.ptr.recv() catch |err| {
+            c_errno = errToErrno(err);
+            return -1;
+        };
+    }
+    defer msg.deinit();
+
+    const copy_len = @min(len, msg.size());
+    @memcpy(buf[0..copy_len], msg.data()[0..copy_len]);
+
+    return @intCast(msg.size());
+}
+
+// ============================================================================
+// Message API
+// ============================================================================
+
+/// zmq_msg_t layout - must match C header (64 bytes)
+const CMessage = extern struct {
+    _data: [64]u8 align(@alignOf(*anyopaque)),
+
+    fn fromZig(msg: *zzmq.Message) *CMessage {
+        return @ptrCast(msg);
+    }
+
+    fn toZig(self: *CMessage) *zzmq.Message {
+        return @ptrCast(@alignCast(self));
+    }
+};
+
+export fn zmq_msg_init(msg: *CMessage) c_int {
+    msg.toZig().* = zzmq.Message.init();
+    return 0;
+}
+
+export fn zmq_msg_init_size(msg: *CMessage, size: usize) c_int {
+    msg.toZig().* = zzmq.Message.initSize(size) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+    return 0;
+}
+
+export fn zmq_msg_init_data(
+    msg: *CMessage,
+    data: [*]u8,
+    size: usize,
+    ffn: ?*const fn (*anyopaque, *anyopaque) callconv(.C) void,
+    hint: ?*anyopaque,
+) c_int {
+    msg.toZig().* = zzmq.Message.initExternal(data[0..size], ffn, hint);
+    return 0;
+}
+
+export fn zmq_msg_data(msg: *CMessage) ?[*]u8 {
+    return msg.toZig().data().ptr;
+}
+
+export fn zmq_msg_size(msg: *const CMessage) usize {
+    return @constCast(msg).toZig().size();
+}
+
+export fn zmq_msg_more(msg: *const CMessage) c_int {
+    return if (@constCast(msg).toZig().hasMore()) 1 else 0;
+}
+
+export fn zmq_msg_close(msg: *CMessage) c_int {
+    msg.toZig().deinit();
+    return 0;
+}
+
+// ============================================================================
+// Polling
+// ============================================================================
+
+const CPollItem = extern struct {
+    socket: ?*anyopaque,
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+};
+
+export fn zmq_poll(items: [*]CPollItem, nitems: c_int, timeout: c_long) c_int {
+    if (nitems <= 0) return 0;
+
+    const n: usize = @intCast(nitems);
+    var ready: c_int = 0;
+
+    // Convert to ZZMQ poll items and poll
+    var zzmq_items: [64]zzmq.PollItem = undefined;
+    if (n > zzmq_items.len) {
+        c_errno = @intFromEnum(std.os.E.EINVAL);
+        return -1;
+    }
+
+    for (items[0..n], 0..) |*item, i| {
+        zzmq_items[i] = .{
+            .socket = if (item.socket) |s| SocketHandle.fromOpaque(s).?.ptr else null,
+            .fd = if (item.socket == null) item.fd else -1,
+            .events = @bitCast(item.events),
+        };
+    }
+
+    const timeout_ms: i64 = if (timeout < 0) -1 else timeout;
+    const result = zzmq.poll(zzmq_items[0..n], timeout_ms) catch |err| {
+        c_errno = errToErrno(err);
+        return -1;
+    };
+
+    // Copy results back
+    for (items[0..n], 0..) |*item, i| {
+        item.revents = @bitCast(zzmq_items[i].revents);
+        if (item.revents != 0) ready += 1;
+    }
+
+    return ready;
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn errToErrno(err: anyerror) c_int {
+    return switch (err) {
+        error.OutOfMemory => @intFromEnum(std.os.E.ENOMEM),
+        error.InvalidEndpoint => @intFromEnum(std.os.E.EINVAL),
+        error.AddressInUse => @intFromEnum(std.os.E.EADDRINUSE),
+        error.SocketClosed => @intFromEnum(std.os.E.ENOTSOCK),
+        error.Timeout => @intFromEnum(std.os.E.ETIMEDOUT),
+        error.ContextTerminated => @intFromEnum(std.os.E.ETERM),
+        error.InvalidState => @intFromEnum(std.os.E.EFSM),
+        error.NoRoute => @intFromEnum(std.os.E.EHOSTUNREACH),
+        else => @intFromEnum(std.os.E.EINVAL),
+    };
+}
+```
+
+### FFI Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **64-byte zmq_msg_t** | Binary compatibility with existing bindings |
+| **Thread-local errno** | C convention, avoids per-call error struct |
+| **Opaque void* handles** | Type safety via Zig, flexibility for C |
+| **Direct memory layout** | No wrapper allocation for messages |
+| **Export with C calling convention** | `export fn` in Zig generates C-compatible symbols |
+
+### Compatibility Testing
+
+```c
+// test_compat.c - Verify API compatibility with libzmq
+#include <assert.h>
+#include <string.h>
+
+// Can be compiled against either libzmq or zzmq
+#include <zmq.h>
+
+void test_basic() {
+    void *ctx = zmq_ctx_new();
+    assert(ctx != NULL);
+
+    void *push = zmq_socket(ctx, ZMQ_PUSH);
+    void *pull = zmq_socket(ctx, ZMQ_PULL);
+    assert(push && pull);
+
+    assert(zmq_bind(pull, "inproc://test") == 0);
+    assert(zmq_connect(push, "inproc://test") == 0);
+
+    const char *msg = "Hello";
+    assert(zmq_send(push, msg, strlen(msg), 0) == strlen(msg));
+
+    char buf[256];
+    int rc = zmq_recv(pull, buf, sizeof(buf), 0);
+    assert(rc == strlen(msg));
+    assert(memcmp(buf, msg, rc) == 0);
+
+    zmq_close(push);
+    zmq_close(pull);
+    zmq_ctx_term(ctx);
+}
+
+int main() {
+    test_basic();
+    return 0;
+}
+```
+
+### Build Integration
+
+```zig
+// build.zig snippet for C library generation
+pub fn build(b: *std.Build) void {
+    const lib = b.addSharedLibrary(.{
+        .name = "zzmq",
+        .root_source_file = .{ .path = "src/c_api.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Generate C header
+    lib.installHeader("include/zzmq.h", "zmq.h");
+
+    // Install shared library
+    b.installArtifact(lib);
+
+    // Also build static library
+    const static_lib = b.addStaticLibrary(.{
+        .name = "zzmq",
+        .root_source_file = .{ .path = "src/c_api.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(static_lib);
+}
+```
+
+---
+
 ## Performance Considerations: Hot Path Deep Dive
 
 This section analyzes the critical hot paths for sending and receiving messages, grounded in libzmq source analysis, and designs ZZMQ's approach using idiomatic ZIO for maximum performance.
@@ -3576,7 +4479,7 @@ socket.recv(msg)
 
 3. **Throttled Command Check**: `recv()` only checks for commands every 100 messages (`inbound_poll_rate`). This avoids signaler overhead on the hot path.
 
-4. **VSM (Very Small Message)**: Messages ≤24 bytes stored inline in msg_t - zero allocation on hot path.
+4. **VSM (Very Small Message)**: Messages ≤~30 bytes stored inline in msg_t (exact size is platform-dependent: `64 - sizeof(metadata_t*) - 3 - 16 - sizeof(uint32_t)` = ~33 bytes on 64-bit). Zero allocation on hot path.
 
 5. **Speculative Write** (stream_engine_base.cpp:393-397): When sending, try to write immediately without waiting for POLLOUT:
    ```cpp
@@ -5829,7 +6732,7 @@ test "message copy creates shared reference" {
 **Storage Class Tests:**
 | Test Case | Verification |
 |-----------|--------------|
-| VSM (≤24 bytes) | Message stored inline, no heap allocation |
+| VSM (≤48 bytes) | Message stored inline, no heap allocation |
 | Small heap (25-255 bytes) | Single allocation, owned storage |
 | Large message (>255 bytes) | Owned storage with proper alignment |
 | External buffer | Zero-copy wrapping, proper lifecycle |
