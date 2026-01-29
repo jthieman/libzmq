@@ -646,12 +646,19 @@ Based on ZIO source analysis, here are corrections to earlier assumptions:
 
 The context owns shared resources and provides the ZIO runtime for all sockets.
 
+**Key design decision**: Users provide an allocator to the context. This follows Zig idioms and enables:
+- Custom allocators for performance (arena, pool)
+- Testing with failing allocators
+- Memory tracking and debugging
+- Embedded systems with fixed buffers
+
 ```zig
 pub const Context = struct {
     /// The ZIO runtime - ALL I/O goes through this
     runtime: *zio.Runtime,
 
-    /// Allocator for dynamic allocations
+    /// Allocator for ALL dynamic allocations (messages, buffers, subscriptions)
+    /// User-provided, enabling custom memory strategies
     allocator: std.mem.Allocator,
 
     /// Context-wide options
@@ -672,8 +679,33 @@ pub const Context = struct {
         terminated,
     };
 
-    pub fn init(runtime: *zio.Runtime, allocator: std.mem.Allocator, options: ContextOptions) !*Context;
-    pub fn deinit(self: *Context) void;
+    /// Initialize context with user-provided allocator
+    /// All ZZMQ allocations for this context use this allocator
+    pub fn init(options: ContextOptions) !*Context {
+        const allocator = options.allocator orelse std.heap.page_allocator;
+        const runtime = options.runtime orelse try zio.Runtime.init(allocator);
+
+        const self = try allocator.create(Context);
+        self.* = .{
+            .runtime = runtime,
+            .allocator = allocator,
+            .options = options,
+            .inproc_endpoints = InprocRegistry.init(allocator),
+            .sockets = SocketList.init(allocator),
+            .state = .active,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.inproc_endpoints.deinit();
+        self.sockets.deinit();
+        if (self.options.owns_runtime) {
+            self.runtime.deinit();
+        }
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
 
     /// Create a socket of the specified type
     pub fn socket(self: *Context, comptime Pattern: type) !*Socket(Pattern);
@@ -686,9 +718,65 @@ pub const Context = struct {
 };
 
 pub const ContextOptions = struct {
+    /// User-provided allocator (null = use page_allocator)
+    allocator: ?std.mem.Allocator = null,
+
+    /// User-provided ZIO runtime (null = create internal runtime)
+    runtime: ?*zio.Runtime = null,
+
+    /// Maximum concurrent sockets
     max_sockets: u32 = 1024,
-    max_message_size: usize = 0,  // 0 = no limit
-    io_threads: u32 = 1,          // Hint (ZIO manages actual threading)
+
+    /// Maximum message size (0 = no limit)
+    max_message_size: usize = 0,
+
+    /// I/O thread hint (ZIO manages actual threading)
+    io_threads: u32 = 1,
+
+    /// Internal tracking
+    owns_runtime: bool = false,
+};
+```
+
+**Allocator Usage Throughout ZZMQ**:
+
+| Component | Allocations |
+|-----------|------------|
+| Message (>48 bytes) | Payload buffer + refcount |
+| Pipe | Channel backing arrays |
+| Socket | Pattern state, pipe list |
+| Subscriptions | Trie nodes, prefix copies |
+| Engine | Codec buffers, connection state |
+
+**Example: Custom Allocator for High-Throughput**:
+
+```zig
+// Use arena allocator that resets periodically
+var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+defer arena.deinit();
+
+var ctx = try zzmq.Context.init(.{
+    .allocator = arena.allocator(),
+});
+defer ctx.deinit();
+
+// All ZZMQ allocations use the arena
+var socket = try ctx.socket(.push);
+```
+
+**Example: Testing with Failing Allocator**:
+
+```zig
+var failing = std.testing.FailingAllocator.init(std.heap.page_allocator, .{
+    .fail_index = 100,  // Fail after 100 allocations
+});
+
+var ctx = zzmq.Context.init(.{
+    .allocator = failing.allocator(),
+}) catch |err| {
+    // Verify graceful handling of OOM
+    try std.testing.expectEqual(error.OutOfMemory, err);
+    return;
 };
 ```
 
@@ -1763,6 +1851,135 @@ fn createPipe(
 | Dynamic HWM | Update via command | `setHwm()` + command to peer |
 | Conflate mode | Keep only latest | `ConflatingChannel` |
 | Either side unlimited | Total unlimited | `null` propagates |
+
+#### Channel Sizing: The HWM-to-Frames Problem
+
+**The Core Mismatch**:
+- **libzmq**: HWM counts complete messages; ypipe is unbounded (linked list of chunks)
+- **ZZMQ**: HWM counts complete messages; ZIO channel is bounded (fixed capacity)
+
+This creates a mapping problem: if HWM = 1000 messages, what should channel capacity be?
+
+**The Variables**:
+- `H` = HWM (complete messages, user-configured)
+- `F` = frames per message (varies: 1 for simple, 3+ for envelopes, 100+ for streaming)
+- `C` = channel capacity (frames, must be set at creation)
+
+**Constraint**: `C >= H * F_max` to avoid channel-full-before-HWM
+
+| Pattern | Typical F | HWM=1000 needs C= |
+|---------|-----------|-------------------|
+| PUSH/PULL simple | 1 | 1,000 |
+| REQ/REP with envelope | 3 | 3,000 |
+| ROUTER with routing | 2-4 | 4,000 |
+| Multipart streaming | 10-100 | 100,000 |
+
+**What happens when C is undersized?**
+
+```
+Scenario: HWM=1000, actual F=5, but C=1000 (sized for F=1)
+
+After 200 messages (1000 frames): channel is FULL
+HWM says 800 more messages allowed, but channel blocks!
+
+Result: Effective HWM = 200 (not 1000) ← Violates user expectations
+```
+
+**ZZMQ Solution: Dual Backpressure**
+
+```zig
+pub const PipeConfig = struct {
+    /// HWM in complete messages (libzmq semantics)
+    hwm: ?u32 = 1000,
+
+    /// Safety limit on pending multipart frames
+    max_multipart_frames: u32 = 256,
+
+    /// Explicit channel capacity (null = auto-calculate)
+    channel_capacity: ?u32 = null,
+
+    /// Expected frames per message for auto-sizing
+    frames_per_message: u32 = 4,
+
+    /// Calculate channel capacity
+    pub fn effectiveChannelCapacity(self: PipeConfig) u32 {
+        if (self.channel_capacity) |explicit| {
+            return explicit;
+        }
+
+        const hwm = self.hwm orelse return 65536; // Unlimited: large default
+
+        // Formula: HWM * frames_per_msg * headroom
+        const headroom: u32 = 2;  // 2x for bursts
+        return hwm * self.frames_per_message * headroom;
+    }
+};
+```
+
+**Rigorous Pipe Implementation**:
+
+```zig
+pub const Pipe = struct {
+    outbound: *zio.Channel(Message),
+    pending_multipart: std.ArrayList(Message),
+
+    msgs_written: u64 = 0,
+    msgs_read_by_peer: u64 = 0,  // Updated via credit flow
+    config: PipeConfig,
+
+    pub fn write(self: *Pipe, msg: Message, rt: *zio.Runtime) !void {
+        // SAFETY: Limit pending multipart to prevent unbounded growth
+        if (self.pending_multipart.items.len >= self.config.max_multipart_frames) {
+            return error.MultipartTooLarge;
+        }
+
+        try self.pending_multipart.append(msg);
+
+        if (!msg.hasMore()) {
+            // Complete message - enforce HWM at message boundary
+            if (self.config.hwm) |hwm| {
+                while (self.outstandingMessages() >= hwm) {
+                    // Block until receiver drains (or drop for PUB)
+                    try self.waitForCredit(rt);
+                }
+            }
+
+            // Flush all frames to channel
+            // Note: channel.send() may also block if channel full (memory protection)
+            for (self.pending_multipart.items) |frame| {
+                try self.outbound.send(rt, frame);
+            }
+            self.pending_multipart.clearRetainingCapacity();
+            self.msgs_written += 1;
+        }
+    }
+
+    pub fn outstandingMessages(self: *Pipe) u64 {
+        return self.msgs_written - self.msgs_read_by_peer;
+    }
+};
+```
+
+**Two Independent Limits**:
+
+| Limit | Purpose | Blocks When |
+|-------|---------|-------------|
+| Channel capacity | Memory protection | Channel buffer full |
+| HWM counter | libzmq semantics | Message count exceeded |
+
+**Invariant**: Effective limit = min(channel_capacity / F, HWM)
+
+If channel fills before HWM (due to undersized capacity), sender blocks anyway—this is safe but suboptimal. Users with large multipart messages should increase `frames_per_message` or set explicit `channel_capacity`.
+
+**Sizing Guidelines**:
+
+| Use Case | HWM | frames_per_message | Recommended C |
+|----------|-----|-------------------|---------------|
+| High-throughput simple | 10000 | 1 | 20,000 |
+| REQ/REP broker | 1000 | 4 | 8,000 |
+| PUB/SUB fan-out | 1000 | 2 | 4,000 |
+| Multipart streaming | 100 | 32 | 6,400 |
+| Memory-constrained | 100 | 2 | 400 |
 
 #### Backpressure Flow
 
