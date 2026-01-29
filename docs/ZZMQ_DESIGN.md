@@ -122,10 +122,10 @@ HOT PATH - Recv (called millions of times/sec):
 WARM PATH - Engine writer (per-message, but async):
   channel.receive()             // Wake on data
     → codec.encode(msg)         // In-place, no copy
-    → stream.write(buf)         // ZIO async write
+    → stream.send(buf)          // ZIO async send
 
 WARM PATH - Engine reader (per-message, but async):
-  stream.read(buf)              // ZIO async read
+  stream.recv(buf)              // ZIO async recv
     → codec.decode(buf)         // Parse in place
     → channel.send(msg)         // May suspend on HWM
 ```
@@ -381,8 +381,8 @@ try rt.sleep(time.Duration.fromMilliseconds(100));
 const timeout = time.Timeout{ .duration = time.Duration.fromMilliseconds(100) };
 const no_timeout = time.Timeout.none;  // Wait forever
 
-// Timestamp (point in time)
-const now = time.os.now(.monotonic);
+// Timestamp (point in time) - use runtime for monotonic time
+const now = rt.now();  // Returns time.Instant
 const deadline = now.addDuration(d1);
 
 // Stopwatch for measuring elapsed time
@@ -393,29 +393,60 @@ const elapsed = stopwatch.read();
 
 ### Network API
 
-```zig
-const net = @import("zio").net;
+ZIO uses an address-centric API where addresses have methods for connection/listening:
 
-// TCP Client
-const stream = try net.tcpConnectToAddress(rt, address, .{});
+```zig
+const zio = @import("zio");
+
+// TCP Client - address.connect() returns a stream
+const addr = try zio.IpAddress.parse("127.0.0.1", 5555);
+const stream = try addr.connect(rt, .{});
 defer stream.close();
 
-const bytes_written = try stream.write(rt, data);
-const bytes_read = try stream.read(rt, &buffer);
+// Stream I/O - send/recv (not write/read)
+const bytes_sent = try stream.send(rt, data, .{});
+try stream.sendAll(rt, data, .{});  // Send all bytes
+const bytes_received = try stream.recv(rt, &buffer, .{});
 
-// TCP Server
-var server = try net.Server.init(address, .{ .backlog = 128 });
-defer server.close();
+// TCP Server - address.listen() returns an Acceptor
+const bind_addr = try zio.IpAddress.parse("0.0.0.0", 5555);
+var acceptor = try bind_addr.listen(rt, .{ .backlog = 128 });
+defer acceptor.close();
 
 while (true) {
-    const client_stream = try server.accept(rt);
+    const client_stream = try acceptor.accept(rt);
     try group.spawn(rt, handleClient, .{ rt, client_stream });
 }
 
-// Addresses
-const addr = net.IpAddress.parse("127.0.0.1", 5555);
-const any_addr = net.IpAddress.any(5555);  // 0.0.0.0:5555
+// Address types
+const ipv4_addr = try zio.IpAddress.parse("127.0.0.1", 5555);
+const ipv6_addr = try zio.IpAddress.parse("::1", 5555);
 ```
+
+### Vectored I/O
+
+ZIO supports scatter/gather I/O for efficient multipart message handling:
+
+```zig
+// Vectored send - multiple buffers in single syscall
+const slices: []const []const u8 = &.{
+    header_bytes,
+    body_bytes,
+    trailer_bytes,
+};
+const bytes_sent = try stream.sendVec(rt, slices, .{});
+try stream.sendAllVec(rt, slices, .{});  // Send all
+
+// Vectored receive
+var buffers: [3][]u8 = .{
+    &header_buf,
+    &body_buf,
+    &trailer_buf,
+};
+const bytes_received = try stream.recvVec(rt, &buffers, .{});
+```
+
+This is critical for ZZMQ multipart messages - we can send all frames with minimal syscalls.
 
 ### Runtime and Coroutine Management
 
@@ -466,6 +497,102 @@ ZIO uses io_uring on Linux with optimized flags:
 1. Syscalls are automatically batched by io_uring
 2. Multiple network operations can be submitted in one syscall
 3. Falls back to epoll on older kernels, kqueue on macOS/BSD
+
+### Notify: One-Shot Signaling
+
+ZIO provides `Notify` for efficient one-shot notifications between coroutines:
+
+```zig
+const zio = @import("zio");
+
+// Create a notify (typically stored in a struct)
+var notify: zio.Notify = .{};
+
+// Sender side: wake up exactly one waiter
+notify.set();
+
+// Receiver side: wait until signaled
+try notify.wait(rt);
+
+// Can also use in select for non-blocking check
+var notify_op = notify.asyncWait();
+const result = try zio.select(rt, .{
+    .notify = &notify_op,
+    .timeout = Timeout{ .duration = Duration.fromMilliseconds(100) },
+});
+```
+
+**ZZMQ uses Notify for:**
+1. **Engine wakeup**: When user adds message after engine was idle
+2. **Shutdown signaling**: Context tells sockets to start closing
+3. **Linger completion**: Signal when pending messages are flushed
+4. **Reconnect trigger**: Session tells connector to initiate reconnect
+
+```zig
+pub const Pipe = struct {
+    outbound: zio.Channel(Message),
+    inbound: zio.Channel(Message),
+    engine_wakeup: zio.Notify = .{},  // Wake engine when user sends after idle
+
+    pub fn send(self: *Pipe, rt: *zio.Runtime, msg: Message) !void {
+        try self.outbound.send(rt, msg);
+        self.engine_wakeup.set();  // Signal engine in case it was waiting
+    }
+};
+```
+
+### Cancellation and Shielding
+
+ZIO supports cooperative cancellation with shielding for critical sections:
+
+```zig
+// Cancel a group (signals all coroutines)
+group.cancel(rt);
+
+// Inside a coroutine, check for cancellation
+if (rt.isCancelled()) {
+    return error.Cancelled;
+}
+
+// Shield a critical section from cancellation
+// (useful for linger: must complete pending sends)
+rt.beginShield();
+defer rt.endShield();
+
+// This code runs even if cancellation was requested
+for (pending_messages) |msg| {
+    try self.stream.sendAll(rt, msg.data(), .{});
+}
+```
+
+**ZZMQ linger with shielding:**
+```zig
+pub fn closeWithLinger(self: *Socket, rt: *zio.Runtime, linger_ms: i32) void {
+    if (linger_ms == 0) {
+        // Drop immediately
+        self.dropAllPending();
+        return;
+    }
+
+    // Shield from cancellation - we need to try sending pending messages
+    rt.beginShield();
+    defer rt.endShield();
+
+    if (linger_ms < 0) {
+        // Infinite linger - wait until all sent
+        self.flushAllPending(rt) catch {};
+    } else {
+        // Timed linger - use deadline
+        const deadline = rt.now().addDuration(
+            Duration.fromMilliseconds(@intCast(linger_ms))
+        );
+        self.flushWithDeadline(rt, deadline) catch {
+            // Timeout - drop remaining
+            self.dropAllPending();
+        };
+    }
+}
+```
 
 ### ZZMQ-Specific Usage Patterns
 
@@ -526,7 +653,7 @@ fn heartbeatLoop(self: *Engine, rt: *Runtime) !void {
     while (!self.terminated) {
         try rt.sleep(Duration.fromMilliseconds(self.heartbeat_interval));
 
-        const now = time.os.now(.monotonic);
+        const now = rt.now();  // Runtime provides monotonic time
         const since_recv = self.last_recv.durationTo(now);
 
         if (since_recv.toMilliseconds() > self.heartbeat_timeout) {
@@ -1152,10 +1279,13 @@ pub const MultipartMessage = struct {
 The atomic delivery is ensured at the pipe/engine level:
 
 ```zig
-/// Engine writer: send multipart atomically
+/// Engine writer: send multipart atomically using vectored I/O
 fn writeMultipart(self: *Engine, rt: *zio.Runtime) !void {
     var multipart_frames = std.ArrayList([]u8).init(self.allocator);
-    defer multipart_frames.deinit();
+    defer {
+        for (multipart_frames.items) |frame| self.allocator.free(frame);
+        multipart_frames.deinit();
+    }
 
     // Collect all frames of multipart
     while (true) {
@@ -1168,11 +1298,10 @@ fn writeMultipart(self: *Engine, rt: *zio.Runtime) !void {
         if (!msg.flags.more) break;
     }
 
-    // Write all frames in single operation (or as close as possible)
-    // TCP may split across packets, but ZMQ peers handle reassembly
-    for (multipart_frames.items) |frame| {
-        try self.stream.writeAll(rt, frame);
-    }
+    // Use vectored I/O to send all frames with minimal syscalls
+    // ZIO's sendAllVec batches into single io_uring submission
+    const slices = @as([]const []const u8, multipart_frames.items);
+    try self.stream.sendAllVec(rt, slices, .{});
 }
 
 /// Engine reader: buffer multipart before delivering
@@ -2462,8 +2591,10 @@ pub const Engine = struct {
         var read_buf: [65536]u8 = undefined;
 
         while (self.state == .ready) {
-            // Read from network
-            const n = self.stream.read(rt, &read_buf, self.readTimeout()) catch |err| {
+            // Read from network (ZIO stream.recv API)
+            const n = self.stream.recv(rt, &read_buf, .{
+                .deadline = self.readDeadline(rt),
+            }) catch |err| {
                 self.handleReadError(err);
                 break;
             };
@@ -2473,7 +2604,7 @@ pub const Engine = struct {
                 break;
             }
 
-            self.heartbeat.last_recv = zio.time.now();
+            self.heartbeat.last_recv = rt.now();
 
             // Decode ZMTP frames
             var offset: usize = 0;
@@ -3309,8 +3440,8 @@ fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
     var decode_offset: usize = 0;
 
     while (self.state == .ready) {
-        // Read more data from network
-        const n = self.stream.read(rt, read_buf[decode_offset..]) catch |err| {
+        // Read more data from network (ZIO stream.recv API)
+        const n = self.stream.recv(rt, read_buf[decode_offset..], .{}) catch |err| {
             self.handleReadError(err);
             break;
         };
@@ -5426,29 +5557,29 @@ fn writerLoop(self: *Engine) !void {
         }
 
         if (batch_size > 0) {
-            // Single syscall for entire batch
-            try self.stream.write(batch_buffer[0..batch_size]);
+            // Single syscall for entire batch (ZIO stream.sendAll API)
+            try self.stream.sendAll(rt, batch_buffer[0..batch_size], .{});
             batch_size = 0;
         } else {
             // No data - yield to let other coroutines run
             // Then wait for either: new message or socket writable
-            const msg = self.pipe.outbound.receive();  // Suspends coroutine
+            const msg = self.pipe.outbound.receive(rt);  // Suspends coroutine
             batch_size = self.codec.encode(&msg, &batch_buffer);
         }
 
         // Speculative write: try immediately (low latency)
-        try self.stream.write(batch_buffer[0..batch_size]);
+        try self.stream.sendAll(rt, batch_buffer[0..batch_size], .{});
         batch_size = 0;
     }
 }
 
 // Reader coroutine - moves messages from network to pipe
-fn readerLoop(self: *Engine) !void {
+fn readerLoop(self: *Engine, rt: *zio.Runtime) !void {
     var read_buffer: [65536]u8 = undefined;  // Large buffer for batched reads
 
     while (!self.terminated) {
-        // Read from network (may suspend)
-        const n = try self.stream.read(&read_buffer);
+        // Read from network (may suspend) - ZIO stream.recv API
+        const n = try self.stream.recv(rt, &read_buffer, .{});
         if (n == 0) return error.ConnectionClosed;
 
         // Decode and push messages
@@ -6055,6 +6186,83 @@ void zmq::session_base_t::timer_event (int id_)
 }
 ```
 
+**ZZMQ implementation with cancellation shielding:**
+
+In ZIO, we use `rt.beginShield()`/`rt.endShield()` to protect the linger flush from
+cancellation. This ensures pending messages get a fair chance to be sent even if
+the context is shutting down.
+
+```zig
+pub const Session = struct {
+    pipe: *Pipe,
+    engine: ?*Engine,
+    linger_ms: i32,
+    linger_complete: zio.Notify = .{},
+
+    /// Called when socket.close() is invoked
+    pub fn beginTerminate(self: *Session, rt: *zio.Runtime) void {
+        if (self.linger_ms == 0) {
+            // Immediate termination - drop all pending
+            self.pipe.drop();
+            self.terminateEngine();
+            return;
+        }
+
+        // Shield from cancellation - linger must complete
+        rt.beginShield();
+        defer rt.endShield();
+
+        if (self.linger_ms < 0) {
+            // Infinite linger - flush all pending messages
+            self.flushPendingMessages(rt) catch {};
+        } else {
+            // Timed linger - flush with deadline
+            const deadline = rt.now().addDuration(
+                Duration.fromMilliseconds(@intCast(self.linger_ms))
+            );
+
+            // Try to flush, racing against deadline
+            var flush_op = self.asyncFlushPending();
+            const result = zio.select(rt, .{
+                .flush = &flush_op,
+                .timeout = zio.Timeout{ .deadline = deadline },
+            }) catch {
+                // Interrupted - drop remaining
+                self.pipe.drop();
+                return;
+            };
+
+            switch (result) {
+                .flush => {}, // All messages sent
+                .timeout => {
+                    // Deadline reached - drop remaining
+                    self.pipe.drop();
+                },
+            }
+        }
+
+        self.terminateEngine();
+        self.linger_complete.set();  // Signal completion
+    }
+
+    fn flushPendingMessages(self: *Session, rt: *zio.Runtime) !void {
+        while (self.pipe.outbound.tryReceive()) |msg| {
+            if (self.engine) |eng| {
+                try eng.sendImmediate(rt, msg);
+            } else {
+                msg.deinit();  // No engine - must drop
+            }
+        }
+    }
+};
+```
+
+**Key differences from libzmq:**
+- libzmq uses timers (poll-based): `add_timer(linger_, linger_timer_id)`
+- ZZMQ uses ZIO's `select` with deadline: `Timeout{ .deadline = ... }`
+- libzmq callbacks: `timer_event()` fires asynchronously
+- ZZMQ shielded block: runs synchronously, protected from cancellation
+
 ### Context Shutdown Coordination
 
 **Pending inproc connections** (`src/ctx.cpp:137-145`):
@@ -6571,7 +6779,7 @@ pub const Engine = struct {
         defer self.handleDisconnect();
 
         while (self.state == .ready) {
-            const n = self.stream.read(rt, &self.read_buf) catch |err| {
+            const n = self.stream.recv(rt, &self.read_buf, .{}) catch |err| {
                 self.onError(.connection_error, err);
                 return;
             };
