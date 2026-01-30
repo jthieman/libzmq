@@ -907,6 +907,197 @@ var ctx = zzmq.Context.init(.{
 };
 ```
 
+### Buffer Strategy
+
+Following Zig idioms: explicit allocation, arenas for batch operations, no hidden pooling.
+
+**Design Principles:**
+1. **User controls memory** - All allocations flow through context allocator
+2. **No hidden pools** - If user wants pooling, they provide a pooling allocator
+3. **Arenas for batch operations** - Multipart receive uses arena for clean cleanup
+4. **Predictable per-connection memory** - Fixed buffers in Engine, known sizes
+
+**Buffer Categories and Strategy:**
+
+| Buffer Type | Size | Strategy | Rationale |
+|-------------|------|----------|-----------|
+| Engine read buffer | 64KB | Allocated from `ctx.allocator` at init | Simple, user controls source |
+| Engine write buffer | 64KB | Allocated from `ctx.allocator` at init | Simple, user controls source |
+| Message data (≤48B) | Inline | No allocation (VSM) | Fast path optimization |
+| Message data (>48B) | Variable | `ctx.allocator` | User controls, can use pool |
+| Multipart recv | Variable | Arena per multipart | Batch free on `deinit()` |
+| Channel backing | HWM × sizeof(Message) | `ctx.allocator` | Sized at pipe creation |
+
+**Engine Buffer Allocation:**
+
+```zig
+pub const Engine = struct {
+    /// Read buffer - allocated from context allocator
+    read_buf: []u8,
+
+    /// Write buffer - allocated from context allocator
+    write_buf: []u8,
+
+    /// Context reference (for allocator access)
+    ctx: *Context,
+
+    // ... other fields ...
+
+    pub fn init(ctx: *Context, stream: zio.net.Stream, pipe: *Pipe) !Engine {
+        const allocator = ctx.allocator;
+
+        return .{
+            .read_buf = try allocator.alloc(u8, ctx.options.engine_buffer_size),
+            .write_buf = try allocator.alloc(u8, ctx.options.engine_buffer_size),
+            .ctx = ctx,
+            .stream = stream,
+            .pipe = pipe,
+            // ...
+        };
+    }
+
+    pub fn deinit(self: *Engine) void {
+        const allocator = self.ctx.allocator;
+        allocator.free(self.read_buf);
+        allocator.free(self.write_buf);
+        // ...
+    }
+};
+```
+
+**Message Allocation (send side - user controls):**
+
+```zig
+// User creates messages - they choose allocation strategy
+const msg = try zzmq.Message.init(ctx.allocator, data);
+defer msg.deinit();
+try socket.send(rt, msg);
+
+// Or with external buffer (zero-copy)
+const msg = zzmq.Message.initExternal(user_buffer, freeCallback, hint);
+try socket.send(rt, msg);
+
+// Or inline for small messages (no allocation)
+const msg = zzmq.Message.initInline("hello");
+try socket.send(rt, msg);
+```
+
+**Message Allocation (recv side - context allocator):**
+
+```zig
+pub fn recv(self: *Socket, rt: *zio.Runtime) !Message {
+    // Single message uses context allocator
+    // Caller responsible for calling msg.deinit()
+    return self.recvWithAllocator(rt, self.ctx.allocator);
+}
+```
+
+**Multipart Receive with Arena:**
+
+```zig
+/// Receive a complete multipart message
+/// All frames allocated from internal arena - freed together on deinit()
+pub fn recvMultipart(self: *Socket, rt: *zio.Runtime) !MultipartMessage {
+    // Arena backed by context allocator
+    var arena = std.heap.ArenaAllocator.init(self.ctx.allocator);
+    errdefer arena.deinit();
+
+    var frames = std.ArrayList([]const u8).init(arena.allocator());
+
+    while (true) {
+        const msg = try self.pipe.inbound.receive(rt);
+        defer msg.deinit();  // Original message cleaned up
+
+        // Copy data into arena
+        const frame_data = try arena.allocator().dupe(u8, msg.data());
+        try frames.append(frame_data);
+
+        if (!msg.flags.more) break;
+    }
+
+    return .{
+        .frames = try frames.toOwnedSlice(),
+        .arena = arena,
+    };
+}
+
+pub const MultipartMessage = struct {
+    frames: []const []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    /// Free all frames with single arena deinit
+    pub fn deinit(self: *MultipartMessage) void {
+        self.arena.deinit();
+    }
+
+    pub fn frameCount(self: MultipartMessage) usize {
+        return self.frames.len;
+    }
+
+    pub fn frame(self: MultipartMessage, index: usize) []const u8 {
+        return self.frames[index];
+    }
+
+    /// Iterator over frames
+    pub fn iterator(self: *const MultipartMessage) FrameIterator {
+        return .{ .frames = self.frames, .index = 0 };
+    }
+};
+```
+
+**User-Provided Pooling (if needed):**
+
+Users who need pooling provide their own allocator:
+
+```zig
+// User creates a pooling allocator
+var pool = MyMessagePool.init(std.heap.page_allocator, .{
+    .size_classes = &.{ 64, 256, 1024, 4096, 65536 },
+    .slabs_per_class = 16,
+});
+defer pool.deinit();
+
+// Pass pool's allocator interface to context
+var ctx = try zzmq.Context.init(.{
+    .allocator = pool.allocator(),
+});
+
+// All ZZMQ allocations now go through the pool
+```
+
+**ContextOptions for Buffer Tuning:**
+
+```zig
+pub const ContextOptions = struct {
+    /// User-provided allocator (null = use page_allocator)
+    allocator: ?std.mem.Allocator = null,
+
+    /// Engine read/write buffer size (default 64KB)
+    engine_buffer_size: usize = 65536,
+
+    /// Maximum message size (0 = no limit, enforced on recv)
+    max_message_size: usize = 0,
+
+    // ... other options ...
+};
+```
+
+**Why No Built-in Buffer Pool:**
+
+1. **Zig idiom**: "If you want pooling, bring a pooling allocator"
+2. **Simplicity**: Less code to maintain, fewer edge cases
+3. **Flexibility**: User can choose pool strategy (slab, arena, fixed)
+4. **Predictability**: No hidden caching behavior
+5. **Testing**: Easy to test with std.testing.FailingAllocator
+
+**io_uring Buffer Registration:**
+
+Deferred - adds complexity with unclear benefit:
+- Requires fixed buffer addresses (can't resize)
+- Needs ZIO-specific hooks
+- User can achieve similar with FixedBufferAllocator
+- Revisit only if profiling shows syscall overhead is bottleneck
+
 ### Socket Handle
 
 Opaque handle to a socket, parameterized by pattern type.
@@ -2367,6 +2558,333 @@ The key insight: ZIO's cooperative scheduling means "waiting" is just coroutine 
 
 ---
 
+## Structured Concurrency with ZIO Groups
+
+ZZMQ uses ZIO Groups for structured concurrency, matching libzmq's explicit lifecycle management while leveraging ZIO's cooperative scheduling.
+
+### Design Principles
+
+1. **Groups at Engine level** - Reader/writer/heartbeat coroutines in a group
+2. **Explicit Session list at Socket level** - More control for linger, matches libzmq
+3. **Graceful shutdown by default** - Set state, let coroutines exit naturally
+4. **Forceful cancel only for `linger=0`** - Context termination with immediate drop
+
+### Hierarchy
+
+```
+Context
+  └── Socket (list, not group)
+        └── Session (list, not group - for linger control)
+              └── Engine
+                    └── Group: coroutines
+                          ├── readerLoop
+                          ├── writerLoop
+                          └── heartbeatLoop (optional)
+```
+
+**Why lists instead of groups at Socket/Session level:**
+
+| Level | Uses Group? | Rationale |
+|-------|-------------|-----------|
+| Engine coroutines | Yes | All exit together when connection ends |
+| Session list | No | Need per-session linger, ordered shutdown |
+| Socket sessions | No | Different endpoints may have different linger |
+| Context sockets | No | Each socket closes independently |
+
+### Failure Propagation: Explicit State Coordination
+
+When reader detects disconnect, it sets state; writer checks and exits gracefully:
+
+```zig
+pub const Engine = struct {
+    state: State,
+    group: zio.Group = .{},
+    disconnect_reason: ?DisconnectReason = null,
+
+    const State = enum {
+        handshaking,
+        ready,
+        closing,  // Graceful shutdown initiated
+        closed,
+    };
+
+    const DisconnectReason = enum {
+        peer_closed,
+        protocol_error,
+        heartbeat_timeout,
+        local_close,
+    };
+
+    pub fn run(self: *Engine, rt: *zio.Runtime) void {
+        defer self.cleanup(rt);
+
+        // Handshake
+        self.performHandshake(rt) catch |err| {
+            self.disconnect_reason = .protocol_error;
+            return;
+        };
+
+        self.state = .ready;
+
+        // Spawn coroutines into group
+        self.group.spawn(rt, Engine.readerLoop, .{ self, rt }) catch return;
+        self.group.spawn(rt, Engine.writerLoop, .{ self, rt }) catch return;
+
+        if (self.heartbeat.interval != null) {
+            self.group.spawn(rt, Engine.heartbeatLoop, .{ self, rt }) catch return;
+        }
+
+        // Wait for all to finish (any exit causes others to see state change)
+        self.group.wait(rt) catch {};
+
+        // Notify session of disconnect
+        if (self.disconnect_reason) |reason| {
+            self.session.handleDisconnect(reason);
+        }
+    }
+
+    /// Reader: sets state on disconnect, others check and exit
+    fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
+        while (self.state == .ready) {
+            const n = self.stream.recv(rt, self.read_buf, .{}) catch |err| {
+                self.disconnect_reason = switch (err) {
+                    error.ConnectionReset, error.BrokenPipe => .peer_closed,
+                    error.Timeout => .heartbeat_timeout,
+                    else => .protocol_error,
+                };
+                self.state = .closing;  // Signal others to exit
+                return;
+            };
+
+            if (n == 0) {
+                self.disconnect_reason = .peer_closed;
+                self.state = .closing;
+                return;
+            }
+
+            // Process data...
+        }
+    }
+
+    /// Writer: checks state before each operation
+    fn writerLoop(self: *Engine, rt: *zio.Runtime) void {
+        while (self.state == .ready) {
+            // Receive from channel - will unblock when state changes
+            // because channel will be closed
+            const msg = self.pipe.outbound.receive(rt) catch |err| {
+                if (err == error.ChannelClosed) return;
+                self.state = .closing;
+                return;
+            };
+            defer msg.deinit();
+
+            // Check state again before sending
+            if (self.state != .ready) {
+                // Re-queue message if linger allows
+                if (self.session.linger_ms != 0) {
+                    self.pipe.outbound.trySend(msg) catch {};
+                }
+                return;
+            }
+
+            self.stream.sendAll(rt, self.encodeMessage(msg), .{}) catch |err| {
+                self.state = .closing;
+                return;
+            };
+        }
+    }
+
+    fn heartbeatLoop(self: *Engine, rt: *zio.Runtime) void {
+        const interval = self.heartbeat.interval orelse return;
+
+        while (self.state == .ready) {
+            rt.sleep(Duration.fromMilliseconds(interval)) catch return;
+
+            if (self.state != .ready) return;
+
+            const now = rt.now();
+            if (now.since(self.heartbeat.last_recv).toMilliseconds() > self.heartbeat.timeout) {
+                self.disconnect_reason = .heartbeat_timeout;
+                self.state = .closing;
+                return;
+            }
+
+            if (now.since(self.heartbeat.last_send).toMilliseconds() > interval) {
+                self.sendPing() catch {
+                    self.state = .closing;
+                    return;
+                };
+            }
+        }
+    }
+};
+```
+
+### Graceful vs Forceful Shutdown
+
+```zig
+pub const Session = struct {
+    engine: ?*Engine = null,
+    linger_ms: i32,
+
+    /// Graceful shutdown: let engine finish current work
+    pub fn beginGracefulShutdown(self: *Session, rt: *zio.Runtime) void {
+        if (self.engine) |eng| {
+            eng.state = .closing;
+            // Engine checks state and exits loops naturally
+            eng.group.wait(rt) catch {};
+            eng.deinit();
+            self.engine = null;
+        }
+    }
+
+    /// Forceful shutdown: cancel immediately (linger=0)
+    pub fn forceShutdown(self: *Session, rt: *zio.Runtime) void {
+        if (self.engine) |eng| {
+            eng.group.cancel(rt);  // Immediate cancellation
+            eng.deinit();
+            self.engine = null;
+        }
+    }
+};
+
+pub const Socket = struct {
+    sessions: std.ArrayList(*Session),
+    ctx: *Context,
+
+    /// Close socket with linger
+    pub fn close(self: *Socket, rt: *zio.Runtime) void {
+        const linger = self.options.linger_ms;
+
+        for (self.sessions.items) |session| {
+            if (linger == 0) {
+                session.forceShutdown(rt);
+            } else {
+                session.beginGracefulShutdown(rt);
+            }
+        }
+
+        self.sessions.deinit();
+        self.ctx.unregisterSocket(self);
+    }
+};
+```
+
+### Listener with Accept Group
+
+Listener uses a group for accepted connections (all engines for this endpoint):
+
+```zig
+pub const Listener = struct {
+    acceptor: zio.net.Acceptor,
+    engine_group: zio.Group = .{},  // All engines from this listener
+    active: bool = true,
+
+    pub fn run(self: *Listener, rt: *zio.Runtime) void {
+        defer self.cleanup(rt);
+
+        while (self.active) {
+            const stream = self.acceptor.accept(rt) catch |err| {
+                if (err == error.Cancelled) break;
+                continue;  // Transient error, retry
+            };
+
+            // Create engine for this connection
+            const engine = Engine.create(self.socket, stream, .server) catch {
+                stream.close();
+                continue;
+            };
+
+            // Spawn into group - will be cancelled when listener stops
+            self.engine_group.spawn(rt, Engine.run, .{ engine, rt }) catch {
+                engine.deinit();
+                continue;
+            };
+        }
+    }
+
+    pub fn stop(self: *Listener, rt: *zio.Runtime) void {
+        self.active = false;
+        self.acceptor.close();  // Unblocks accept()
+        self.engine_group.cancel(rt);  // Cancel all engines
+        self.engine_group.wait(rt) catch {};  // Wait for cleanup
+    }
+};
+```
+
+### Connector with Reconnection
+
+Connector doesn't use a group - it manages a single engine with reconnection logic:
+
+```zig
+pub const Connector = struct {
+    endpoint: Endpoint,
+    engine: ?*Engine = null,
+    reconnect: ReconnectState,
+    state: State = .disconnected,
+
+    const State = enum { disconnected, connecting, connected };
+
+    pub fn run(self: *Connector, rt: *zio.Runtime) void {
+        while (self.state != .disconnected) {
+            // Connect
+            const stream = self.endpoint.connect(rt) catch |err| {
+                self.scheduleReconnect(rt);
+                continue;
+            };
+
+            // Create and run engine
+            self.engine = Engine.create(self.socket, stream, .client) catch {
+                stream.close();
+                self.scheduleReconnect(rt);
+                continue;
+            };
+
+            self.state = .connected;
+            self.reconnect.reset();
+
+            // Run engine (blocks until disconnect)
+            self.engine.?.run(rt);
+
+            // Engine exited - cleanup and maybe reconnect
+            self.engine.?.deinit();
+            self.engine = null;
+
+            if (self.state != .disconnected) {
+                self.scheduleReconnect(rt);
+            }
+        }
+    }
+
+    fn scheduleReconnect(self: *Connector, rt: *zio.Runtime) void {
+        const delay = self.reconnect.nextDelay();
+        rt.sleep(Duration.fromMilliseconds(delay)) catch return;
+    }
+
+    pub fn stop(self: *Connector) void {
+        self.state = .disconnected;
+        if (self.engine) |eng| {
+            eng.state = .closing;
+        }
+    }
+};
+```
+
+### Comparison with libzmq
+
+| Aspect | libzmq | ZZMQ |
+|--------|--------|------|
+| Engine coordination | Mailbox commands | State enum + channel close |
+| Reader/writer sync | Lock-free queues + signaler | ZIO channels + groups |
+| Shutdown signal | Command via mailbox | `state = .closing` |
+| Forceful cancel | `terminate(false)` | `group.cancel(rt)` |
+| Reconnection | Timer + state machine | Loop with `rt.sleep()` |
+| Linger | Timer callback | Shielded block + deadline |
+
+**Key insight:** libzmq uses commands and signaling because it's poll-based. ZZMQ uses state + channels because ZIO coroutines can simply check state and exit naturally.
+
+---
+
 ## Connection Management
 
 ### Listener (for `bind()`)
@@ -2653,13 +3171,13 @@ pub const Engine = struct {
                 break;
             };
 
-            // Write to network
-            self.stream.writeAll(rt, encoded, self.writeTimeout()) catch |err| {
+            // Write to network (ZIO stream.sendAll API)
+            self.stream.sendAll(rt, encoded, .{}) catch |err| {
                 self.handleWriteError(err);
                 break;
             };
 
-            self.heartbeat.last_send = zio.time.now();
+            self.heartbeat.last_send = rt.now();
         }
     }
 
@@ -2668,25 +3186,27 @@ pub const Engine = struct {
         const interval = self.heartbeat.interval orelse return;
 
         while (self.state == .ready) {
-            zio.time.sleep(rt, .fromMilliseconds(interval)) catch break;
+            rt.sleep(Duration.fromMilliseconds(interval)) catch break;
 
             // Check for timeout
-            const now = zio.time.now();
-            if (now - self.heartbeat.last_recv > self.heartbeat.timeout) {
+            const now = rt.now();
+            const since_recv = now.since(self.heartbeat.last_recv);
+            if (since_recv.toMilliseconds() > self.heartbeat.timeout) {
                 self.handleTimeout();
                 break;
             }
 
             // Send PING if needed
-            if (now - self.heartbeat.last_send > interval) {
+            const since_send = now.since(self.heartbeat.last_send);
+            if (since_send.toMilliseconds() > interval) {
                 self.sendCommand(.ping) catch break;
             }
         }
     }
 
-    fn stop(self: *Engine) void {
+    fn stop(self: *Engine, rt: *zio.Runtime) void {
         self.state = .closing;
-        self.group.cancel();
+        self.group.cancel(rt);
     }
 };
 ```
