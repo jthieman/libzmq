@@ -5460,6 +5460,1174 @@ Examples:
 
 ---
 
+## Subscription Matching System
+
+### Semantic Requirements (libzmq Compatibility)
+
+Subscription matching in ZMQ is **prefix-based**: a subscriber subscribes to a prefix (e.g., `"weather."`), and all messages whose first frame starts with that prefix are delivered. Key semantics:
+
+1. **Prefix Matching**: Topic `"weather.nyc.temp"` matches subscriptions `""`, `"w"`, `"weather"`, `"weather."`, `"weather.nyc"`, etc.
+2. **Empty Prefix**: Subscribing to `""` matches ALL messages (wildcard)
+3. **Multiple Subscriptions**: A pipe can have multiple subscriptions; message delivered if ANY matches
+4. **Subscription Counting**: Same prefix subscribed twice requires two unsubscribes to remove
+5. **First Frame Only**: Only the first frame of a multipart message is matched against subscriptions
+6. **Binary Safe**: Prefixes are byte arrays, not strings (can contain NUL bytes)
+
+### ZZMQ Design: Prefix Trie with Zig Idioms
+
+We implement a prefix trie (similar to libzmq's MTrie) but with Zig-idiomatic design:
+
+```zig
+pub const SubscriptionTrie = struct {
+    const Self = @This();
+
+    /// Node in the prefix trie
+    pub const Node = struct {
+        /// Pipes subscribed at this exact prefix
+        /// Uses small-vector optimization: inline storage for common case (1-4 pipes)
+        pipes: PipeSet,
+
+        /// Child nodes, keyed by next byte
+        /// null means no children (leaf or partial leaf)
+        children: ?*Children,
+
+        /// Reference count for this prefix (same pipe can subscribe multiple times)
+        /// Maps pipe -> subscription count
+        ref_counts: std.AutoHashMap(*Pipe, u32),
+
+        pub const Children = struct {
+            /// Sparse child storage for typical case (few children)
+            /// Falls back to dense array if many children
+            storage: ChildStorage,
+
+            const ChildStorage = union(enum) {
+                /// Sparse: up to 8 children stored inline
+                sparse: struct {
+                    keys: [8]u8,
+                    nodes: [8]?*Node,
+                    count: u8,
+                },
+                /// Dense: 256-entry array for nodes with many children
+                dense: [256]?*Node,
+            };
+        };
+    };
+
+    root: Node,
+    allocator: Allocator,
+
+    /// Total number of unique subscriptions (for stats/debugging)
+    total_subscriptions: usize = 0,
+
+    /// Add a subscription for a pipe
+    /// Returns true if this is the FIRST subscription for this prefix (any pipe)
+    pub fn subscribe(self: *Self, prefix: []const u8, pipe: *Pipe) !bool {
+        var node = &self.root;
+
+        // Walk/create path to prefix
+        for (prefix) |byte| {
+            node = try self.getOrCreateChild(node, byte);
+        }
+
+        // Add pipe to this node
+        const first_for_prefix = node.pipes.count() == 0;
+        const prev_count = node.ref_counts.get(pipe) orelse 0;
+        try node.ref_counts.put(pipe, prev_count + 1);
+
+        if (prev_count == 0) {
+            try node.pipes.add(pipe);
+        }
+
+        self.total_subscriptions += 1;
+        return first_for_prefix;
+    }
+
+    /// Remove a subscription for a pipe
+    /// Returns: .removed if last subscription for this prefix, .remaining if others exist, .not_found
+    pub fn unsubscribe(self: *Self, prefix: []const u8, pipe: *Pipe) UnsubscribeResult {
+        var node = &self.root;
+
+        // Walk to prefix
+        for (prefix) |byte| {
+            node = self.getChild(node, byte) orelse return .not_found;
+        }
+
+        // Decrement reference count
+        const count = node.ref_counts.get(pipe) orelse return .not_found;
+        if (count == 1) {
+            _ = node.ref_counts.remove(pipe);
+            node.pipes.remove(pipe);
+            self.total_subscriptions -= 1;
+
+            // Clean up empty nodes (optional, for memory efficiency)
+            self.maybeCompact(prefix);
+
+            return if (node.pipes.count() == 0) .removed else .remaining;
+        } else {
+            node.ref_counts.put(pipe, count - 1) catch unreachable;
+            self.total_subscriptions -= 1;
+            return .remaining;
+        }
+    }
+
+    pub const UnsubscribeResult = enum { removed, remaining, not_found };
+
+    /// Find all pipes matching a topic (prefix match)
+    /// Calls callback for each matching pipe (may be called multiple times for same pipe
+    /// if subscribed at multiple prefix levels - caller should deduplicate if needed)
+    pub fn match(self: *Self, topic: []const u8, callback: *const fn(*Pipe) void) void {
+        var node = &self.root;
+
+        // Root node pipes (empty prefix "") match everything
+        for (node.pipes.slice()) |pipe| {
+            callback(pipe);
+        }
+
+        // Walk topic, collecting matching pipes at each level
+        for (topic) |byte| {
+            node = self.getChild(node, byte) orelse break;
+            for (node.pipes.slice()) |pipe| {
+                callback(pipe);
+            }
+        }
+    }
+
+    /// Optimized: collect unique matching pipes into a set
+    pub fn matchUnique(self: *Self, topic: []const u8, result: *PipeSet) void {
+        var node = &self.root;
+
+        // Root matches
+        result.addAll(node.pipes);
+
+        // Walk and collect
+        for (topic) |byte| {
+            node = self.getChild(node, byte) orelse break;
+            result.addAll(node.pipes);
+        }
+    }
+
+    /// Remove ALL subscriptions for a pipe (called when pipe disconnects)
+    pub fn removeAllForPipe(self: *Self, pipe: *Pipe) void {
+        self.removeFromSubtree(&self.root, pipe);
+    }
+
+    fn removeFromSubtree(self: *Self, node: *Node, pipe: *Pipe) void {
+        // Remove from this node
+        if (node.ref_counts.remove(pipe)) |count| {
+            node.pipes.remove(pipe);
+            self.total_subscriptions -= count;
+        }
+
+        // Recurse to children
+        if (node.children) |children| {
+            switch (children.storage) {
+                .sparse => |*s| {
+                    for (s.nodes[0..s.count]) |maybe_child| {
+                        if (maybe_child) |child| {
+                            self.removeFromSubtree(child, pipe);
+                        }
+                    }
+                },
+                .dense => |*d| {
+                    for (d) |maybe_child| {
+                        if (maybe_child) |child| {
+                            self.removeFromSubtree(child, pipe);
+                        }
+                    }
+                },
+            }
+        }
+    }
+};
+```
+
+### Design Rationale
+
+**Why Prefix Trie (not HashMap)?**
+- `match()` is O(topic_length), touching only relevant nodes
+- HashMap would require checking every subscription prefix against topic
+- Memory sharing for common prefixes (e.g., "weather.nyc" and "weather.london")
+
+**Sparse vs Dense Children:**
+- Most nodes have few children (typical topic hierarchies)
+- Sparse storage (8 inline slots) avoids 256-byte allocation per node
+- Automatic promotion to dense when >8 children
+
+**Reference Counting:**
+- Same pipe subscribing twice to same prefix is valid
+- Must unsubscribe twice to fully remove
+- Separate from pipe set membership (pipe in set iff ref_count > 0)
+
+**Deduplication Strategy:**
+- `match()` may return same pipe multiple times (subscribed at multiple levels)
+- `matchUnique()` deduplicates into PipeSet for send operations
+- PUB pattern uses `matchUnique()` to build send list
+
+### Integration with PUB Pattern
+
+```zig
+pub const Pub = struct {
+    subscriptions: SubscriptionTrie,
+    dist: Distributor,
+    match_buffer: PipeSet,  // Reused buffer for match results
+
+    pub fn send(self: *Pub, msg: *Message, rt: *zio.Runtime) !void {
+        // Match first frame against subscriptions
+        const topic = msg.firstFrame().data;
+
+        self.match_buffer.clear();
+        self.subscriptions.matchUnique(topic, &self.match_buffer);
+
+        // Send to all matching pipes
+        for (self.match_buffer.slice()) |pipe| {
+            // Copy message to each pipe (COW optimization kicks in)
+            try pipe.write(msg.copy());
+        }
+    }
+
+    pub fn onPipeAttached(self: *Pub, pipe: *Pipe) void {
+        self.dist.attach(pipe);
+        // New pipe has no subscriptions yet
+    }
+
+    pub fn onPipeDetached(self: *Pub, pipe: *Pipe) void {
+        self.subscriptions.removeAllForPipe(pipe);
+        self.dist.detach(pipe);
+    }
+
+    pub fn handleSubscription(self: *Pub, pipe: *Pipe, data: []const u8) !void {
+        if (data.len == 0) return error.InvalidSubscription;
+
+        const subscribe = data[0] == 1;
+        const prefix = data[1..];
+
+        if (subscribe) {
+            _ = try self.subscriptions.subscribe(prefix, pipe);
+        } else {
+            _ = self.subscriptions.unsubscribe(prefix, pipe);
+        }
+    }
+};
+```
+
+### XPUB Subscription Notifications
+
+XPUB exposes subscription events to the application:
+
+```zig
+pub const XPub = struct {
+    subscriptions: SubscriptionTrie,
+
+    /// Pending subscription notifications for recv()
+    pending_notifications: std.ArrayList(Notification),
+
+    /// Options
+    verbose_subs: bool = false,    // Notify on every sub, not just first
+    verbose_unsubs: bool = false,  // Notify on every unsub, not just last
+
+    const Notification = struct {
+        subscribe: bool,  // true = subscribe, false = unsubscribe
+        prefix: []const u8,
+    };
+
+    pub fn handleSubscription(self: *XPub, pipe: *Pipe, data: []const u8) !void {
+        const subscribe = data[0] == 1;
+        const prefix = data[1..];
+
+        if (subscribe) {
+            const first = try self.subscriptions.subscribe(prefix, pipe);
+            if (first or self.verbose_subs) {
+                try self.pending_notifications.append(.{
+                    .subscribe = true,
+                    .prefix = try self.allocator.dupe(u8, prefix),
+                });
+            }
+        } else {
+            const result = self.subscriptions.unsubscribe(prefix, pipe);
+            if (result == .removed or self.verbose_unsubs) {
+                try self.pending_notifications.append(.{
+                    .subscribe = false,
+                    .prefix = try self.allocator.dupe(u8, prefix),
+                });
+            }
+        }
+    }
+
+    pub fn recv(self: *XPub) ?Message {
+        if (self.pending_notifications.popOrNull()) |notif| {
+            // Return subscription event as message: [0/1][prefix]
+            var msg = Message.init(self.allocator);
+            const frame = msg.addFrame(notif.prefix.len + 1);
+            frame[0] = if (notif.subscribe) 1 else 0;
+            @memcpy(frame[1..], notif.prefix);
+            self.allocator.free(notif.prefix);
+            return msg;
+        }
+        return null;
+    }
+};
+```
+
+---
+
+## Identity and Routing ID Lifecycle
+
+Routing IDs (also called "identities") are critical for ROUTER sockets to address specific peers. Understanding the lifecycle is essential for correct implementation.
+
+### Identity Sources
+
+A pipe's routing ID can come from three sources, in priority order:
+
+```
+1. Explicit ZMQ_ROUTING_ID option (set before connect)
+2. ZMTP handshake Identity property (sent by peer)
+3. Auto-generated ID (ROUTER assigns unique ID)
+```
+
+### Lifecycle Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ROUTING ID LIFECYCLE                          │
+└─────────────────────────────────────────────────────────────────┘
+
+CONNECTING SOCKET (e.g., DEALER connecting to ROUTER):
+─────────────────────────────────────────────────────
+
+[1] Socket Creation
+    │
+    ▼
+[2] Optional: socket.setOption(.routing_id, "my-identity")
+    │                     │
+    │                     └── Stored in socket.options.routing_id
+    │
+    ▼
+[3] socket.connect("tcp://server:5555")
+    │
+    ▼
+[4] ZMTP Handshake
+    │   ┌──────────────────────────────────────────────┐
+    │   │ READY command includes:                       │
+    │   │   Identity: <routing_id or empty>            │
+    │   │   Socket-Type: DEALER                        │
+    │   └──────────────────────────────────────────────┘
+    │
+    ▼
+[5] Pipe created with routing_id attached
+
+
+ROUTER SOCKET (receiving connection):
+─────────────────────────────────────
+
+[1] Incoming connection accepted
+    │
+    ▼
+[2] ZMTP Handshake
+    │   ┌──────────────────────────────────────────────┐
+    │   │ Receive peer's READY command                  │
+    │   │   Identity: "my-identity" (or empty)         │
+    │   └──────────────────────────────────────────────┘
+    │
+    ▼
+[3] Determine Routing ID:
+    │
+    │   if peer sent non-empty Identity:
+    │       routing_id = peer's Identity
+    │       ┌────────────────────────────────────────┐
+    │       │ Check for collision!                    │
+    │       │ If routing_id already exists:          │
+    │       │   - ZMQ_ROUTER_HANDOVER=1: disconnect  │
+    │       │     old pipe, use new                   │
+    │       │   - ZMQ_ROUTER_HANDOVER=0: reject new  │
+    │       │     connection (disconnect it)         │
+    │       └────────────────────────────────────────┘
+    │   else:
+    │       routing_id = generate_unique_id()
+    │       // Format: 0x00 + 4-byte counter (binary, not string)
+    │
+    ▼
+[4] Pipe attached with routing_id
+    │   pipes.addWithRoutingId(pipe, routing_id)
+    │
+    ▼
+[5] Ready for send/recv
+    │
+    │   recv() → prepends routing_id to message
+    │   send() → first frame is routing_id, routes to that pipe
+```
+
+### ZZMQ Implementation
+
+```zig
+pub const RoutingId = struct {
+    /// Routing IDs are 1-255 bytes
+    data: [255]u8,
+    len: u8,
+
+    pub const MAX_LEN = 255;
+
+    pub fn fromSlice(slice: []const u8) !RoutingId {
+        if (slice.len == 0 or slice.len > MAX_LEN) {
+            return error.InvalidRoutingId;
+        }
+        var id: RoutingId = undefined;
+        @memcpy(id.data[0..slice.len], slice);
+        id.len = @intCast(slice.len);
+        return id;
+    }
+
+    pub fn slice(self: *const RoutingId) []const u8 {
+        return self.data[0..self.len];
+    }
+
+    /// Auto-generated IDs start with 0x00 (cannot conflict with user IDs)
+    pub fn isAutoGenerated(self: *const RoutingId) bool {
+        return self.len >= 1 and self.data[0] == 0x00;
+    }
+};
+
+pub const RoutingIdGenerator = struct {
+    counter: u32 = 0,
+
+    pub fn next(self: *RoutingIdGenerator) RoutingId {
+        self.counter += 1;
+        var id: RoutingId = undefined;
+        id.data[0] = 0x00;  // Auto-generated marker
+        std.mem.writeInt(u32, id.data[1..5], self.counter, .big);
+        id.len = 5;
+        return id;
+    }
+};
+
+pub const Router = struct {
+    /// Pipe lookup by routing ID
+    pipes_by_id: std.HashMap(RoutingIdKey, *Pipe, RoutingIdContext, 80),
+
+    /// ID generator for auto-assigned IDs
+    id_generator: RoutingIdGenerator,
+
+    /// Options
+    mandatory: bool = false,      // ZMQ_ROUTER_MANDATORY
+    handover: bool = false,       // ZMQ_ROUTER_HANDOVER
+
+    const RoutingIdKey = struct {
+        data: [255]u8,
+        len: u8,
+    };
+
+    /// Called when ZMTP handshake completes
+    pub fn onPipeReady(self: *Router, pipe: *Pipe, peer_identity: ?[]const u8) !void {
+        const routing_id = if (peer_identity) |id| blk: {
+            if (id.len > 0) {
+                // Peer provided explicit identity
+                break :blk try RoutingId.fromSlice(id);
+            }
+            // Empty identity = generate one
+            break :blk self.id_generator.next();
+        } else self.id_generator.next();
+
+        // Check for collision
+        const key = RoutingIdKey{ .data = routing_id.data, .len = routing_id.len };
+        if (self.pipes_by_id.get(key)) |existing_pipe| {
+            if (self.handover) {
+                // Disconnect old pipe, use new
+                existing_pipe.terminate();
+                _ = self.pipes_by_id.remove(key);
+            } else {
+                // Reject new connection
+                pipe.terminate();
+                return error.RoutingIdCollision;
+            }
+        }
+
+        pipe.routing_id = routing_id;
+        try self.pipes_by_id.put(key, pipe);
+    }
+
+    pub fn onPipeDetached(self: *Router, pipe: *Pipe) void {
+        if (pipe.routing_id) |id| {
+            const key = RoutingIdKey{ .data = id.data, .len = id.len };
+            _ = self.pipes_by_id.remove(key);
+        }
+    }
+
+    pub fn send(self: *Router, msg: *Message) !void {
+        // First frame must be routing ID
+        const routing_id = msg.routing_id orelse return error.NoRoutingId;
+
+        const key = RoutingIdKey{ .data = routing_id.data, .len = routing_id.len };
+        const pipe = self.pipes_by_id.get(key) orelse {
+            if (self.mandatory) {
+                return error.HostUnreachable;
+            }
+            // Silently drop (default ZMQ behavior)
+            return;
+        };
+
+        // Send message (without routing ID frame on wire)
+        try pipe.write(msg);
+    }
+
+    pub fn recv(self: *Router, pipes: *PipeSet, rt: *zio.Runtime) !Message {
+        // Fair queue from all pipes
+        const pipe = try pipes.waitReadable(rt);
+        var msg = try pipe.read(rt);
+
+        // Prepend routing ID so user knows who sent it
+        msg.routing_id = pipe.routing_id;
+        return msg;
+    }
+};
+```
+
+### Identity Constraints
+
+```zig
+pub fn validateRoutingId(id: []const u8) !void {
+    // Length: 1-255 bytes
+    if (id.len == 0) return error.RoutingIdEmpty;
+    if (id.len > 255) return error.RoutingIdTooLong;
+
+    // User-provided IDs cannot start with 0x00 (reserved for auto-generated)
+    if (id[0] == 0x00) return error.RoutingIdReservedPrefix;
+}
+```
+
+### Use Cases
+
+**Named Services:**
+```zig
+// Worker identifies itself
+worker.setOption(.routing_id, "worker-1");
+worker.connect("tcp://broker:5555");
+
+// Broker can route to specific worker
+var msg = Message.init(allocator);
+msg.routing_id = try RoutingId.fromSlice("worker-1");
+msg.addFrame("specific task for worker-1");
+broker.send(&msg);
+```
+
+**Extracting Sender Identity:**
+```zig
+// Broker receives request
+var request = try broker.recv();
+const sender = request.routing_id.?.slice();  // Who sent this?
+
+// Reply to same sender
+var reply = Message.init(allocator);
+reply.routing_id = request.routing_id;
+reply.addFrame("response");
+try broker.send(&reply);
+```
+
+---
+
+## Memory Pressure and Graceful Degradation
+
+### Philosophy
+
+Memory pressure handling is a **shared responsibility**:
+- **ZZMQ** provides mechanisms and sensible defaults
+- **Users** configure behavior appropriate to their use case
+- **Explicit failures** are preferred over silent data loss
+
+### Memory Failure Points
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MEMORY ALLOCATION POINTS                      │
+└─────────────────────────────────────────────────────────────────┘
+
+1. Message Creation
+   └── User calls Message.init() or recv()
+       └── Frame data allocation
+
+2. Pipe Write (send path)
+   └── Frame queue chunk allocation (when queue grows)
+
+3. Subscription Trie
+   └── New node creation for new prefixes
+
+4. Connection Establishment
+   └── Pipe allocation, engine buffers
+
+5. ZMTP Codec
+   └── Decode buffer allocation for large frames
+```
+
+### Strategy: Fail-Fast with User Control
+
+```zig
+pub const MemoryPolicy = struct {
+    /// What to do when send() can't allocate
+    on_send_oom: SendOomAction = .return_error,
+
+    /// What to do when recv() can't allocate
+    on_recv_oom: RecvOomAction = .return_error,
+
+    /// Maximum memory for pipe queues (0 = unlimited)
+    max_queue_memory: usize = 0,
+
+    /// Pre-allocate queue chunks to avoid OOM during operation
+    preallocate_chunks: u32 = 0,
+
+    pub const SendOomAction = enum {
+        return_error,    // Return error.OutOfMemory (default)
+        block_until_mem, // Block until memory available (risky!)
+        drop_message,    // Drop this message, return success (lossy)
+    };
+
+    pub const RecvOomAction = enum {
+        return_error,    // Return error.OutOfMemory (default)
+        disconnect_peer, // Disconnect the peer that sent too-large message
+    };
+};
+```
+
+### Pipe Queue Memory Limits
+
+```zig
+pub const Pipe = struct {
+    // Existing fields...
+
+    /// Memory tracking
+    queue_memory_used: usize = 0,
+    queue_memory_limit: usize,  // 0 = unlimited
+
+    pub fn writeFrame(self: *Pipe, frame: Frame) !void {
+        const frame_size = frame.data.len + @sizeOf(FrameHeader);
+
+        // Check memory limit (separate from HWM!)
+        if (self.queue_memory_limit > 0) {
+            if (self.queue_memory_used + frame_size > self.queue_memory_limit) {
+                return error.QueueMemoryExceeded;
+            }
+        }
+
+        // Try to enqueue
+        try self.outbound.enqueue(frame);
+        self.queue_memory_used += frame_size;
+    }
+
+    pub fn readFrame(self: *Pipe, rt: *zio.Runtime) !Frame {
+        const frame = try self.inbound.dequeue(rt);
+        const frame_size = frame.data.len + @sizeOf(FrameHeader);
+        self.queue_memory_used -= frame_size;
+        return frame;
+    }
+};
+```
+
+### Handling Large Messages
+
+```zig
+pub const Codec = struct {
+    /// Maximum frame size we'll decode (protection against malicious peers)
+    max_frame_size: usize = 1024 * 1024 * 1024,  // 1GB default
+
+    /// Decode buffer (reused between frames)
+    decode_buffer: std.ArrayList(u8),
+
+    pub fn decodeFrame(self: *Codec, reader: anytype) !Frame {
+        const size = try self.readFrameSize(reader);
+
+        // Check limit
+        if (size > self.max_frame_size) {
+            return error.FrameTooLarge;
+        }
+
+        // Allocate
+        self.decode_buffer.resize(size) catch |err| {
+            // Can't allocate decode buffer
+            return error.OutOfMemory;
+        };
+
+        try reader.readAll(self.decode_buffer.items);
+        return Frame.fromSlice(self.decode_buffer.items);
+    }
+};
+```
+
+### Pre-allocation Strategy
+
+For latency-critical applications, pre-allocate resources:
+
+```zig
+pub fn createPreallocatedPipe(allocator: Allocator, config: PipeConfig) !*Pipe {
+    var pipe = try allocator.create(Pipe);
+
+    // Pre-allocate queue chunks
+    const chunks_needed = config.preallocate_chunks;
+    for (0..chunks_needed) |_| {
+        const chunk = try allocator.create(FrameQueue.Chunk);
+        pipe.outbound.chunk_pool.push(chunk);
+        pipe.inbound.chunk_pool.push(chunk);
+    }
+
+    return pipe;
+}
+```
+
+### Error Propagation
+
+```zig
+pub const Socket = struct {
+    pub fn send(self: *Socket, msg: *Message) SendError!void {
+        // Allocation failures during send are explicit errors
+        return self.inner.send(msg) catch |err| switch (err) {
+            error.OutOfMemory => {
+                // User must handle this:
+                // - Retry later
+                // - Drop message (if acceptable)
+                // - Shut down gracefully
+                return error.OutOfMemory;
+            },
+            error.QueueMemoryExceeded => {
+                // Queue memory limit hit (not HWM!)
+                return error.OutOfMemory;
+            },
+            else => |e| return e,
+        };
+    }
+
+    pub fn recv(self: *Socket) RecvError!Message {
+        return self.inner.recv() catch |err| switch (err) {
+            error.OutOfMemory => {
+                // Couldn't allocate space for received message
+                // Options:
+                // - Return error (user retries later)
+                // - If policy is disconnect_peer, the pipe is terminated
+                return error.OutOfMemory;
+            },
+            error.FrameTooLarge => {
+                // Peer sent frame exceeding our limit
+                // Pipe is disconnected (protocol violation)
+                return error.PeerViolation;
+            },
+            else => |e| return e,
+        };
+    }
+};
+```
+
+### Monitoring Memory Usage
+
+```zig
+pub const Context = struct {
+    pub fn getMemoryStats(self: *Context) MemoryStats {
+        var stats = MemoryStats{};
+
+        for (self.sockets.items) |socket| {
+            for (socket.pipes.items) |pipe| {
+                stats.queue_memory += pipe.queue_memory_used;
+                stats.pipe_count += 1;
+            }
+        }
+
+        return stats;
+    }
+
+    pub const MemoryStats = struct {
+        queue_memory: usize = 0,
+        pipe_count: usize = 0,
+        message_count: usize = 0,
+    };
+};
+```
+
+### Summary: Memory Pressure Design
+
+| Scenario | Default Behavior | User Override |
+|----------|------------------|---------------|
+| send() OOM | Return `error.OutOfMemory` | `drop_message` for lossy |
+| recv() OOM | Return `error.OutOfMemory` | `disconnect_peer` |
+| Frame too large | Disconnect peer | Configure `max_frame_size` |
+| Queue memory limit | Return `error.OutOfMemory` | Set `queue_memory_limit` |
+| Pre-allocation | None | Set `preallocate_chunks` |
+
+**Key Principle:** Never silently lose data by default. Users opt into lossy behavior explicitly.
+
+---
+
+## Configuration Validation
+
+### Philosophy
+
+Configuration errors should be caught **as early as possible** with **clear, actionable error messages**. This dramatically improves developer experience.
+
+### Validation Timing
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    VALIDATION TIMING                             │
+└─────────────────────────────────────────────────────────────────┘
+
+[1] SOCKET CREATION (comptime where possible)
+    - Socket type validity
+    - Invalid option combinations caught at compile time (Zig)
+
+[2] OPTION SETTING (socket.setOption)
+    - Value range validation
+    - Type-specific constraints
+    - Option compatibility with socket type
+
+[3] BIND/CONNECT (socket.bind/connect)
+    - Endpoint format validation
+    - Transport-specific validation
+    - Socket type allows bind/connect
+
+[4] OPERATION TIME (send/recv)
+    - Message structure requirements
+    - State machine violations (e.g., REQ waiting for reply)
+```
+
+### Zig Comptime Validation
+
+```zig
+/// Socket type constraints validated at compile time
+pub fn Socket(comptime socket_type: SocketType) type {
+    return struct {
+        const Self = @This();
+
+        // Comptime-check socket capabilities
+        const can_send = switch (socket_type) {
+            .PULL, .SUB => false,
+            else => true,
+        };
+        const can_recv = switch (socket_type) {
+            .PUSH, .PUB => false,
+            else => true,
+        };
+        const can_bind = true;  // All types can bind
+        const can_connect = true;  // All types can connect
+        const requires_peer = switch (socket_type) {
+            .PAIR => true,
+            else => false,
+        };
+
+        pub fn send(self: *Self, msg: *Message) !void {
+            comptime if (!can_send) {
+                @compileError("Cannot send on " ++ @tagName(socket_type) ++ " socket");
+            };
+            return self.inner.send(msg);
+        }
+
+        pub fn recv(self: *Self) !Message {
+            comptime if (!can_recv) {
+                @compileError("Cannot recv on " ++ @tagName(socket_type) ++ " socket");
+            };
+            return self.inner.recv();
+        }
+
+        /// Subscribe only valid for SUB/XSUB
+        pub fn subscribe(self: *Self, prefix: []const u8) !void {
+            comptime if (socket_type != .SUB and socket_type != .XSUB) {
+                @compileError("subscribe() only valid for SUB/XSUB sockets");
+            };
+            return self.inner.subscribe(prefix);
+        }
+    };
+}
+
+// Usage - compile errors for invalid operations:
+var push = try context.socket(.PUSH);
+// push.recv();  // COMPILE ERROR: Cannot recv on PUSH socket
+
+var sub = try context.socket(.SUB);
+// sub.send(&msg);  // COMPILE ERROR: Cannot send on SUB socket
+```
+
+### Runtime Option Validation
+
+```zig
+pub const SocketOptions = struct {
+    pub fn set(self: *SocketOptions, socket_type: SocketType, option: Option, value: anytype) !void {
+        // Validate option is applicable to this socket type
+        if (!option.validFor(socket_type)) {
+            return ConfigError.optionNotApplicable(option, socket_type);
+        }
+
+        // Validate value
+        try self.validateValue(option, value);
+
+        // Apply
+        self.applyOption(option, value);
+    }
+
+    fn validateValue(self: *SocketOptions, option: Option, value: anytype) !void {
+        switch (option) {
+            .sndhwm, .rcvhwm => {
+                // HWM: 0 (unlimited) or positive
+                // Already valid by type (u32)
+            },
+            .routing_id => {
+                const id = value;
+                if (id.len == 0) return ConfigError.routingIdEmpty();
+                if (id.len > 255) return ConfigError.routingIdTooLong(id.len);
+                if (id[0] == 0x00) return ConfigError.routingIdReservedPrefix();
+            },
+            .subscribe => {
+                // Prefix can be any bytes, including empty
+                // (empty = subscribe to all)
+            },
+            .linger => {
+                // -1 = infinite, 0 = drop immediately, >0 = milliseconds
+                const linger: i32 = value;
+                if (linger < -1) return ConfigError.lingerInvalid(linger);
+            },
+            .tcp_keepalive => {
+                const ka: i32 = value;
+                if (ka < -1 or ka > 1) return ConfigError.boolOptionInvalid("tcp_keepalive", ka);
+            },
+            else => {},
+        }
+    }
+};
+```
+
+### Detailed Error Messages
+
+```zig
+pub const ConfigError = struct {
+    kind: Kind,
+    details: Details,
+
+    pub const Kind = enum {
+        option_not_applicable,
+        value_out_of_range,
+        invalid_format,
+        incompatible_options,
+        invalid_state,
+    };
+
+    pub const Details = union {
+        option_not_applicable: struct {
+            option: Option,
+            socket_type: SocketType,
+        },
+        value_out_of_range: struct {
+            option: Option,
+            value: i64,
+            min: i64,
+            max: i64,
+        },
+        // ... etc
+    };
+
+    pub fn format(self: ConfigError, writer: anytype) !void {
+        switch (self.kind) {
+            .option_not_applicable => {
+                const d = self.details.option_not_applicable;
+                try writer.print(
+                    "Option '{s}' is not applicable to {s} sockets. " ++
+                    "This option is only valid for: {s}",
+                    .{
+                        @tagName(d.option),
+                        @tagName(d.socket_type),
+                        d.option.validSocketTypes(),
+                    }
+                );
+            },
+            .value_out_of_range => {
+                const d = self.details.value_out_of_range;
+                try writer.print(
+                    "Value {d} for option '{s}' is out of range. " ++
+                    "Valid range: {d} to {d}",
+                    .{ d.value, @tagName(d.option), d.min, d.max }
+                );
+            },
+            // ...
+        }
+    }
+
+    // Convenience constructors with good messages
+    pub fn optionNotApplicable(option: Option, socket_type: SocketType) ConfigError {
+        return .{
+            .kind = .option_not_applicable,
+            .details = .{ .option_not_applicable = .{
+                .option = option,
+                .socket_type = socket_type,
+            }},
+        };
+    }
+
+    pub fn routingIdEmpty() ConfigError {
+        return .{
+            .kind = .invalid_format,
+            .details = .{ .message = "Routing ID cannot be empty. Provide 1-255 bytes." },
+        };
+    }
+
+    pub fn routingIdReservedPrefix() ConfigError {
+        return .{
+            .kind = .invalid_format,
+            .details = .{ .message =
+                "Routing ID cannot start with 0x00 (reserved for auto-generated IDs). " ++
+                "Use any other starting byte for explicit identities."
+            },
+        };
+    }
+};
+```
+
+### Endpoint Validation
+
+```zig
+pub const Endpoint = struct {
+    pub fn parse(uri: []const u8) !Endpoint {
+        // Format: transport://address
+        const sep = std.mem.indexOf(u8, uri, "://") orelse {
+            return ConfigError.invalidEndpoint(uri,
+                "Missing '://'. Expected format: transport://address (e.g., tcp://127.0.0.1:5555)");
+        };
+
+        const transport = uri[0..sep];
+        const address = uri[sep + 3..];
+
+        return switch (transport) {
+            "tcp" => .{ .tcp = try TcpEndpoint.parse(address) },
+            "ipc" => .{ .ipc = try IpcEndpoint.parse(address) },
+            "inproc" => .{ .inproc = try InprocEndpoint.parse(address) },
+            else => ConfigError.unknownTransport(transport),
+        };
+    }
+};
+
+pub const TcpEndpoint = struct {
+    pub fn parse(address: []const u8) !TcpEndpoint {
+        // Format: host:port or [ipv6]:port or *:port (bind any)
+
+        // Find last colon (port separator)
+        const colon = std.mem.lastIndexOf(u8, address, ":") orelse {
+            return ConfigError.invalidEndpoint(address,
+                "TCP address must include port. Expected: host:port (e.g., 127.0.0.1:5555 or *:5555)");
+        };
+
+        const host = address[0..colon];
+        const port_str = address[colon + 1..];
+
+        const port = std.fmt.parseInt(u16, port_str, 10) catch {
+            return ConfigError.invalidEndpoint(address,
+                std.fmt.allocPrint(allocator,
+                    "Invalid port '{s}'. Port must be a number 1-65535.", .{port_str}));
+        };
+
+        if (port == 0) {
+            return ConfigError.invalidEndpoint(address,
+                "Port 0 is not valid. Use a specific port (1-65535) or ephemeral port binding.");
+        }
+
+        // Parse host
+        if (host.len == 0) {
+            return ConfigError.invalidEndpoint(address, "Host cannot be empty.");
+        }
+
+        return .{ .host = host, .port = port };
+    }
+};
+```
+
+### Option Compatibility Matrix
+
+```zig
+pub const Option = enum {
+    // Common
+    sndhwm,
+    rcvhwm,
+    linger,
+
+    // Pattern-specific
+    routing_id,      // DEALER, REQ, ROUTER
+    subscribe,       // SUB, XSUB
+    unsubscribe,     // SUB, XSUB
+    router_mandatory, // ROUTER only
+    router_handover, // ROUTER only
+    req_correlate,   // REQ only
+    req_relaxed,     // REQ only
+
+    pub fn validFor(self: Option, socket_type: SocketType) bool {
+        return switch (self) {
+            .sndhwm, .rcvhwm, .linger => true,  // Valid for all
+
+            .routing_id => switch (socket_type) {
+                .DEALER, .REQ, .REP, .ROUTER => true,
+                else => false,
+            },
+
+            .subscribe, .unsubscribe => switch (socket_type) {
+                .SUB, .XSUB => true,
+                else => false,
+            },
+
+            .router_mandatory, .router_handover => socket_type == .ROUTER,
+
+            .req_correlate, .req_relaxed => socket_type == .REQ,
+        };
+    }
+
+    pub fn validSocketTypes(self: Option) []const u8 {
+        return switch (self) {
+            .routing_id => "DEALER, REQ, REP, ROUTER",
+            .subscribe, .unsubscribe => "SUB, XSUB",
+            .router_mandatory, .router_handover => "ROUTER",
+            .req_correlate, .req_relaxed => "REQ",
+            else => "all socket types",
+        };
+    }
+};
+```
+
+### State Validation
+
+```zig
+pub const ReqSocket = struct {
+    state: State = .ready,
+
+    const State = enum { ready, waiting_reply };
+
+    pub fn send(self: *ReqSocket, msg: *Message) !void {
+        if (self.state != .ready) {
+            return error.InvalidState;
+            // Better: return ConfigError.invalidState(
+            //     "REQ socket already sent a request. " ++
+            //     "Must call recv() before sending another request.");
+        }
+
+        try self.inner.send(msg);
+        self.state = .waiting_reply;
+    }
+
+    pub fn recv(self: *ReqSocket) !Message {
+        if (self.state != .waiting_reply) {
+            return error.InvalidState;
+            // Better: return ConfigError.invalidState(
+            //     "REQ socket has no pending request. " ++
+            //     "Must call send() before recv().");
+        }
+
+        const reply = try self.inner.recv();
+        self.state = .ready;
+        return reply;
+    }
+};
+```
+
+### Summary: Configuration Validation
+
+| When | What | How |
+|------|------|-----|
+| Compile time | send/recv capability | Zig comptime checks |
+| Compile time | Method availability (subscribe on SUB) | Type-specific Socket |
+| Option set | Value ranges | Runtime validation |
+| Option set | Socket type compatibility | `validFor()` lookup |
+| Bind/Connect | Endpoint format | `Endpoint.parse()` |
+| Operation | State machine | Pattern-specific checks |
+
+**Key Principle:** Catch errors early, provide clear messages, leverage Zig's comptime for impossible-to-misuse APIs.
+
+---
+
 ## Proxy Pattern
 
 The proxy (also called "device" or "forwarder") is a built-in message forwarding pattern that connects two sockets bidirectionally, optionally capturing all messages.
@@ -10401,14 +11569,16 @@ fn compatTest(comptime testFn: fn (*Socket, *Socket) anyerror!void) !void {
 
 ZZMQ provides ZeroMQ semantics on Zig/ZIO by:
 
-1. **Using zio.Channel as pipes**: Bounded channels with backpressure = HWM
-2. **Coroutines for connections**: Each connection is Engine coroutine pair
-3. **Pattern-specific logic**: Traits for PUSH/PULL/PUB/SUB/etc.
-4. **Reference-counted messages**: Zero-copy fan-out
-5. **Blocking API backed by async**: Natural code, efficient execution
-6. **Level-triggered polling via ZIO**: Compatible poll/poller APIs with external event loop integration
+1. **Frame-based pipes with growable queues**: Pipes store frames (not complete messages), with truly unlimited capacity when HWM=0. HWM enforced via message counters, not queue size.
+2. **Coroutines for connections**: Each connection is an Engine with reader/writer coroutine pair managed by ZIO Groups.
+3. **Pattern-specific logic**: Comptime traits for PUSH/PULL/PUB/SUB/REQ/REP/DEALER/ROUTER with pattern-appropriate send/recv semantics.
+4. **Explicit copy semantics**: Messages use copy-on-send with inline small-message optimization. No hidden sharing or reference counting complexity.
+5. **Blocking API backed by async**: Natural synchronous code, efficient cooperative scheduling via ZIO runtime.
+6. **Level-triggered polling via ZIO**: Compatible `poll()`/`Poller` APIs with `getFd()` for external event loop integration.
+7. **Two-tier architecture**: Comptime-optimized layer for Zig users (zero-cost abstractions), runtime-flexible layer for C FFI compatibility.
 
 The design prioritizes:
-- Simplicity (ZIO does the hard work)
-- Performance (minimal copies, efficient scheduling)
-- Compatibility (libzmq semantics, ZMTP wire protocol, polling APIs)
+- **Simplicity**: ZIO handles async I/O, cancellation, and structured concurrency
+- **Performance**: Minimal copies, cache-friendly layouts, io_uring integration
+- **Compatibility**: libzmq semantics, ZMTP 3.1 wire protocol, familiar polling APIs
+- **Correctness**: Explicit ownership, validated configuration, graceful error handling
