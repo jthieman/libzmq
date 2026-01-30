@@ -5157,13 +5157,39 @@ pub const Router = struct {
 
 XPUB and XSUB are the "extended" versions of PUB and SUB that expose subscription messages to the application layer, enabling subscription forwarding through intermediary proxies.
 
+#### Key Differences from PUB/SUB
+
+| Aspect | PUB/SUB | XPUB/XSUB |
+|--------|---------|-----------|
+| Subscription API | `setsockopt(ZMQ_SUBSCRIBE)` | `send()` subscription message |
+| Subscription visibility | Hidden | Exposed via `recv()` on XPUB |
+| Upstream data | Not supported | XSUB can send user messages |
+| Filtering | Automatic at SUB | Configurable at XSUB |
+| Use case | Simple pub/sub | Proxies, logging, manual control |
+
+#### Subscription Message Formats
+
+ZZMQ supports both legacy wire format and ZMTP 3.1 commands:
+
+```
+Legacy Wire Format (sent by application):
+  Subscribe:   [0x01][prefix bytes...]
+  Unsubscribe: [0x00][prefix bytes...]
+
+ZMTP 3.1 Commands (internal, on wire):
+  SUBSCRIBE command with body = prefix
+  CANCEL command with body = prefix
+
+Both formats are equivalent - ZMTP 3.1 is used on the wire,
+legacy format is used at the API level for backwards compatibility.
+```
+
 #### libzmq XPUB/XSUB Reference
 
 From `src/xpub.cpp` and `src/xsub.cpp`:
 
 **XPUB (Extended Publisher):**
 - Receives subscription messages from subscribers as readable messages
-- Format: `[0x01][prefix]` for subscribe, `[0x00][prefix]` for unsubscribe
 - `_subscriptions` mtrie tracks which pipes subscribe to which prefixes
 - On send: matches topic against subscriptions, distributes to matching pipes
 - Options:
@@ -5172,13 +5198,19 @@ From `src/xpub.cpp` and `src/xsub.cpp`:
   - `ZMQ_XPUB_MANUAL`: Application controls subscription acceptance
   - `ZMQ_XPUB_NODROP`: Block instead of drop when HWM reached
   - `ZMQ_XPUB_WELCOME_MSG`: Send message to new subscribers
+  - `ZMQ_ONLY_FIRST_SUBSCRIBE`: Only first frame considered for subscription
+  - `ZMQ_INVERT_MATCHING`: Send to pipes NOT matching
+  - `ZMQ_TOPICS_COUNT`: Query number of unique subscription prefixes
 
 **XSUB (Extended Subscriber):**
-- Sends subscription messages upstream (instead of setsockopt)
-- Format: same `[0x01][prefix]` / `[0x00][prefix]` wire format
+- Sends subscription messages upstream (via `send()`, not setsockopt)
 - Caches subscriptions locally in `_subscriptions` trie
 - On reconnect (`xhiccuped`): resends all cached subscriptions
-- Filters incoming messages against local subscriptions
+- `options.filter`: When true (default for SUB), filters incoming messages
+- Options:
+  - `ZMQ_ONLY_FIRST_SUBSCRIBE`: Only first frame triggers subscription logic
+  - `ZMQ_XSUB_VERBOSE_UNSUBSCRIBE`: Forward all unsubscribes (draft API)
+  - `ZMQ_TOPICS_COUNT`: Query number of local subscriptions
 
 **Key Insight**: XPUB/XSUB enable building subscription-forwarding proxies. The proxy receives subscription messages from XPUB, forwards them to XSUB, which sends them upstream to the real publisher.
 
@@ -5192,18 +5224,30 @@ pub const XPub = struct {
     /// Pending subscription notifications to deliver via recv()
     pending_notifications: std.ArrayList(SubscriptionNotification),
 
+    /// Pending upstream data messages (non-subscription)
+    pending_data: std.ArrayList(Message),
+
     /// Distributor for fan-out
     dist: Distributor,
 
     /// Options
-    verbose_subs: bool = false,
-    verbose_unsubs: bool = false,
-    manual_mode: bool = false,
-    lossy: bool = true,  // Drop on HWM (false = block)
-    welcome_msg: ?Message = null,
+    verbose_subs: bool = false,      // ZMQ_XPUB_VERBOSE
+    verbose_unsubs: bool = false,    // ZMQ_XPUB_VERBOSER
+    manual_mode: bool = false,       // ZMQ_XPUB_MANUAL
+    lossy: bool = true,              // !ZMQ_XPUB_NODROP
+    invert_matching: bool = false,   // ZMQ_INVERT_MATCHING
+    only_first_subscribe: bool = false,  // ZMQ_ONLY_FIRST_SUBSCRIBE
+    welcome_msg: ?Message = null,    // ZMQ_XPUB_WELCOME_MSG
 
     /// Currently sending multipart
     more_send: bool = false,
+    more_recv: bool = false,
+
+    /// For manual mode: tracks which pipe sent the subscription we just delivered
+    last_pipe: ?*Pipe = null,
+
+    /// For manual mode with last value: send to specific pipe
+    send_last_pipe: bool = false,
 
     const SubscriptionNotification = struct {
         subscribe: bool,  // true=subscribe, false=unsubscribe
@@ -5215,6 +5259,7 @@ pub const XPub = struct {
         return .{
             .subscriptions = SubscriptionTrie.init(allocator),
             .pending_notifications = std.ArrayList(SubscriptionNotification).init(allocator),
+            .pending_data = std.ArrayList(Message).init(allocator),
             .dist = Distributor.init(allocator),
         };
     }
@@ -5231,60 +5276,113 @@ pub const XPub = struct {
         }
 
         // Process any subscription messages from this pipe
-        self.processSubscriptions(pipe);
+        self.processIncoming(pipe);
     }
 
-    /// Process incoming subscription messages from a pipe
-    fn processSubscriptions(self: *XPub, pipe: *Pipe) void {
+    /// Process incoming messages from a pipe (subscriptions + upstream data)
+    fn processIncoming(self: *XPub, pipe: *Pipe) void {
         while (pipe.tryRead()) |msg| {
-            defer msg.deinit();
-
-            // Parse subscription message: [0x00|0x01][prefix]
             const data = msg.data();
-            if (data.len == 0) continue;
+            const first_part = !self.more_recv;
+            self.more_recv = msg.hasMore();
 
-            const is_subscribe = data[0] == 0x01;
-            const prefix = data[1..];
+            // Determine if this is a subscription message
+            var is_subscription = false;
+            var subscribe: bool = undefined;
+            var prefix: []const u8 = undefined;
 
-            if (self.manual_mode) {
-                // Queue for application to approve via setsockopt
-                self.pending_notifications.append(.{
-                    .subscribe = is_subscribe,
-                    .prefix = prefix,
-                    .pipe = pipe,
-                }) catch continue;
-            } else {
-                // Auto-accept subscription
-                const notify = if (is_subscribe) blk: {
-                    const first_added = self.subscriptions.add(prefix, pipe);
-                    break :blk first_added or self.verbose_subs;
-                } else blk: {
-                    const result = self.subscriptions.remove(prefix, pipe);
-                    break :blk result != .values_remain or self.verbose_unsubs;
-                };
-
-                // Queue notification for recv()
-                if (notify) {
-                    self.pending_notifications.append(.{
-                        .subscribe = is_subscribe,
-                        .prefix = prefix,
-                        .pipe = null,
-                    }) catch continue;
+            if (first_part or !self.only_first_subscribe) {
+                // Check for ZMTP 3.1 command format
+                if (msg.isSubscribeCommand()) {
+                    is_subscription = true;
+                    subscribe = true;
+                    prefix = msg.commandBody();
+                } else if (msg.isCancelCommand()) {
+                    is_subscription = true;
+                    subscribe = false;
+                    prefix = msg.commandBody();
                 }
+                // Check for legacy wire format
+                else if (data.len > 0 and (data[0] == 0x01 or data[0] == 0x00)) {
+                    is_subscription = true;
+                    subscribe = data[0] == 0x01;
+                    prefix = data[1..];
+                }
+            }
+
+            if (is_subscription) {
+                self.handleSubscription(pipe, subscribe, prefix, msg);
+            } else {
+                // Non-subscription upstream data - queue for recv()
+                self.pending_data.append(msg) catch {
+                    msg.deinit();
+                };
             }
         }
     }
 
-    /// Send message to matching subscribers
-    pub fn send(
+    fn handleSubscription(
         self: *XPub,
-        msg: *Message,
-        rt: *zio.Runtime,
-    ) SendError!void {
+        pipe: *Pipe,
+        subscribe: bool,
+        prefix: []const u8,
+        original_msg: Message,
+    ) void {
+        defer original_msg.deinit();
+
+        if (self.manual_mode) {
+            // Queue for application to approve
+            const notif = SubscriptionNotification{
+                .subscribe = subscribe,
+                .prefix = self.allocator.dupe(u8, prefix) catch return,
+                .pipe = pipe,
+            };
+            self.pending_notifications.append(notif) catch return;
+        } else {
+            // Auto-accept subscription
+            const notify = if (subscribe) blk: {
+                const first_added = self.subscriptions.subscribe(prefix, pipe) catch return;
+                break :blk first_added or self.verbose_subs;
+            } else blk: {
+                const result = self.subscriptions.unsubscribe(prefix, pipe);
+                break :blk result == .removed or self.verbose_unsubs;
+            };
+
+            // Queue notification for recv()
+            if (notify) {
+                const notif = SubscriptionNotification{
+                    .subscribe = subscribe,
+                    .prefix = self.allocator.dupe(u8, prefix) catch return,
+                    .pipe = null,
+                };
+                self.pending_notifications.append(notif) catch return;
+            }
+        }
+    }
+
+    /// Manual mode: accept a pending subscription
+    pub fn acceptSubscription(self: *XPub, prefix: []const u8) void {
+        if (!self.manual_mode or self.last_pipe == null) return;
+        self.subscriptions.subscribe(prefix, self.last_pipe.?) catch return;
+    }
+
+    /// Manual mode: reject a pending subscription (unsubscribe)
+    pub fn rejectSubscription(self: *XPub, prefix: []const u8) void {
+        if (!self.manual_mode or self.last_pipe == null) return;
+        _ = self.subscriptions.unsubscribe(prefix, self.last_pipe.?);
+    }
+
+    /// Send message to matching subscribers
+    pub fn send(self: *XPub, msg: *Message, rt: *zio.Runtime) SendError!void {
         // For first frame, find matching pipes
         if (!self.more_send) {
             self.dist.unmatch();
-            self.subscriptions.match(msg.data(), markAsMatching, self);
+            self.subscriptions.matchUnique(msg.data(), &self.dist.matched);
+
+            // Invert matching if configured
+            if (self.invert_matching) {
+                self.dist.reverseMatch();
+            }
         }
 
         // Check HWM
@@ -5301,29 +5399,43 @@ pub const XPub = struct {
         }
     }
 
-    /// Receive subscription notification
+    /// Receive subscription notification or upstream data
     pub fn recv(self: *XPub) RecvError!Message {
-        if (self.pending_notifications.items.len == 0) {
-            return error.WouldBlock;
+        // First return subscription notifications
+        if (self.pending_notifications.items.len > 0) {
+            const notif = self.pending_notifications.orderedRemove(0);
+
+            // Track last pipe for manual mode
+            self.last_pipe = notif.pipe;
+
+            // Create notification message: [0x00|0x01][prefix]
+            var msg = try Message.initSize(self.allocator, 1 + notif.prefix.len);
+            msg.data()[0] = if (notif.subscribe) 0x01 else 0x00;
+            @memcpy(msg.data()[1..], notif.prefix);
+            self.allocator.free(notif.prefix);
+            return msg;
         }
 
-        const notif = self.pending_notifications.orderedRemove(0);
+        // Then return upstream data (if any)
+        if (self.pending_data.items.len > 0) {
+            return self.pending_data.orderedRemove(0);
+        }
 
-        // Create notification message: [0x00|0x01][prefix]
-        var msg = try Message.initSize(1 + notif.prefix.len);
-        msg.data()[0] = if (notif.subscribe) 0x01 else 0x00;
-        @memcpy(msg.data()[1..], notif.prefix);
-
-        return msg;
+        return error.WouldBlock;
     }
 
     pub fn hasIn(self: *XPub) bool {
-        return self.pending_notifications.items.len > 0;
+        return self.pending_notifications.items.len > 0 or
+               self.pending_data.items.len > 0;
     }
 
-    fn markAsMatching(pipe: *Pipe, ctx: *anyopaque) void {
-        const self: *XPub = @ptrCast(@alignCast(ctx));
-        self.dist.match(pipe);
+    pub fn hasOut(self: *XPub) bool {
+        return self.lossy or self.dist.checkHwm();
+    }
+
+    /// Query number of unique subscription prefixes
+    pub fn getTopicsCount(self: *XPub) usize {
+        return self.subscriptions.total_subscriptions;
     }
 };
 ```
@@ -5332,8 +5444,8 @@ pub const XPub = struct {
 
 ```zig
 pub const XSub = struct {
-    /// Local subscription cache (for reconnect replay)
-    subscriptions: SubscriptionSet,
+    /// Local subscription cache (for reconnect replay and filtering)
+    subscriptions: SubscriptionCache,
 
     /// Fair queue for receiving messages
     fq: FairQueue,
@@ -5341,14 +5453,73 @@ pub const XSub = struct {
     /// Distributor for sending subscriptions upstream
     dist: Distributor,
 
-    /// Currently receiving multipart
+    /// Options
+    filter: bool = false,  // When true, filter incoming by subscriptions (SUB sets this true)
+    only_first_subscribe: bool = false,
+    verbose_unsubs: bool = false,
+
+    /// Currently receiving/sending multipart
     more_recv: bool = false,
+    more_send: bool = false,
+    process_subscribe: bool = false,
+
+    /// Cached message for poll efficiency (hasIn check)
+    has_message: bool = false,
+    cached_message: Message,
+
+    /// Subscription cache for XSUB (different from Trie - just tracks prefixes, no pipes)
+    pub const SubscriptionCache = struct {
+        /// Set of subscribed prefixes
+        prefixes: std.StringHashMap(void),
+        /// For iteration during replay
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator) SubscriptionCache {
+            return .{
+                .prefixes = std.StringHashMap(void).init(allocator),
+                .allocator = allocator,
+            };
+        }
+
+        pub fn add(self: *SubscriptionCache, prefix: []const u8) !void {
+            const owned = try self.allocator.dupe(u8, prefix);
+            try self.prefixes.put(owned, {});
+        }
+
+        pub fn remove(self: *SubscriptionCache, prefix: []const u8) bool {
+            if (self.prefixes.fetchRemove(prefix)) |entry| {
+                self.allocator.free(entry.key);
+                return true;
+            }
+            return false;
+        }
+
+        /// Check if topic matches any subscription (prefix match)
+        pub fn matches(self: *SubscriptionCache, topic: []const u8) bool {
+            var iter = self.prefixes.keyIterator();
+            while (iter.next()) |prefix| {
+                if (std.mem.startsWith(u8, topic, prefix.*)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        pub fn iterator(self: *SubscriptionCache) std.StringHashMap(void).KeyIterator {
+            return self.prefixes.keyIterator();
+        }
+
+        pub fn count(self: *SubscriptionCache) usize {
+            return self.prefixes.count();
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) XSub {
         return .{
-            .subscriptions = SubscriptionSet.init(allocator),
+            .subscriptions = SubscriptionCache.init(allocator),
             .fq = FairQueue.init(allocator),
             .dist = Distributor.init(allocator),
+            .cached_message = Message.empty(),
         };
     }
 
@@ -5370,9 +5541,9 @@ pub const XSub = struct {
     fn replaySubscriptions(self: *XSub, pipe: *Pipe) void {
         var iter = self.subscriptions.iterator();
         while (iter.next()) |prefix| {
-            var msg = Message.initSize(1 + prefix.len) catch continue;
+            var msg = Message.initSize(self.allocator, 1 + prefix.len) catch continue;
             msg.data()[0] = 0x01;  // Subscribe
-            @memcpy(msg.data()[1..], prefix);
+            @memcpy(msg.data()[1..], prefix.*);
 
             pipe.write(msg) catch {
                 msg.deinit();
@@ -5383,47 +5554,82 @@ pub const XSub = struct {
     }
 
     /// Send subscription message upstream (or user data)
-    pub fn send(
-        self: *XSub,
-        msg: *Message,
-        rt: *zio.Runtime,
-    ) SendError!void {
+    pub fn send(self: *XSub, msg: *Message, rt: *zio.Runtime) SendError!void {
         const data = msg.data();
+        const first_part = !self.more_send;
+        self.more_send = msg.hasMore();
 
-        // Check if this is a subscription message
-        if (data.len > 0 and (data[0] == 0x00 or data[0] == 0x01)) {
-            const is_subscribe = data[0] == 0x01;
-            const prefix = data[1..];
+        // Determine if we should process this as subscription
+        if (first_part) {
+            self.process_subscribe = !self.only_first_subscribe;
+        }
 
+        // Check for subscription message
+        var is_subscription = false;
+        var subscribe: bool = undefined;
+        var prefix: []const u8 = undefined;
+
+        if (self.process_subscribe or first_part) {
+            if (msg.isSubscribeCommand()) {
+                is_subscription = true;
+                subscribe = true;
+                prefix = msg.commandBody();
+            } else if (msg.isCancelCommand()) {
+                is_subscription = true;
+                subscribe = false;
+                prefix = msg.commandBody();
+            } else if (data.len > 0 and data[0] == 0x01) {
+                is_subscription = true;
+                subscribe = true;
+                prefix = data[1..];
+            } else if (data.len > 0 and data[0] == 0x00) {
+                is_subscription = true;
+                subscribe = false;
+                prefix = data[1..];
+            }
+        }
+
+        if (is_subscription) {
             // Update local cache
-            if (is_subscribe) {
+            if (subscribe) {
                 try self.subscriptions.add(prefix);
             } else {
-                _ = self.subscriptions.remove(prefix);
+                const removed = self.subscriptions.remove(prefix);
+                // If verbose_unsubs is false and this wasn't the last, don't forward
+                if (!removed and !self.verbose_unsubs) {
+                    msg.deinit();
+                    return;  // Don't forward duplicate unsubscribe
+                }
             }
+            self.process_subscribe = true;
         }
 
         // Forward upstream to XPUB/PUB
         try self.dist.sendToAll(msg, rt);
     }
 
-    /// Receive message (filtered by subscriptions)
-    pub fn recv(
-        self: *XSub,
-        rt: *zio.Runtime,
-    ) RecvError!Message {
+    /// Receive message (optionally filtered by subscriptions)
+    pub fn recv(self: *XSub, rt: *zio.Runtime) RecvError!Message {
+        // Return cached message if available (from hasIn check)
+        if (self.has_message) {
+            self.has_message = false;
+            self.more_recv = self.cached_message.hasMore();
+            return self.cached_message;
+        }
+
         while (true) {
             const msg = try self.fq.recv(rt);
 
             // Pass through if:
             // - Continuation of multipart (more_recv)
+            // - Filtering disabled
             // - Matches subscription
-            if (self.more_recv or self.subscriptions.matches(msg.data())) {
+            if (self.more_recv or !self.filter or self.subscriptions.matches(msg.data())) {
                 self.more_recv = msg.hasMore();
                 return msg;
             }
 
-            // Doesn't match - skip entire multipart
+            // Message doesn't match - skip entire multipart
             msg.deinit();
             while (msg.hasMore()) {
                 const part = try self.fq.recv(rt);
@@ -5432,32 +5638,211 @@ pub const XSub = struct {
         }
     }
 
+    pub fn hasIn(self: *XSub) bool {
+        // Continuation of multipart
+        if (self.more_recv) return true;
+
+        // Already have cached message
+        if (self.has_message) return true;
+
+        // Try to get a matching message
+        while (true) {
+            const msg = self.fq.tryRecv() orelse return false;
+
+            if (!self.filter or self.subscriptions.matches(msg.data())) {
+                self.cached_message = msg;
+                self.has_message = true;
+                return true;
+            }
+
+            // Skip non-matching multipart
+            msg.deinit();
+            while (msg.hasMore()) {
+                if (self.fq.tryRecv()) |part| {
+                    part.deinit();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn hasOut(self: *XSub) bool {
         _ = self;
         return true;  // Subscriptions can always be sent
     }
+
+    /// Query number of local subscriptions
+    pub fn getTopicsCount(self: *XSub) usize {
+        return self.subscriptions.count();
+    }
 };
 ```
 
-#### Subscription Message Format
+#### SUB as XSUB Wrapper
+
+SUB is implemented as a thin wrapper around XSUB with `filter = true`:
+
+```zig
+pub const Sub = struct {
+    inner: XSub,
+
+    pub fn init(allocator: std.mem.Allocator) Sub {
+        var sub = Sub{ .inner = XSub.init(allocator) };
+        sub.inner.filter = true;  // SUB always filters
+        return sub;
+    }
+
+    /// SUB uses setsockopt for subscriptions (not send)
+    pub fn subscribe(self: *Sub, prefix: []const u8) !void {
+        // Create subscription message
+        var msg = try Message.initSize(self.allocator, 1 + prefix.len);
+        msg.data()[0] = 0x01;
+        @memcpy(msg.data()[1..], prefix);
+
+        // Send upstream
+        try self.inner.send(&msg, self.rt);
+    }
+
+    pub fn unsubscribe(self: *Sub, prefix: []const u8) !void {
+        var msg = try Message.initSize(self.allocator, 1 + prefix.len);
+        msg.data()[0] = 0x00;
+        @memcpy(msg.data()[1..], prefix);
+        try self.inner.send(&msg, self.rt);
+    }
+
+    pub fn recv(self: *Sub, rt: *zio.Runtime) !Message {
+        return self.inner.recv(rt);
+    }
+
+    // SUB cannot send user messages
+    pub fn send(self: *Sub, msg: *Message, rt: *zio.Runtime) !void {
+        _ = self;
+        _ = msg;
+        _ = rt;
+        return error.NotSupported;
+    }
+
+    pub fn hasIn(self: *Sub) bool {
+        return self.inner.hasIn();
+    }
+
+    pub fn hasOut(self: *Sub) bool {
+        return false;  // SUB cannot send
+    }
+};
+```
+
+#### XPUB Manual Mode Workflow
+
+Manual mode allows applications to approve/reject subscriptions:
 
 ```
-Subscribe:   [0x01][prefix bytes...]
-Unsubscribe: [0x00][prefix bytes...]
+┌─────────────────────────────────────────────────────────────────┐
+│                    XPUB MANUAL MODE WORKFLOW                     │
+└─────────────────────────────────────────────────────────────────┘
 
-Examples:
-  Subscribe to "weather.":  0x01 0x77 0x65 0x61 0x74 0x68 0x65 0x72 0x2e
-  Unsubscribe from "":      0x00
-  Subscribe to all:         0x01  (empty prefix)
+1. Subscriber connects and sends subscription
+   │
+   ▼
+2. XPUB queues notification (doesn't apply to trie yet)
+   │
+   ▼
+3. Application calls recv()
+   │   ┌──────────────────────────────────────────────┐
+   │   │ Returns: [0x01]["weather."]                   │
+   │   │ XPUB stores last_pipe internally              │
+   │   └──────────────────────────────────────────────┘
+   │
+   ▼
+4. Application decides to accept or reject
+   │
+   ├─── Accept: socket.setOption(.subscribe, "weather.")
+   │    │   → subscriptions.add("weather.", last_pipe)
+   │    │   → Future publishes to "weather.*" go to this subscriber
+   │
+   └─── Reject: socket.setOption(.unsubscribe, "weather.")
+        │   → Subscription not added
+        │   → Subscriber won't receive these messages
 ```
 
-#### XPUB/XSUB Use Cases
+#### XPUB/XSUB Proxy Pattern
 
-1. **Subscription Forwarding Proxy**: XSUB receives publications, XPUB sends to subscribers, subscriptions flow in reverse
-2. **Subscription Logging**: Application can see all subscribe/unsubscribe events
-3. **Manual Subscription Approval**: Application validates subscriptions before accepting
-4. **Dynamic Topic Discovery**: Query active subscriptions via `ZMQ_TOPICS_COUNT`
+The canonical use case for XPUB/XSUB:
 
+```zig
+/// Subscription-forwarding proxy
+pub fn pubSubProxy(
+    xpub: *Socket(.XPUB),  // Subscribers connect here
+    xsub: *Socket(.XSUB),  // Publishers connect here
+    rt: *zio.Runtime,
+) !void {
+    while (true) {
+        // Wait for activity on either socket
+        const ready = try zio.select(.{
+            xpub.pollable(.recv),
+            xsub.pollable(.recv),
+        }, rt);
+
+        // Forward subscriptions: XPUB → XSUB
+        if (ready[0]) {
+            // Subscription notifications from XPUB
+            while (xpub.hasIn()) {
+                var sub_msg = try xpub.recv();
+                // Forward to XSUB (sends upstream to publishers)
+                try xsub.send(&sub_msg, rt);
+            }
+        }
+
+        // Forward publications: XSUB → XPUB
+        if (ready[1]) {
+            while (xsub.hasIn()) {
+                var pub_msg = try xsub.recv(rt);
+                // Forward to XPUB (distributes to matching subscribers)
+                try xpub.send(&pub_msg, rt);
+            }
+        }
+    }
+}
+```
+
+#### Subscription Message Flow Diagram
+
+```
+Publishers          Proxy                 Subscribers
+    │                 │                        │
+    │    ┌────────────┴────────────┐           │
+    │    │  XSUB           XPUB    │           │
+    │    │   ▲               │     │           │
+    │    │   │               ▼     │           │
+    │    │   │    ┌─────────────┐  │           │
+    │    │   │    │ Subscription │  │           │
+    │    │   │    │    Trie     │  │           │
+    │    │   │    └─────────────┘  │           │
+    │    │   │               │     │           │
+    │    └───┼───────────────┼─────┘           │
+    │        │               │                 │
+    │        │               │                 │
+◄───┼────────┼───────────────┼─────────────────┤
+    │  Publications flow     │   Subscriptions  │
+    │  from left to right    │   flow from      │
+    │                        │   right to left  │
+    │        │               │                 │
+    ▼        │               ▼                 │
+┌───────┐    │          ┌───────┐          ┌───────┐
+│ PUB   │────┼─────────▶│ Proxy │◀─────────│ SUB   │
+│       │    │          │       │──────────▶│       │
+└───────┘    │          └───────┘          └───────┘
+             │               │
+             │  [0x01]topic  │
+             │ ◄──────────── │
+             │               │
+        topic:data           │
+         ─────────────────▶  │
+                             │
+                        topic:data
+                         ─────────────▶
+```
 ---
 
 ## Subscription Matching System
