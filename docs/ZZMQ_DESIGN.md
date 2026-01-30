@@ -6355,123 +6355,262 @@ pub const SocketEvent = union(enum) {
 };
 ```
 
-### Monitor Channel
+### Monitor with BroadcastChannel
+
+ZZMQ uses `zio.BroadcastChannel` for monitoring, enabling multiple independent monitors
+to observe the same socket's events. This is a natural fit because:
+
+- All monitors want ALL events (no per-subscriber filtering needed)
+- Events are small and infrequent
+- Multiple monitors are naturally supported
+- No complex subscription logic required
+
+**Design Decisions:**
+
+| Aspect | Decision | Rationale |
+|--------|----------|-----------|
+| **Channel type** | `zio.BroadcastChannel(SocketEvent)` | Multiple consumers, same events |
+| **Filtering** | Receiver-side | Events are small; simple switch statement |
+| **Backpressure** | Drop oldest on full | Monitoring shouldn't block I/O |
+| **Initialization** | Lazy (on first subscribe) | No overhead if unused |
+| **libzmq compat** | C FFI shim available | Encodes to binary, uses inproc PAIR |
 
 ```zig
-pub const Monitor = struct {
-    /// Event channel (bounded to prevent buildup)
-    events: zio.Channel(SocketEvent),
+pub const SocketInner = struct {
+    // ... other fields ...
 
-    /// Which events to capture (bitmask)
-    event_mask: EventMask,
+    /// Lazy-initialized broadcast channel for monitor events
+    monitor_channel: ?*zio.BroadcastChannel(SocketEvent) = null,
 
-    pub const EventMask = packed struct {
-        connected: bool = true,
-        disconnected: bool = true,
-        bind_failed: bool = true,
-        accept_failed: bool = true,
-        handshake_failed: bool = true,
-        protocol_error: bool = true,
-        // ... etc
-    };
+    /// Track dropped events (for diagnostics)
+    monitor_events_dropped: u64 = 0,
 
-    /// Create a monitor for a socket
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, mask: EventMask) !Monitor {
-        var buf = try allocator.alloc(SocketEvent, capacity);
-        return .{
-            .events = zio.Channel(SocketEvent).init(buf),
-            .event_mask = mask,
-        };
+    /// Get or create the monitor broadcast channel
+    pub fn monitorChannel(self: *SocketInner) !*zio.BroadcastChannel(SocketEvent) {
+        if (self.monitor_channel == null) {
+            const channel = try self.ctx.allocator.create(zio.BroadcastChannel(SocketEvent));
+            channel.* = zio.BroadcastChannel(SocketEvent).init(self.ctx.allocator, .{
+                .buffer_size = 64,  // Per-receiver buffer
+            });
+            self.monitor_channel = channel;
+        }
+        return self.monitor_channel.?;
     }
 
-    /// Receive next event (blocking)
-    pub fn recv(self: *Monitor, rt: *zio.Runtime) !SocketEvent {
-        return self.events.receive(rt);
+    /// Subscribe to monitor events
+    /// Returns a receiver that will get all future events
+    pub fn monitorSubscribe(self: *SocketInner) !zio.BroadcastChannel(SocketEvent).Receiver {
+        const channel = try self.monitorChannel();
+        return channel.subscribe();
     }
 
-    /// Try to receive event (non-blocking)
-    pub fn tryRecv(self: *Monitor) ?SocketEvent {
-        return self.events.tryReceive() catch null;
+    /// Internal: emit event to all monitors (non-blocking)
+    fn emitMonitorEvent(self: *SocketInner, event: SocketEvent) void {
+        if (self.monitor_channel) |channel| {
+            channel.trySend(event) catch |err| switch (err) {
+                error.Full => {
+                    // Best-effort: monitoring shouldn't block socket operations
+                    self.monitor_events_dropped += 1;
+                },
+                else => {},
+            };
+        }
     }
 
-    /// Post event (internal use by socket)
-    pub fn post(self: *Monitor, event: SocketEvent) void {
-        // Non-blocking: drop if channel full
-        _ = self.events.trySend(event) catch {};
+    fn deinit(self: *SocketInner) void {
+        if (self.monitor_channel) |channel| {
+            channel.deinit();
+            self.ctx.allocator.destroy(channel);
+        }
+        // ... other cleanup ...
     }
 };
+```
 
-// Usage
-pub fn monitorExample(ctx: *zzmq.Context, rt: *zio.Runtime) !void {
-    var socket = try ctx.socket(zzmq.Push);
-    defer socket.close();
+### Usage Examples
 
-    // Attach monitor
-    var monitor = try Monitor.init(ctx.allocator, 100, .{});
-    defer monitor.deinit();
-    try socket.attachMonitor(&monitor);
+**Simple single monitor:**
 
-    // Connect (will generate events)
-    try socket.connect("tcp://127.0.0.1:5555");
+```zig
+var socket = try ctx.socket(zzmq.Push);
+defer socket.close();
 
-    // Monitor events in separate coroutine
-    var group: zio.Group = .init;
-    defer group.cancel(rt);
+// Subscribe to events
+var events = try socket.monitorSubscribe();
+defer events.unsubscribe();
 
-    try group.spawn(rt, struct {
-        fn run(mon: *Monitor, runtime: *zio.Runtime) !void {
-            while (true) {
-                const event = mon.recv(runtime) catch break;
-                switch (event) {
-                    .connected => |e| {
-                        std.log.info("Connected to {s}", .{e.endpoint});
-                    },
-                    .disconnected => |e| {
-                        std.log.info("Disconnected from {s}: {}", .{e.endpoint, e.reason});
-                    },
-                    .handshake_failed => |e| {
-                        std.log.err("Handshake failed: {}", .{e.error});
-                    },
-                    else => {},
-                }
-            }
+// Monitor in separate coroutine
+try group.spawn(rt, monitorLoop, .{ &events, rt });
+
+fn monitorLoop(events: *Receiver, rt: *zio.Runtime) void {
+    while (events.receive(rt)) |event| {
+        switch (event) {
+            .connected => |e| log.info("Connected to {s}", .{e.endpoint}),
+            .disconnected => |e| log.warn("Disconnected: {s} ({})", .{e.endpoint, e.reason}),
+            .handshake_failed => |e| log.err("Handshake failed: {}", .{e.error}),
+            else => {},
         }
-    }.run, .{ &monitor, rt });
+    } else |err| {
+        if (err != error.ChannelClosed) log.err("Monitor error: {}", .{err});
+    }
+}
+```
+
+**Multiple independent monitors (debugging, metrics, alerting):**
+
+```zig
+var socket = try ctx.socket(zzmq.Router);
+
+// Each subscriber gets ALL events independently
+var debug_rx = try socket.monitorSubscribe();
+var metrics_rx = try socket.monitorSubscribe();
+var alerts_rx = try socket.monitorSubscribe();
+
+// Debug: log everything
+try group.spawn(rt, debugMonitor, .{ &debug_rx, rt });
+
+// Metrics: count events
+try group.spawn(rt, metricsMonitor, .{ &metrics_rx, rt });
+
+// Alerts: only care about failures
+try group.spawn(rt, alertsMonitor, .{ &alerts_rx, rt });
+
+fn metricsMonitor(rx: *Receiver, rt: *zio.Runtime) void {
+    var connected_count: u64 = 0;
+    var disconnected_count: u64 = 0;
+
+    while (rx.receive(rt)) |event| {
+        switch (event) {
+            .connected => connected_count += 1,
+            .disconnected => disconnected_count += 1,
+            else => {},
+        }
+    } else |_| {}
+}
+
+fn alertsMonitor(rx: *Receiver, rt: *zio.Runtime) void {
+    while (rx.receive(rt)) |event| {
+        switch (event) {
+            .handshake_failed, .bind_failed, .accept_failed => |e| {
+                sendAlert("Socket failure", e);
+            },
+            else => {},  // Ignore non-failure events
+        }
+    } else |_| {}
 }
 ```
 
 ### Integration Points
 
-Events are posted from:
-- **Listener**: `listening`, `bind_failed`, `accepted`, `accept_failed`
-- **Connector**: `connected`, `connect_delayed`, `connect_retried`
-- **Engine**: `handshake_succeeded`, `handshake_failed`, `disconnected`, `protocol_error`
-- **Socket**: `closed`, `close_failed`
+Events are emitted from:
+
+| Component | Events |
+|-----------|--------|
+| **Listener** | `listening`, `bind_failed`, `accepted`, `accept_failed` |
+| **Connector** | `connected`, `connect_delayed`, `connect_retried` |
+| **Engine** | `handshake_succeeded`, `handshake_failed`, `disconnected`, `protocol_error` |
+| **Socket** | `closed`, `close_failed`, `monitor_stopped` |
 
 ```zig
-// Example: Engine posts events
+// Example: Engine emits events
 fn performHandshake(self: *Engine, rt: *zio.Runtime) !void {
     // ... handshake logic ...
 
     if (handshake_error) |err| {
-        self.postEvent(.{ .handshake_failed = .{
+        self.socket.emitMonitorEvent(.{ .handshake_failed = .{
             .endpoint = self.endpoint,
             .error = err,
+            .timestamp = rt.now(),
         }});
         return error.HandshakeFailed;
     }
 
-    self.postEvent(.{ .handshake_succeeded = .{
+    self.socket.emitMonitorEvent(.{ .handshake_succeeded = .{
         .endpoint = self.endpoint,
-        .peer_identity = self.codec.properties.peer_identity,
+        .peer_identity = self.codec.peer_identity,
+        .timestamp = rt.now(),
     }});
 }
 
-fn postEvent(self: *Engine, event: SocketEvent) void {
-    if (self.monitor) |mon| {
-        mon.post(event);
+// Example: Connector emits events
+fn connectLoop(self: *Connector, rt: *zio.Runtime) void {
+    while (self.state != .disconnected) {
+        self.socket.emitMonitorEvent(.{ .connect_delayed = .{
+            .endpoint = self.endpoint,
+            .timestamp = rt.now(),
+        }});
+
+        const stream = self.endpoint.connect(rt) catch |err| {
+            self.socket.emitMonitorEvent(.{ .connect_retried = .{
+                .endpoint = self.endpoint,
+                .interval = self.reconnect.interval,
+                .attempt = self.reconnect.attempt,
+                .timestamp = rt.now(),
+            }});
+            self.scheduleReconnect(rt);
+            continue;
+        };
+
+        self.socket.emitMonitorEvent(.{ .connected = .{
+            .endpoint = self.endpoint,
+            .peer_address = stream.peerAddress(),
+            .timestamp = rt.now(),
+        }});
+
+        // ... run engine ...
     }
 }
+```
+
+### C FFI Compatibility
+
+For libzmq compatibility, we provide a shim that bridges to the inproc PAIR pattern:
+
+```zig
+/// libzmq-compatible monitor API
+/// Creates an internal bridge that encodes events to binary format
+pub fn zmq_socket_monitor(
+    socket: *anyopaque,
+    endpoint: [*:0]const u8,
+    events: c_int,
+) c_int {
+    const sock = @ptrCast(*Socket, @alignCast(@alignOf(Socket), socket));
+
+    // Create internal monitor bridge
+    const bridge = MonitorBridge.create(sock, endpoint, events) catch return -1;
+
+    // Bridge subscribes to BroadcastChannel and forwards to inproc PAIR
+    sock.ctx.spawnInternal(MonitorBridge.run, .{bridge}) catch return -1;
+
+    return 0;
+}
+
+const MonitorBridge = struct {
+    receiver: zio.BroadcastChannel(SocketEvent).Receiver,
+    pair_socket: *Socket,
+    event_mask: u32,
+
+    fn run(self: *MonitorBridge, rt: *zio.Runtime) void {
+        defer self.cleanup();
+
+        while (self.receiver.receive(rt)) |event| {
+            if (!self.matchesMask(event)) continue;
+
+            // Encode to libzmq binary format (2 frames)
+            var event_frame: [6]u8 = undefined;
+            var addr_frame: [256]u8 = undefined;
+            const encoded = self.encodeEvent(event, &event_frame, &addr_frame);
+
+            // Send as multipart to PAIR socket
+            self.pair_socket.sendMultipart(rt, encoded) catch break;
+        } else |_| {}
+    }
+
+    fn encodeEvent(self: *MonitorBridge, event: SocketEvent, ...) []const []const u8 {
+        // libzmq format: [event_id:u16 ++ value:u32, endpoint:string]
+        // ...
+    }
+};
 ```
 
 ---
