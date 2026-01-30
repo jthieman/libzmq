@@ -4971,6 +4971,718 @@ pub const LoadBalancer = struct {
 };
 ```
 
+### Distributor (Fan-Out)
+
+The Distributor sends messages to multiple pipes simultaneously (used by PUB, XPUB). Unlike LoadBalancer (one-to-one), Distributor is one-to-many with subscription filtering.
+
+**libzmq reference** (`src/dist.cpp`):
+- `_pipes` array of all attached pipes
+- `_matching` count of pipes selected for current message
+- `match(pipe)` / `unmatch()` for subscription-based selection
+- `send_to_matching()` copies message to all matched pipes
+- `reverse_match()` for `ZMQ_INVERT_MATCHING`
+
+```zig
+pub const Distributor = struct {
+    /// All attached pipes
+    pipes: std.ArrayList(*Pipe),
+
+    /// Currently matched pipes (for this message)
+    matched: std.ArrayList(*Pipe),
+
+    /// Multipart state
+    more: bool = false,
+
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Distributor {
+        return .{
+            .pipes = std.ArrayList(*Pipe).init(allocator),
+            .matched = std.ArrayList(*Pipe).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn attach(self: *Distributor, pipe: *Pipe) void {
+        self.pipes.append(pipe) catch return;
+    }
+
+    pub fn detach(self: *Distributor, pipe: *Pipe) void {
+        for (self.pipes.items, 0..) |p, i| {
+            if (p == pipe) {
+                _ = self.pipes.swapRemove(i);
+                break;
+            }
+        }
+        // Also remove from matched if present
+        for (self.matched.items, 0..) |p, i| {
+            if (p == pipe) {
+                _ = self.matched.swapRemove(i);
+                break;
+            }
+        }
+    }
+
+    /// Mark a pipe as matching (called during subscription match)
+    pub fn match(self: *Distributor, pipe: *Pipe) void {
+        // Avoid duplicates
+        for (self.matched.items) |p| {
+            if (p == pipe) return;
+        }
+        self.matched.append(pipe) catch return;
+    }
+
+    /// Clear all matches (between messages)
+    pub fn unmatch(self: *Distributor) void {
+        self.matched.clearRetainingCapacity();
+    }
+
+    /// Invert matching (for ZMQ_INVERT_MATCHING)
+    pub fn reverseMatch(self: *Distributor) void {
+        // matched = all_pipes - currently_matched
+        var new_matched = std.ArrayList(*Pipe).init(self.allocator);
+        for (self.pipes.items) |pipe| {
+            var is_matched = false;
+            for (self.matched.items) |m| {
+                if (m == pipe) {
+                    is_matched = true;
+                    break;
+                }
+            }
+            if (!is_matched) {
+                new_matched.append(pipe) catch continue;
+            }
+        }
+        self.matched.deinit();
+        self.matched = new_matched;
+    }
+
+    /// Check if all matched pipes can accept (for ZMQ_XPUB_NODROP)
+    pub fn checkHwm(self: *Distributor) bool {
+        for (self.matched.items) |pipe| {
+            if (!pipe.canSendMessage()) return false;
+        }
+        return true;
+    }
+
+    /// Send message to all matched pipes
+    pub fn sendToMatching(self: *Distributor, msg: *Message, rt: *zio.Runtime) !void {
+        const is_more = msg.flags.more;
+
+        // If mid-multipart, use same matched set
+        // (first frame determines matching, subsequent frames go to same pipes)
+
+        for (self.matched.items) |pipe| {
+            // Copy message for each pipe (COW optimization in Message.copy)
+            var copy = try msg.copy(self.allocator);
+            errdefer copy.deinit();
+
+            try writeMessageToPipe(pipe, &copy, rt);
+            pipe.flush();
+        }
+
+        self.more = is_more;
+        if (!is_more) {
+            // End of message - clear matches for next message
+            self.unmatch();
+        }
+    }
+
+    /// Send to ALL pipes (for XSUB upstream forwarding)
+    pub fn sendToAll(self: *Distributor, msg: *Message, rt: *zio.Runtime) !void {
+        for (self.pipes.items) |pipe| {
+            var copy = try msg.copy(self.allocator);
+            errdefer copy.deinit();
+            try writeMessageToPipe(pipe, &copy, rt);
+            pipe.flush();
+        }
+    }
+
+    pub fn hasOut(self: *Distributor) bool {
+        return self.pipes.items.len > 0;
+    }
+
+    pub fn hasPipe(self: *Distributor, pipe: *Pipe) bool {
+        for (self.pipes.items) |p| {
+            if (p == pipe) return true;
+        }
+        return false;
+    }
+};
+```
+
+---
+
+### Message ↔ Frame Conversion
+
+Messages are the user-facing API; Frames are the internal pipe/wire unit. This section specifies the conversion.
+
+#### Message to Frames (Send Path)
+
+```zig
+/// Write a complete message to a pipe as frames
+fn writeMessageToPipe(pipe: *Pipe, msg: *Message, rt: *zio.Runtime) !void {
+    switch (msg.*) {
+        // Single-frame message
+        .single => |data| {
+            var frame = try Frame.initCopy(pipe.allocator, data);
+            frame.flags.more = false;
+            try pipe.writeFrame(frame);
+        },
+
+        // Multipart message
+        .multipart => |parts| {
+            for (parts.items, 0..) |part, i| {
+                var frame = try Frame.initCopy(pipe.allocator, part.data);
+                frame.flags.more = (i < parts.items.len - 1);
+                try pipe.writeFrame(frame);
+            }
+        },
+    }
+}
+
+/// Alternative: Message owns frame data, zero-copy send
+fn writeMessageZeroCopy(pipe: *Pipe, msg: *Message) !void {
+    // Transfer ownership of message data to frame
+    // Message becomes empty after this
+    const frame = Frame{
+        .data = msg.releaseData(),  // msg.data = null after this
+        .flags = .{ .more = msg.flags.more },
+        .allocator = msg.allocator,
+    };
+    try pipe.writeFrame(frame);
+}
+```
+
+#### Frames to Message (Recv Path)
+
+```zig
+/// Read a complete message from a pipe (may be multiple frames)
+fn readMessageFromPipe(pipe: *Pipe, allocator: Allocator, rt: *zio.Runtime) !Message {
+    var first_frame = try pipe.readFrame(rt);
+
+    // Single frame message (common case)
+    if (!first_frame.isMore()) {
+        return Message.fromFrame(first_frame);
+    }
+
+    // Multipart: collect all frames
+    var parts = std.ArrayList(Frame).init(allocator);
+    try parts.append(first_frame);
+
+    while (true) {
+        var frame = try pipe.readFrame(rt);
+        try parts.append(frame);
+        if (!frame.isMore()) break;
+    }
+
+    return Message.fromFrames(parts);
+}
+
+/// Message from single frame (takes ownership)
+pub fn Message.fromFrame(frame: Frame) Message {
+    return .{
+        .storage = if (frame.data.len <= INLINE_SIZE)
+            .{ .inline_data = inlineFromSlice(frame.data) }
+        else
+            .{ .owned = .{
+                .ptr = frame.data.ptr,
+                .len = frame.data.len,
+                .cap = frame.data.len,
+                .allocator = frame.allocator,
+            }},
+        .flags = .{ .more = frame.flags.more },
+    };
+}
+```
+
+#### Ownership Rules
+
+| Operation | Ownership |
+|-----------|-----------|
+| `socket.send(msg)` | Message is **consumed** - caller must not use after send |
+| `socket.recv()` | Returns **new** Message - caller owns it |
+| `msg.copy()` | Returns **new** Message - both are independent |
+| `pipe.writeFrame(frame)` | Frame is **consumed** - pipe owns frame data |
+| `pipe.readFrame()` | Returns **new** Frame - caller owns it |
+
+```zig
+// Example: send consumes the message
+var msg = try Message.initCopy(allocator, "hello");
+try socket.send(&msg);
+// msg is now invalid - do not use
+
+// Example: recv returns new message
+var reply = try socket.recv();
+defer reply.deinit();  // Caller must free
+```
+
+---
+
+### Pipe Pair Creation
+
+Pipes come in pairs - one end for each peer. This section specifies how pairs are created and connected.
+
+#### For Network Connections (TCP, IPC)
+
+```zig
+/// Create pipe pair for network connection
+/// Returns (local_pipe, peer_pipe) where:
+///   - local_pipe.outbound → wire → peer_pipe.inbound
+///   - peer_pipe.outbound → wire → local_pipe.inbound
+pub fn createNetworkPipePair(
+    allocator: Allocator,
+    local_hwm: HwmConfig,
+    peer_hwm: HwmConfig,
+) !struct { local: *Pipe, peer: *Pipe } {
+    // Create two independent pipes
+    const local = try Pipe.init(allocator, .{
+        .send_hwm = local_hwm.send,
+        .recv_hwm = local_hwm.recv,
+    });
+    errdefer local.deinit();
+
+    const peer = try Pipe.init(allocator, .{
+        .send_hwm = peer_hwm.send,
+        .recv_hwm = peer_hwm.recv,
+    });
+    errdefer peer.deinit();
+
+    // Cross-connect the queues
+    // Local outbound → Peer inbound (we send, they receive)
+    // Peer outbound → Local inbound (they send, we receive)
+    //
+    // For network: Engine handles the actual wire transfer
+    // The pipes don't directly share queues - Engine reads from
+    // local.outbound, encodes, sends over wire, peer Engine decodes
+    // into peer.inbound
+
+    return .{ .local = local, .peer = peer };
+}
+```
+
+For network connections, the Engine bridges the pipe to the wire:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NETWORK PIPE ARCHITECTURE                     │
+└─────────────────────────────────────────────────────────────────┘
+
+Local Socket                                         Remote Socket
+     │                                                    │
+     ▼                                                    ▼
+┌─────────┐                                          ┌─────────┐
+│  Pipe   │                                          │  Pipe   │
+│ ┌─────┐ │        ┌────────┐    ┌────────┐         │ ┌─────┐ │
+│ │ out │─┼───────▶│ Engine │───▶│ Engine │────────▶├─│ in  │ │
+│ └─────┘ │        │ Writer │    │ Reader │         │ └─────┘ │
+│ ┌─────┐ │        │        │    │        │         │ ┌─────┐ │
+│ │ in  │◀┼────────│ Reader │◀───│ Writer │◀────────┼─│ out │ │
+│ └─────┘ │        └────────┘    └────────┘         │ └─────┘ │
+└─────────┘             │              │            └─────────┘
+                        │              │
+                        └──────────────┘
+                           TCP/IPC Wire
+```
+
+#### For Inproc Connections
+
+```zig
+/// Create pipe pair for inproc connection
+/// Queues are directly shared (no wire encoding)
+pub fn createInprocPipePair(
+    allocator: Allocator,
+    bind_hwm: HwmConfig,
+    connect_hwm: HwmConfig,
+) !struct { bind_pipe: *Pipe, connect_pipe: *Pipe } {
+    // For inproc, we share the underlying frame queues directly
+    // bind_pipe.outbound IS connect_pipe.inbound (same queue)
+    // connect_pipe.outbound IS bind_pipe.inbound (same queue)
+
+    const queue_a = try FrameQueue.init(allocator);
+    const queue_b = try FrameQueue.init(allocator);
+
+    const bind_pipe = try allocator.create(Pipe);
+    bind_pipe.* = .{
+        .outbound = queue_a,   // bind sends here
+        .inbound = queue_b,    // bind receives here
+        .allocator = allocator,
+        .send_hwm = bind_hwm.send,
+        .recv_hwm = bind_hwm.recv,
+    };
+
+    const connect_pipe = try allocator.create(Pipe);
+    connect_pipe.* = .{
+        .outbound = queue_b,   // connect sends here → bind receives
+        .inbound = queue_a,    // connect receives ← bind sends
+        .allocator = allocator,
+        .send_hwm = connect_hwm.send,
+        .recv_hwm = connect_hwm.recv,
+    };
+
+    return .{ .bind_pipe = bind_pipe, .connect_pipe = connect_pipe };
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    INPROC PIPE ARCHITECTURE                      │
+└─────────────────────────────────────────────────────────────────┘
+
+Bind Socket                                       Connect Socket
+     │                                                   │
+     ▼                                                   ▼
+┌─────────┐                                         ┌─────────┐
+│ bind    │                                         │ connect │
+│ pipe    │                                         │ pipe    │
+│ ┌─────┐ │         ┌─────────────────┐            │ ┌─────┐ │
+│ │ out │─┼────────▶│   FrameQueue A  │◀───────────┼─│ in  │ │
+│ └─────┘ │         └─────────────────┘            │ └─────┘ │
+│ ┌─────┐ │         ┌─────────────────┐            │ ┌─────┐ │
+│ │ in  │◀┼─────────│   FrameQueue B  │────────────┼▶│ out │ │
+│ └─────┘ │         └─────────────────┘            │ └─────┘ │
+└─────────┘                                        └─────────┘
+                 (Queues are SHARED, not copied)
+```
+
+---
+
+### Credit Flow for Network Connections
+
+For inproc, backpressure is implicit (shared queues block). For network connections, we need explicit credit flow to prevent unbounded memory growth.
+
+#### The Problem
+
+```
+Sender (fast)              Network              Receiver (slow)
+     │                                               │
+     │  msg1 ─────────────────────────▶              │ processing...
+     │  msg2 ─────────────────────────▶              │
+     │  msg3 ─────────────────────────▶              │
+     │  msg4 ─────────────────────────▶  ┌──────────┐
+     │  msg5 ─────────────────────────▶  │ BUFFERED │ Memory grows!
+     │  msg6 ─────────────────────────▶  │ IN RECV  │
+     │  ...                              │ QUEUE    │
+                                         └──────────┘
+```
+
+Without credit flow, a fast sender can overwhelm a slow receiver's memory.
+
+#### ZZMQ Credit Flow Design
+
+We use **implicit credit via HWM counters** with **periodic credit updates**:
+
+```zig
+pub const Pipe = struct {
+    // ... existing fields ...
+
+    // Credit tracking
+    msgs_written: u64 = 0,      // Messages we've sent
+    msgs_read: u64 = 0,         // Messages we've received
+    peers_msgs_read: u64 = 0,   // Last known: how many messages peer has read
+
+    // Credit update batching (LWM = HWM/2)
+    credit_update_threshold: u32,
+
+    /// Called after reading a message
+    pub fn onMessageRead(self: *Pipe) void {
+        self.msgs_read += 1;
+
+        // Batch credit updates at LWM intervals
+        const threshold = self.credit_update_threshold;
+        if (self.msgs_read % threshold == 0) {
+            self.sendCreditUpdate();
+        }
+    }
+
+    /// Send credit update to peer (via Engine)
+    fn sendCreditUpdate(self: *Pipe) void {
+        // Engine will encode this as a ZMTP command or piggyback on next message
+        if (self.engine) |engine| {
+            engine.queueCreditUpdate(self.msgs_read);
+        }
+    }
+
+    /// Called when we receive credit update from peer
+    pub fn onCreditReceived(self: *Pipe, peer_msgs_read: u64) void {
+        self.peers_msgs_read = peer_msgs_read;
+
+        // May unblock writers waiting on HWM
+        if (self.canSendMessage()) {
+            self.write_ready.notify();
+        }
+    }
+
+    /// HWM check uses credit
+    pub fn canSendMessage(self: *Pipe) bool {
+        const hwm = self.send_hwm orelse return true;
+        const in_flight = self.msgs_written - self.peers_msgs_read;
+        return in_flight < hwm;
+    }
+};
+```
+
+#### Credit Update Encoding
+
+Credit updates can be sent:
+1. **Piggybacked** on regular messages (efficient, common case)
+2. **As ZMTP PING** with credit in context field (when no messages to send)
+
+```zig
+// Option 1: Piggyback on message metadata
+pub fn encodeFrameWithCredit(frame: Frame, msgs_read: u64) []u8 {
+    // ZMTP allows metadata on message frames
+    // We use a reserved property for credit
+}
+
+// Option 2: Explicit PING command
+pub fn sendCreditPing(engine: *Engine, msgs_read: u64) void {
+    const ping = Command{ .ping = .{
+        .ttl = 0,  // No TTL, just credit update
+        .context = std.mem.asBytes(&msgs_read),
+    }};
+    engine.sendCommand(ping);
+}
+```
+
+---
+
+### Engine-to-Socket Pipe Notification
+
+When a connection is established, the Engine must notify the Socket that a new pipe is ready. This is the bridge between transport layer and socket layer.
+
+#### Notification Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PIPE ATTACHMENT FLOW                          │
+└─────────────────────────────────────────────────────────────────┘
+
+1. Connection Established
+   │
+   ▼
+┌─────────┐
+│ Engine  │ completes ZMTP handshake
+└────┬────┘
+     │
+     │ 2. Engine calls socket.attachPipe(pipe)
+     ▼
+┌─────────┐
+│ Socket  │ adds pipe to PipeSet
+│         │ notifies pattern
+└────┬────┘
+     │
+     │ 3. Pattern.attachPipe(pipe)
+     ▼
+┌─────────┐
+│ Pattern │ FairQueue.attach() or LoadBalancer.attach()
+└────┬────┘
+     │
+     │ 4. If waiting send/recv, wake up
+     ▼
+   Ready for traffic
+```
+
+#### Implementation
+
+```zig
+pub const SocketInner = struct {
+    // ... existing fields ...
+
+    /// Pipes attached to this socket
+    pipes: PipeSet,
+
+    /// Pending pipe events (thread-safe queue for cross-thread inproc)
+    pipe_events: zio.sync.Channel(PipeEvent, 16),
+
+    const PipeEvent = union(enum) {
+        attached: *Pipe,
+        detached: *Pipe,
+        hiccup: *Pipe,
+    };
+
+    /// Called by Engine when handshake completes
+    pub fn attachPipe(self: *SocketInner, pipe: *Pipe) void {
+        // For same-thread: direct call
+        self.pipes.add(pipe) catch return;
+        self.pattern.attachPipe(pipe);
+
+        // Wake up any waiting send/recv
+        self.state_changed.notify();
+    }
+
+    /// Called by Engine on disconnect
+    pub fn detachPipe(self: *SocketInner, pipe: *Pipe) void {
+        self.pattern.detachPipe(pipe);
+        self.pipes.remove(pipe);
+        self.state_changed.notify();
+    }
+
+    /// Called by Engine on reconnect (same pipe, new connection)
+    pub fn hiccupPipe(self: *SocketInner, pipe: *Pipe) void {
+        self.pattern.onHiccup(pipe);  // E.g., XSUB resends subscriptions
+    }
+};
+```
+
+#### Cross-Thread Notification (Inproc)
+
+For inproc connections where sockets may be on different threads:
+
+```zig
+/// Thread-safe pipe attachment for inproc
+pub fn attachPipeThreadSafe(self: *SocketInner, pipe: *Pipe) void {
+    // Queue the event
+    self.pipe_events.send(.{ .attached = pipe }) catch return;
+
+    // Wake up the socket's event loop
+    self.cross_thread_signal.notify();
+}
+
+/// Socket polls this in its event loop
+pub fn processPipeEvents(self: *SocketInner) void {
+    while (self.pipe_events.tryRecv()) |event| {
+        switch (event) {
+            .attached => |pipe| self.attachPipe(pipe),
+            .detached => |pipe| self.detachPipe(pipe),
+            .hiccup => |pipe| self.hiccupPipe(pipe),
+        }
+    }
+}
+```
+
+---
+
+### Linger Shutdown Sequence
+
+Linger controls what happens to pending messages when a socket closes.
+
+#### Linger Values
+
+| Value | Behavior |
+|-------|----------|
+| 0 | Immediate close, drop all pending messages |
+| -1 | Wait forever until all messages sent |
+| >0 | Wait up to N milliseconds, then drop remaining |
+
+#### Shutdown State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    LINGER SHUTDOWN SEQUENCE                      │
+└─────────────────────────────────────────────────────────────────┘
+
+socket.close() called
+        │
+        ▼
+   ┌────────────┐
+   │ linger = 0 │──────────────────────────────────────────┐
+   │    ?       │                                          │
+   └─────┬──────┘                                          │
+         │ No                                              │
+         ▼                                                 │
+   ┌────────────┐                                          │
+   │ Stop       │ Stop accepting new messages              │
+   │ new sends  │ (hasOut = false)                         │
+   └─────┬──────┘                                          │
+         │                                                 │
+         ▼                                                 │
+   ┌────────────┐                                          │
+   │ Flush      │ Complete any partial multipart           │
+   │ multipart  │ (atomicity guarantee)                    │
+   └─────┬──────┘                                          │
+         │                                                 │
+         ▼                                                 │
+   ┌────────────┐    Timeout or                            │
+   │ Wait for   │    all flushed ──────────────────────────┤
+   │ pending    │◀──────────────┐                          │
+   │ to flush   │               │                          │
+   └─────┬──────┘               │                          │
+         │                      │                          │
+         │ Check periodically   │                          │
+         ▼                      │                          │
+   ┌────────────┐    pending    │                          │
+   │ Pending    │────remains────┘                          │
+   │ empty?     │                                          │
+   └─────┬──────┘                                          │
+         │ Yes                                             │
+         ▼                                                 ▼
+   ┌────────────────────────────────────────────────────────┐
+   │                   CLOSE PIPES                          │
+   │  - Send delimiter to each pipe (graceful)              │
+   │  - Wait for peer acknowledgment (optional)             │
+   │  - Terminate Engine coroutines                         │
+   │  - Free pipe resources                                 │
+   └────────────────────────────────────────────────────────┘
+         │
+         ▼
+   ┌────────────┐
+   │ Socket     │
+   │ destroyed  │
+   └────────────┘
+```
+
+#### Implementation
+
+```zig
+pub fn close(self: *Socket, rt: *zio.Runtime) void {
+    const linger = self.options.linger;
+
+    // Stop accepting new operations
+    self.state = .closing;
+
+    if (linger == 0) {
+        // Immediate shutdown
+        self.forceClose(rt);
+        return;
+    }
+
+    // Flush pending messages with timeout
+    const deadline = if (linger < 0)
+        null  // Infinite
+    else
+        rt.now().add(Duration.fromMilliseconds(@intCast(linger)));
+
+    // Use ZIO shielding to ensure cleanup completes
+    rt.shield();
+    defer rt.unshield();
+
+    // Wait for all pipes to flush
+    for (self.pipes.items) |pipe| {
+        self.flushPipe(pipe, deadline, rt) catch {
+            // Timeout or error - force close remaining
+            break;
+        };
+    }
+
+    // Graceful pipe termination
+    for (self.pipes.items) |pipe| {
+        pipe.terminate();
+    }
+
+    // Wait for engines to finish
+    self.engine_group.wait(rt);
+
+    self.state = .closed;
+}
+
+fn flushPipe(self: *Socket, pipe: *Pipe, deadline: ?Instant, rt: *zio.Runtime) !void {
+    while (!pipe.outbound.isEmpty()) {
+        if (deadline) |d| {
+            if (rt.now().isAfter(d)) return error.TimedOut;
+        }
+
+        // Wait for drain or timeout
+        const result = zio.select(.{
+            pipe.outbound.drained.pollable(),
+            if (deadline) |d| zio.deadline(d) else zio.never(),
+        }, rt);
+
+        if (result[1]) return error.TimedOut;
+    }
+}
+```
+
 **Zig/ZIO optimizations:**
 1. **Tagged enum for send state** - `idle`, `sending_multipart`, `dropping` is clearer than booleans
 2. **Struct return** - `recvPipe` returns `{msg, pipe}` - no out-parameters
