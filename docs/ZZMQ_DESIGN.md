@@ -3047,6 +3047,382 @@ pub const Connector = struct {
 
 ---
 
+## State Change Propagation
+
+A key challenge in ZZMQ is propagating state changes to blocked coroutines. When a coroutine is blocked waiting on a channel or I/O, how does it learn that another coroutine set `state = .closing`?
+
+### The Problem
+
+```zig
+// Writer is blocked here - won't see state change!
+const msg = self.pipe.outbound.receive(rt) catch |err| { ... };
+
+// Meanwhile, reader sets:
+self.state = .closing;  // Writer doesn't wake up
+```
+
+### Hybrid Solution: Notify + Select
+
+ZZMQ uses a hybrid approach combining `zio.Notify` for signaling and `zio.select()` for multiplexing:
+
+```zig
+pub const Engine = struct {
+    state: State = .handshaking,
+    shutdown_notify: zio.Notify = .{},  // One-shot notification
+    group: zio.Group = .{},
+    disconnect_reason: ?DisconnectReason = null,
+
+    const State = enum {
+        handshaking,
+        ready,
+        closing,
+        closed,
+    };
+
+    const DisconnectReason = enum {
+        peer_closed,
+        protocol_error,
+        heartbeat_timeout,
+        local_close,
+    };
+
+    /// Initiate graceful shutdown - wakes all waiting coroutines
+    fn initiateShutdown(self: *Engine, reason: DisconnectReason) void {
+        if (self.state == .ready) {
+            self.state = .closing;
+            self.disconnect_reason = reason;
+            self.shutdown_notify.set();  // Wake writer and heartbeat
+        }
+    }
+
+    /// Reader loop - sets state and signals on disconnect
+    fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
+        while (self.state == .ready) {
+            const n = self.stream.recv(rt, self.read_buf, .{}) catch |err| {
+                const reason: DisconnectReason = switch (err) {
+                    error.ConnectionReset, error.BrokenPipe => .peer_closed,
+                    error.Cancelled => return,  // Graceful cancel
+                    else => .protocol_error,
+                };
+                self.initiateShutdown(reason);
+                return;
+            };
+
+            if (n == 0) {
+                self.initiateShutdown(.peer_closed);
+                return;
+            }
+
+            // Process received data...
+            self.processInbound(self.read_buf[0..n]) catch |err| {
+                self.initiateShutdown(.protocol_error);
+                return;
+            };
+        }
+    }
+
+    /// Writer loop - uses select to wait on message OR shutdown
+    fn writerLoop(self: *Engine, rt: *zio.Runtime) void {
+        while (self.state == .ready) {
+            // Prepare async operations for select
+            var msg_op = self.pipe.outbound.asyncReceive();
+            var shutdown_op = self.shutdown_notify.asyncWait();
+
+            // Wait for either message or shutdown signal
+            const result = zio.select(rt, .{
+                .message = &msg_op,
+                .shutdown = &shutdown_op,
+            }) catch |err| {
+                if (err == error.Cancelled) return;
+                self.initiateShutdown(.protocol_error);
+                return;
+            };
+
+            switch (result) {
+                .message => |msg| {
+                    defer msg.deinit();
+
+                    // Double-check state before sending
+                    if (self.state != .ready) {
+                        // Re-queue if linger allows
+                        self.requeueForLinger(msg);
+                        return;
+                    }
+
+                    self.sendMessage(rt, msg) catch |err| {
+                        self.initiateShutdown(.protocol_error);
+                        return;
+                    };
+                },
+                .shutdown => {
+                    // Shutdown signal received - exit gracefully
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Heartbeat loop - uses select for interruptible sleep
+    fn heartbeatLoop(self: *Engine, rt: *zio.Runtime) void {
+        const interval = self.heartbeat.interval orelse return;
+        const timeout = self.heartbeat.timeout;
+
+        while (self.state == .ready) {
+            // Interruptible sleep using select with timeout
+            var shutdown_op = self.shutdown_notify.asyncWait();
+            var timer_op = zio.async.sleep(Duration.fromMilliseconds(interval));
+
+            const result = zio.select(rt, .{
+                .shutdown = &shutdown_op,
+                .timer = &timer_op,
+            }) catch return;
+
+            switch (result) {
+                .shutdown => return,  // Shutdown during sleep
+                .timer => {
+                    // Check for timeout
+                    const now = rt.now();
+                    if (now.since(self.heartbeat.last_recv).toMilliseconds() > timeout) {
+                        self.initiateShutdown(.heartbeat_timeout);
+                        return;
+                    }
+
+                    // Send ping if needed
+                    if (now.since(self.heartbeat.last_send).toMilliseconds() > interval) {
+                        self.sendPing(rt) catch {
+                            self.initiateShutdown(.protocol_error);
+                            return;
+                        };
+                    }
+                },
+            }
+        }
+    }
+
+    fn requeueForLinger(self: *Engine, msg: Message) void {
+        if (self.session.linger_ms != 0) {
+            self.pipe.outbound.trySend(msg) catch {
+                // Queue full or closed - drop message
+            };
+        }
+    }
+};
+```
+
+### Shutdown Cascade
+
+When shutdown is initiated, the cascade is:
+
+```
+1. Reader detects disconnect (or external close request)
+         ↓
+2. Reader calls initiateShutdown(reason)
+         ↓
+3. initiateShutdown sets state = .closing AND shutdown_notify.set()
+         ↓
+4. Writer's select() returns .shutdown (wakes immediately)
+         ↓
+5. Heartbeat's select() returns .shutdown (wakes immediately)
+         ↓
+6. All coroutines return → group.wait() completes
+         ↓
+7. Engine cleanup runs (deferred)
+```
+
+### Forceful Shutdown (linger=0)
+
+For immediate shutdown, use channel close plus group cancel:
+
+```zig
+pub fn forceShutdown(self: *Engine, rt: *zio.Runtime) void {
+    // Close channels - unblocks any pending receive/send
+    self.pipe.inbound.close();
+    self.pipe.outbound.close();
+
+    // Cancel group - terminates all coroutines at next yield point
+    self.group.cancel(rt);
+
+    // Wait for cleanup
+    self.group.wait(rt) catch {};
+}
+```
+
+### Linger with Deadline
+
+For timed linger, use cancellation shielding with deadline:
+
+```zig
+pub fn shutdownWithLinger(self: *Session, rt: *zio.Runtime, linger_ms: i32) void {
+    if (linger_ms == 0) {
+        // Immediate
+        self.engine.?.forceShutdown(rt);
+        return;
+    }
+
+    // Signal graceful shutdown
+    self.engine.?.initiateShutdown(.local_close);
+
+    if (linger_ms < 0) {
+        // Infinite linger - wait forever
+        self.engine.?.group.wait(rt) catch {};
+    } else {
+        // Timed linger - shield with deadline
+        rt.beginShield();
+        defer rt.endShield();
+
+        const deadline = rt.now().add(Duration.fromMilliseconds(@intCast(linger_ms)));
+
+        // Drain pending messages with deadline
+        while (self.engine.?.hasPendingOutput()) {
+            if (rt.now().compare(deadline) != .lt) {
+                break;  // Deadline exceeded
+            }
+            rt.yield() catch break;
+        }
+
+        // Force remaining
+        self.engine.?.forceShutdown(rt);
+    }
+}
+```
+
+### libzmq Command Mapping
+
+libzmq uses a mailbox system for inter-thread communication with 20+ command types. ZZMQ replaces most with simpler mechanisms:
+
+| libzmq Command | Purpose | ZZMQ Equivalent |
+|----------------|---------|-----------------|
+| `stop` | Terminate I/O thread | `group.cancel(rt)` |
+| `plug` | Register I/O object | Automatic (spawn into group) |
+| `own` | Notify about new object | Direct call (single-threaded) |
+| `attach` | Attach engine to session | Direct assignment |
+| `bind` | Establish pipe | Direct call + channel creation |
+| `activate_read` | Signal data available | ZIO channel (implicit) |
+| `activate_write` | Credit flow - msgs read | ZIO bounded channel (implicit) |
+| `hiccup` | Reconnection handling | Connector state machine |
+| `pipe_term` | Request pipe termination | `shutdown_notify.set()` |
+| `pipe_term_ack` | Acknowledge termination | `group.wait()` completion |
+| `pipe_hwm` | Modify HWM | `options.send_hwm` change |
+| `term_req` | Request shutdown | `initiateShutdown()` |
+| `term` | Start shutdown (with linger) | `shutdownWithLinger()` |
+| `term_ack` | Acknowledge shutdown | Coroutine return |
+| `term_endpoint` | Disconnect endpoint | Direct call |
+| `reap` / `reaped` | Socket deallocation | Zig `defer` + `deinit()` |
+| `pipe_peer_stats` | Monitoring stats | `monitor.broadcast()` |
+| `done` | All sockets deallocated | Context deinit completion |
+
+### Credit Flow (HWM)
+
+libzmq implements HWM credit flow with `activate_read`/`activate_write` commands:
+
+```cpp
+// libzmq: Reader tells writer how many messages read
+struct { uint64_t msgs_read; } activate_write;
+```
+
+ZZMQ uses ZIO bounded channels which handle this automatically:
+
+```zig
+// Channel blocks sender when full (HWM reached)
+// Unblocks when receiver takes a message
+const channel = try zio.Channel(Message).init(rt, hwm);
+
+// Sender blocks when at HWM
+try channel.send(rt, msg);  // Blocks if channel full
+
+// Receiver automatically "credits" by consuming
+const msg = try channel.receive(rt);  // Unblocks a sender
+```
+
+The key difference: libzmq must explicitly signal credit because it's poll-based. ZIO channels provide implicit credit through blocking semantics.
+
+### Pipe Termination Protocol
+
+libzmq uses a two-phase handshake (`pipe_term` / `pipe_term_ack`) to ensure both ends clean up properly:
+
+```
+Reader → Writer: pipe_term (please close your end)
+Writer → Reader: pipe_term_ack (I'm done)
+```
+
+ZZMQ uses group coordination instead:
+
+```zig
+pub const Pipe = struct {
+    inbound: zio.Channel(Message),
+    outbound: zio.Channel(Message),
+    state: PipeState = .active,
+
+    const PipeState = enum {
+        active,
+        closing,      // Initiated termination
+        draining,     // Flushing remaining messages
+        closed,
+    };
+
+    pub fn initiateClose(self: *Pipe) void {
+        self.state = .closing;
+        // Don't close channels yet - allow draining
+    }
+
+    pub fn drain(self: *Pipe, rt: *zio.Runtime) void {
+        self.state = .draining;
+
+        // Flush outbound messages
+        while (self.outbound.tryReceive()) |msg| {
+            // Send to peer (best effort)
+            _ = msg;  // Actual send logic
+        }
+
+        // Close channels
+        self.inbound.close();
+        self.outbound.close();
+        self.state = .closed;
+    }
+};
+```
+
+### Monitoring Events
+
+libzmq uses `pipe_peer_stats` / `pipe_stats_publish` commands for monitoring. ZZMQ uses `BroadcastChannel`:
+
+```zig
+// Engine emits events
+fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
+    // ... on disconnect:
+    self.socket.monitor.?.broadcast(MonitorEvent{
+        .event = .disconnected,
+        .endpoint = self.endpoint,
+        .value = @intFromEnum(self.disconnect_reason.?),
+    });
+}
+
+// Socket close emits event
+fn close(self: *Socket, rt: *zio.Runtime) void {
+    self.monitor.?.broadcast(MonitorEvent{
+        .event = .closed,
+        .endpoint = null,
+        .value = 0,
+    });
+    // ...
+}
+```
+
+### Summary: Why This Design Works
+
+| Aspect | libzmq Challenge | ZZMQ Solution |
+|--------|------------------|---------------|
+| Cross-thread wake | eventfd/pipe signaler | `zio.Notify` |
+| Multiple wait sources | `poll()` on multiple fds | `zio.select()` |
+| Credit flow | Explicit commands | Bounded channel (implicit) |
+| Ordered shutdown | Command sequence | `initiateShutdown()` + `group.wait()` |
+| Linger timeout | Timer callback | Shield + deadline loop |
+| State coordination | Atomic flags + mutex | State enum (single-threaded) |
+
+**Key insight:** libzmq's complexity comes from multi-threaded poll-based I/O. ZZMQ's single-threaded coroutine model with ZIO primitives (Notify, select, bounded channels) provides equivalent functionality with simpler, more explicit code.
+
+---
+
 ## Connection Management
 
 ### Listener (for `bind()`)
