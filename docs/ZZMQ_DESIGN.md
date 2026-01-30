@@ -767,6 +767,168 @@ Based on ZIO source analysis, here are corrections to earlier assumptions:
 
 ---
 
+## Threading Model and Safety
+
+### ZIO's Single-Threaded Runtime Model
+
+ZIO uses a single-threaded runtime model: one OS thread runs one `zio.Runtime`, which
+manages many coroutines cooperatively. This is similar to Node.js's event loop or
+Tokio's single-threaded runtime mode.
+
+**Key implications for ZZMQ:**
+
+1. **No locks within a runtime** - All coroutines in one runtime share memory safely
+2. **Sockets bound to their runtime** - A socket uses its context's runtime
+3. **Cross-runtime communication via channels** - Thread-safe channel for multi-runtime
+
+### ZZMQ Threading Rules
+
+| Resource | Thread Safety | Notes |
+|----------|--------------|-------|
+| **Context** | Create/destroy on one thread | `init()`/`deinit()` not thread-safe |
+| **Socket** | Single runtime only | Cannot be passed between threads |
+| **Message** | Move semantics | Transfer ownership, don't share |
+| **Context.runtime** | One thread owns it | Run event loop on one thread |
+
+### Multi-Core Scaling Pattern
+
+For multi-core scaling, use multiple contexts (each with own runtime) and connect via
+TCP or inproc. This matches libzmq's recommended pattern.
+
+```zig
+// Main thread: coordinator
+var main_ctx = try zzmq.Context.init(.{});
+var frontend = try main_ctx.socket(.router);
+try frontend.bind("tcp://*:5555");
+
+// Worker threads: each with own context
+const workers = try std.Thread.spawn(.{}, workerThread, .{});
+
+fn workerThread() void {
+    var ctx = try zzmq.Context.init(.{});
+    defer ctx.deinit();
+
+    var worker = try ctx.socket(.dealer);
+    try worker.connect("tcp://127.0.0.1:5555");
+
+    // Process messages...
+}
+```
+
+### Inproc Transport Threading
+
+Inproc (`inproc://`) can connect sockets within the same context. Since all sockets
+in a context share the same runtime (single-threaded), inproc is always safe:
+
+```zig
+var ctx = try zzmq.Context.init(.{});
+
+var sender = try ctx.socket(.push);
+try sender.bind("inproc://workers");
+
+var receiver = try ctx.socket(.pull);
+try receiver.connect("inproc://workers");
+
+// Both sockets in same context, same runtime - safe
+// Data flows through ZIO channels, no thread boundary
+```
+
+### Cross-Runtime Channel (Advanced)
+
+For users who need multiple runtimes in one process communicating without network,
+we could provide a thread-safe channel wrapper:
+
+```zig
+pub const CrossRuntimePipe = struct {
+    /// Thread-safe channel (uses mutex internally)
+    channel: ThreadSafeChannel(Message),
+
+    /// Notify for waking up receiving runtime
+    recv_notify: std.Thread.ResetEvent = .{},
+
+    pub fn send(self: *CrossRuntimePipe, msg: Message) void {
+        self.channel.send(msg);
+        self.recv_notify.set();
+    }
+
+    pub fn recv(self: *CrossRuntimePipe, rt: *zio.Runtime) !Message {
+        // TODO: Integrate with ZIO's event loop via fd/eventfd
+        // For now, this is a placeholder design
+    }
+};
+```
+
+**Note:** This is out of scope for initial implementation. Use TCP between runtimes.
+
+### Comparison with libzmq
+
+| Aspect | libzmq | ZZMQ |
+|--------|--------|------|
+| Context | Thread-safe | Single-thread create/destroy |
+| Sockets | NOT thread-safe | Same (single runtime) |
+| Inproc | Lock-free pipes | ZIO channels (no locks) |
+| Multi-core | I/O threads + worker threads | Multiple contexts |
+| Cross-thread send | Mailbox + signaler | Not supported (use TCP) |
+
+**Design decision:** ZZMQ simplifies by embracing ZIO's single-threaded model fully.
+This eliminates lock contention and signaling complexity. Multi-core scaling uses the
+same pattern libzmq recommends: multiple processes/contexts connected via network.
+
+---
+
+## Scope and Feature Decisions
+
+### In Scope (MVP)
+
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| **TCP transport** | P0 | Primary transport |
+| **IPC transport** | P0 | Unix domain sockets |
+| **Inproc transport** | P0 | Same-context fast path |
+| **Core patterns** | P0 | PUSH/PULL, PUB/SUB, REQ/REP, DEALER/ROUTER, PAIR |
+| **XPUB/XSUB** | P1 | For proxy pattern |
+| **Proxy** | P1 | Frontend/backend bridging |
+| **HWM/backpressure** | P0 | Strict libzmq semantics |
+| **Multipart messages** | P0 | Atomic message groups |
+| **ZMTP 3.1** | P0 | Wire protocol |
+| **NULL security** | P0 | No authentication |
+| **Heartbeat** | P1 | PING/PONG keepalive |
+| **Reconnection** | P0 | With exponential backoff |
+| **C FFI** | P1 | libzmq-compatible C API |
+| **Socket monitoring** | P2 | BroadcastChannel-based |
+
+### In Scope (Post-MVP)
+
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| **PLAIN security** | P2 | Username/password |
+| **CURVE security** | P3 | Encrypted, authenticated |
+| **ZAP authentication** | P3 | External authenticator |
+| **Message metadata** | P2 | ZMTP 3.1 properties |
+| **Socket options** | P1+ | Add as needed |
+
+### Out of Scope
+
+| Feature | Reason |
+|---------|--------|
+| **PGM/EPGM multicast** | Complex, rarely used, requires kernel support |
+| **GSSAPI security** | Complex, rarely used outside enterprise |
+| **NORM transport** | Obscure, no demand |
+| **VMCI transport** | VMware-specific |
+| **Draft sockets** (SERVER/CLIENT, RADIO/DISH, etc.) | Unstable API, add later if needed |
+| **SOCKS proxy** | Can add later if demanded |
+| **WebSocket transport** | Can add later; different use case |
+| **Thread-safe sockets** | Complexity; use multiple contexts instead |
+
+### Explicit Non-Goals
+
+1. **100% libzmq compatibility** - We match semantics, not every option/edge case
+2. **Drop-in binary replacement** - Different ABI, but C FFI provides compatibility layer
+3. **Backward compatibility during development** - Will break APIs until 1.0
+4. **Windows support initially** - Linux first, then macOS, then Windows
+
+---
+
 ## Core Types
 
 ### Context
@@ -4331,6 +4493,591 @@ pub const Req = struct {
     }
 };
 ```
+
+### REP Pattern
+
+REP is the server side of REQ/REP. It inherits from ROUTER but adds a strict state machine
+that enforces recv-send-recv-send alternation. Key insight: it automatically copies the
+routing envelope on recv and uses it on send, so the user never sees routing IDs.
+
+**libzmq reference** (`src/rep.cpp`):
+- Inherits from `router_t`
+- Two flags: `_sending_reply` and `_request_begins`
+- On recv: reads envelope frames until empty delimiter, copies them to reply pipe
+- On send: uses ROUTER's send which routes via the copied envelope
+- State flips when complete message (MORE=false) is processed
+
+```zig
+pub const Rep = struct {
+    pub const State = struct {
+        /// State machine phase
+        phase: Phase = .receiving,
+
+        /// Envelope frames copied from request (for routing reply)
+        /// Stored in arena, cleared after each reply
+        envelope: std.ArrayList(Message),
+
+        /// Arena for envelope storage
+        envelope_arena: std.heap.ArenaAllocator,
+
+        const Phase = enum {
+            /// Waiting for request (recv allowed, send blocked)
+            receiving,
+            /// Request received, waiting to send reply (send allowed, recv blocked)
+            sending,
+        };
+    };
+
+    pub fn init(allocator: std.mem.Allocator) State {
+        return .{
+            .envelope = std.ArrayList(Message).init(allocator),
+            .envelope_arena = std.heap.ArenaAllocator.init(allocator),
+        };
+    }
+
+    pub fn recv(
+        state: *State,
+        pipes: *PipeSet,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        // State check: can't recv while sending
+        if (state.phase == .sending) {
+            return error.InvalidState;  // EFSM in libzmq
+        }
+
+        // If this is start of new request, read and store envelope
+        if (state.envelope.items.len == 0) {
+            try state.readEnvelope(pipes, rt);
+        }
+
+        // Read the actual request frame(s)
+        const msg = try Router.recv(undefined, pipes, timeout, rt);
+
+        // If complete message, transition to sending phase
+        if (!msg.flags.more) {
+            state.phase = .sending;
+        }
+
+        return msg;
+    }
+
+    pub fn send(
+        state: *State,
+        pipes: *PipeSet,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        // State check: can't send while receiving
+        if (state.phase == .receiving) {
+            return error.InvalidState;  // EFSM in libzmq
+        }
+
+        // First send of reply: write stored envelope first
+        if (state.envelope.items.len > 0) {
+            for (state.envelope.items) |envelope_frame| {
+                var frame = envelope_frame;
+                frame.flags.more = true;
+                try Router.send(undefined, pipes, &frame, timeout, rt);
+            }
+            state.envelope.clearRetainingCapacity();
+            _ = state.envelope_arena.reset(.retain_capacity);
+        }
+
+        // Send the reply frame
+        try Router.send(undefined, pipes, msg, timeout, rt);
+
+        // If complete message, transition back to receiving phase
+        if (!msg.flags.more) {
+            state.phase = .receiving;
+        }
+    }
+
+    /// Read envelope frames (routing IDs + empty delimiter) from request
+    fn readEnvelope(state: *State, pipes: *PipeSet, rt: *zio.Runtime) !void {
+        const alloc = state.envelope_arena.allocator();
+
+        while (true) {
+            var frame = try Router.recv(undefined, pipes, .{}, rt);
+
+            if (!frame.flags.more) {
+                // Malformed: no delimiter before payload
+                // Discard and reset
+                frame.deinit();
+                state.envelope.clearRetainingCapacity();
+                return error.ProtocolError;
+            }
+
+            // Empty frame = delimiter, we're done with envelope
+            if (frame.len() == 0) {
+                // Store the empty delimiter too
+                try state.envelope.append(frame);
+                break;
+            }
+
+            // Copy frame data to arena (original may be transient)
+            const data_copy = try alloc.dupe(u8, frame.data());
+            var stored = frame;
+            stored.setData(data_copy);
+            try state.envelope.append(stored);
+        }
+    }
+
+    pub fn hasIn(state: *State, pipes: *PipeSet) bool {
+        if (state.phase == .sending) return false;
+        return Router.hasIn(undefined, pipes);
+    }
+
+    pub fn hasOut(state: *State, pipes: *PipeSet) bool {
+        if (state.phase == .receiving) return false;
+        return Router.hasOut(undefined, pipes);
+    }
+};
+```
+
+**Zig/ZIO optimizations:**
+1. **Tagged enum for state** - Compile-time checked, clearer than boolean flags
+2. **Arena for envelope** - Batch deallocation after each reply cycle
+3. **No polling loops** - ZIO channels suspend coroutine when waiting
+
+### DEALER Pattern
+
+DEALER is the async counterpart to REQ. It has no state machine restrictions - you can
+send and recv freely. It load-balances sends (round-robin) and fair-queues receives.
+
+**libzmq reference** (`src/dealer.cpp`):
+- Uses `fq_t` for fair-queue receives
+- Uses `lb_t` for load-balanced sends
+- `_probe_router` option: send empty message on connect (for ROUTER peer awareness)
+- `sendpipe`/`recvpipe` variants expose which pipe was used
+
+```zig
+pub const Dealer = struct {
+    pub const State = struct {
+        /// Fair queue state for receives
+        fq: FairQueue = .{},
+
+        /// Load balancer state for sends
+        lb: LoadBalancer = .{},
+
+        /// Send empty message to routers on connect
+        probe_router: bool = false,
+    };
+
+    pub fn onPipeAttached(state: *State, pipe: *Pipe, rt: *zio.Runtime) void {
+        state.fq.attach(pipe);
+        state.lb.attach(pipe);
+
+        // Probe router: send empty message so ROUTER assigns routing ID
+        if (state.probe_router) {
+            var probe = Message.initEmpty();
+            pipe.trySend(probe) catch {};
+        }
+    }
+
+    pub fn onPipeDetached(state: *State, pipe: *Pipe) void {
+        state.fq.detach(pipe);
+        state.lb.detach(pipe);
+    }
+
+    pub fn send(
+        state: *State,
+        pipes: *PipeSet,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        return state.lb.send(pipes, msg, timeout, rt);
+    }
+
+    pub fn recv(
+        state: *State,
+        pipes: *PipeSet,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        return state.fq.recv(pipes, timeout, rt);
+    }
+
+    /// Send and return which pipe was used (for correlating replies)
+    pub fn sendPipe(
+        state: *State,
+        pipes: *PipeSet,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!*Pipe {
+        return state.lb.sendPipe(pipes, msg, timeout, rt);
+    }
+
+    /// Recv and return which pipe it came from
+    pub fn recvPipe(
+        state: *State,
+        pipes: *PipeSet,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!struct { msg: Message, pipe: *Pipe } {
+        return state.fq.recvPipe(pipes, timeout, rt);
+    }
+
+    pub fn hasIn(state: *State) bool {
+        return state.fq.hasIn();
+    }
+
+    pub fn hasOut(state: *State) bool {
+        return state.lb.hasOut();
+    }
+};
+
+/// Fair queue: round-robin receives from active pipes
+/// libzmq: src/fq.cpp
+pub const FairQueue = struct {
+    /// Current pipe index for round-robin
+    current: usize = 0,
+
+    /// Multipart state: if true, must continue from same pipe
+    receiving_multipart: bool = false,
+
+    /// Pipe that current multipart is coming from
+    multipart_pipe: ?*Pipe = null,
+
+    pub fn recv(
+        self: *FairQueue,
+        pipes: *PipeSet,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        const result = try self.recvPipe(pipes, timeout, rt);
+        return result.msg;
+    }
+
+    pub fn recvPipe(
+        self: *FairQueue,
+        pipes: *PipeSet,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!struct { msg: Message, pipe: *Pipe } {
+        // If mid-multipart, MUST read from same pipe (atomicity)
+        if (self.receiving_multipart) {
+            const pipe = self.multipart_pipe.?;
+            const msg = try pipe.inbound.receive(rt);
+
+            if (!msg.flags.more) {
+                self.receiving_multipart = false;
+                self.multipart_pipe = null;
+                self.advanceRoundRobin(pipes);
+            }
+
+            return .{ .msg = msg, .pipe = pipe };
+        }
+
+        // Try current pipe first (fast path)
+        const active = pipes.activePipes();
+        if (active.len == 0) {
+            return error.NoConnections;
+        }
+
+        // Try non-blocking from current
+        const start = self.current % active.len;
+        var idx = start;
+
+        while (true) {
+            const pipe = active[idx];
+            if (pipe.inbound.tryReceive()) |msg| {
+                if (msg.flags.more) {
+                    self.receiving_multipart = true;
+                    self.multipart_pipe = pipe;
+                } else {
+                    self.current = (idx + 1) % active.len;
+                }
+                return .{ .msg = msg, .pipe = pipe };
+            }
+
+            idx = (idx + 1) % active.len;
+            if (idx == start) break;  // Checked all, none ready
+        }
+
+        // All empty - wait with select
+        const ready_pipe = try pipes.waitAnyReadable(timeout, rt);
+        const msg = try ready_pipe.inbound.receive(rt);
+
+        if (msg.flags.more) {
+            self.receiving_multipart = true;
+            self.multipart_pipe = ready_pipe;
+        } else {
+            self.current = (pipes.indexOf(ready_pipe) + 1) % active.len;
+        }
+
+        return .{ .msg = msg, .pipe = ready_pipe };
+    }
+
+    fn advanceRoundRobin(self: *FairQueue, pipes: *PipeSet) void {
+        const active = pipes.activePipes();
+        if (active.len > 0) {
+            self.current = (self.current + 1) % active.len;
+        }
+    }
+
+    pub fn hasIn(self: *FairQueue, pipes: *PipeSet) bool {
+        if (self.receiving_multipart) return true;
+
+        for (pipes.activePipes()) |pipe| {
+            if (pipe.inbound.canReceive()) return true;
+        }
+        return false;
+    }
+};
+
+/// Load balancer: round-robin sends to active pipes
+/// libzmq: src/lb.cpp
+pub const LoadBalancer = struct {
+    /// Current pipe index for round-robin
+    current: usize = 0,
+
+    /// Multipart state
+    state: SendState = .idle,
+
+    /// Pipe that current multipart is going to
+    multipart_pipe: ?*Pipe = null,
+
+    const SendState = enum {
+        idle,
+        sending_multipart,
+        /// Mid-multipart pipe disconnected, drop remaining frames
+        dropping,
+    };
+
+    pub fn send(
+        self: *LoadBalancer,
+        pipes: *PipeSet,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        _ = try self.sendPipe(pipes, msg, timeout, rt);
+    }
+
+    pub fn sendPipe(
+        self: *LoadBalancer,
+        pipes: *PipeSet,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!*Pipe {
+        // Handle dropping mode (mid-multipart disconnect)
+        if (self.state == .dropping) {
+            if (!msg.flags.more) {
+                self.state = .idle;
+                self.multipart_pipe = null;
+            }
+            // Silently discard, return success (libzmq compat)
+            return self.multipart_pipe.?;
+        }
+
+        // If mid-multipart, MUST send to same pipe (atomicity)
+        if (self.state == .sending_multipart) {
+            const pipe = self.multipart_pipe.?;
+
+            // Check if pipe still active
+            if (!pipe.isActive()) {
+                // Pipe disconnected mid-multipart - enter dropping mode
+                pipe.rollback();
+                self.state = .dropping;
+                if (!msg.flags.more) {
+                    self.state = .idle;
+                    self.multipart_pipe = null;
+                }
+                return pipe;
+            }
+
+            try pipe.outbound.send(rt, msg.*);
+
+            if (!msg.flags.more) {
+                pipe.flush();
+                self.state = .idle;
+                self.multipart_pipe = null;
+                self.advanceRoundRobin(pipes);
+            }
+
+            return pipe;
+        }
+
+        // Find writable pipe via round-robin
+        const active = pipes.activePipes();
+        if (active.len == 0) {
+            return error.NoConnections;
+        }
+
+        const start = self.current % active.len;
+        var idx = start;
+
+        while (true) {
+            const pipe = active[idx];
+            if (pipe.outbound.canSend()) {
+                try pipe.outbound.send(rt, msg.*);
+
+                if (msg.flags.more) {
+                    self.state = .sending_multipart;
+                    self.multipart_pipe = pipe;
+                } else {
+                    pipe.flush();
+                    self.current = (idx + 1) % active.len;
+                }
+
+                return pipe;
+            }
+
+            idx = (idx + 1) % active.len;
+            if (idx == start) break;  // All full
+        }
+
+        // All pipes full - wait with select
+        const ready_pipe = try pipes.waitAnyWritable(timeout, rt);
+        try ready_pipe.outbound.send(rt, msg.*);
+
+        if (msg.flags.more) {
+            self.state = .sending_multipart;
+            self.multipart_pipe = ready_pipe;
+        } else {
+            ready_pipe.flush();
+            self.current = (pipes.indexOf(ready_pipe) + 1) % active.len;
+        }
+
+        return ready_pipe;
+    }
+
+    fn advanceRoundRobin(self: *LoadBalancer, pipes: *PipeSet) void {
+        const active = pipes.activePipes();
+        if (active.len > 0) {
+            self.current = (self.current + 1) % active.len;
+        }
+    }
+
+    pub fn hasOut(self: *LoadBalancer, pipes: *PipeSet) bool {
+        // If mid-multipart, we must continue (can't switch pipes)
+        if (self.state == .sending_multipart) return true;
+
+        for (pipes.activePipes()) |pipe| {
+            if (pipe.outbound.canSend()) return true;
+        }
+        return false;
+    }
+};
+```
+
+**Zig/ZIO optimizations:**
+1. **Tagged enum for send state** - `idle`, `sending_multipart`, `dropping` is clearer than booleans
+2. **Struct return** - `recvPipe` returns `{msg, pipe}` - no out-parameters
+3. **ZIO select for waiting** - No polling loops, just `waitAnyReadable/Writable`
+4. **Index arithmetic** - Simple modulo, no atomic operations needed (single-threaded)
+
+### PAIR Pattern
+
+PAIR is the simplest pattern - exactly one peer, no routing, no load balancing.
+Often used for inproc coordination between threads/coroutines.
+
+**libzmq reference** (`src/pair.cpp`):
+- Single `_pipe` pointer (nullable)
+- Rejects additional connections (`pipe_->terminate(false)`)
+- Direct read/write to the pipe
+- Flush only on complete message (MORE=false)
+
+```zig
+pub const Pair = struct {
+    pub const State = struct {
+        /// The single peer pipe (null if disconnected)
+        pipe: ?*Pipe = null,
+    };
+
+    pub fn onPipeAttached(state: *State, pipe: *Pipe) void {
+        if (state.pipe == null) {
+            state.pipe = pipe;
+        } else {
+            // PAIR only allows one connection - reject additional
+            pipe.terminate(false);
+        }
+    }
+
+    pub fn onPipeDetached(state: *State, pipe: *Pipe) void {
+        if (state.pipe == pipe) {
+            state.pipe = null;
+        }
+    }
+
+    pub fn send(
+        state: *State,
+        msg: *Message,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        const pipe = state.pipe orelse return error.NoConnection;
+
+        try pipe.outbound.send(rt, msg.*);
+
+        // Flush on complete message
+        if (!msg.flags.more) {
+            pipe.flush();
+        }
+    }
+
+    pub fn recv(
+        state: *State,
+        timeout: Timeout,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        const pipe = state.pipe orelse return error.NoConnection;
+
+        return pipe.inbound.receive(rt);
+    }
+
+    pub fn trySend(state: *State, msg: *Message) SendError!bool {
+        const pipe = state.pipe orelse return error.NoConnection;
+
+        if (pipe.outbound.trySend(msg.*)) {
+            if (!msg.flags.more) {
+                pipe.flush();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    pub fn tryRecv(state: *State) RecvError!?Message {
+        const pipe = state.pipe orelse return error.NoConnection;
+        return pipe.inbound.tryReceive();
+    }
+
+    pub fn hasIn(state: *State) bool {
+        const pipe = state.pipe orelse return false;
+        return pipe.inbound.canReceive();
+    }
+
+    pub fn hasOut(state: *State) bool {
+        const pipe = state.pipe orelse return false;
+        return pipe.outbound.canSend();
+    }
+};
+```
+
+**Zig/ZIO optimizations:**
+1. **Optional type** - `?*Pipe` is idiomatic Zig, clear null handling
+2. **Minimal abstraction** - No FQ/LB, just direct pipe operations
+3. **Good for inproc** - Fast path for same-context communication
+
+### Pattern Summary
+
+| Pattern | Send Strategy | Recv Strategy | State Machine | Key Feature |
+|---------|--------------|---------------|---------------|-------------|
+| **PUSH** | Load balance | N/A | None | Fire-and-forget |
+| **PULL** | N/A | Fair queue | None | Collect from many |
+| **PUB** | Filtered multicast | N/A | None | Topic filtering |
+| **SUB** | N/A | Filtered recv | None | Subscriptions |
+| **REQ** | Load balance | From same pipe | Send→Recv | Correlation |
+| **REP** | To envelope pipe | Fair queue | Recv→Send | Auto-routing |
+| **DEALER** | Load balance | Fair queue | None | Async REQ |
+| **ROUTER** | By routing ID | Fair queue | None | Manual routing |
+| **PAIR** | Single pipe | Single pipe | None | 1:1 only |
 
 ### ROUTER Pattern
 
