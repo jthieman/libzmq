@@ -1826,7 +1826,173 @@ pub const PipeSet = struct {
 
 ## Pipe System
 
-A pipe represents the bidirectional connection between a socket and a peer (either remote via network, or local via inproc).
+A pipe represents the bidirectional connection between a socket and a peer (either remote via network, or local via inproc). This section describes ZZMQ's pipe architecture, which follows libzmq semantics while leveraging ZIO's coroutine model.
+
+### Core Design Decisions
+
+Based on analysis of libzmq's `pipe.cpp`, `ypipe.hpp`, `fq.cpp`, and `lb.cpp`:
+
+| Decision | libzmq | ZZMQ | Rationale |
+|----------|--------|------|-----------|
+| Queue contents | Frames | Frames | Enables streaming large multipart messages |
+| HWM enforcement | Counter check | Counter check | HWM counts messages, not frames |
+| Queue capacity | Unbounded (linked chunks) | Growable | "Unlimited" means unlimited |
+| Credit flow | Explicit commands | Implicit (blocking) | ZIO coroutines handle backpressure |
+| Flush semantics | Explicit flush() | Explicit flush() | Batching for throughput |
+
+### Frame vs Message: Why Frames Matter
+
+libzmq pipes store **frames**, not complete messages. This is critical for:
+
+1. **Streaming large messages** - A 1GB file sent as 1000 frames shouldn't be buffered entirely
+2. **Memory efficiency** - Process frames as they arrive
+3. **Latency** - Start work before complete message received
+4. **libzmq compatibility** - `ZMQ_RCVMORE` pattern is widely used
+
+```zig
+// Low-level API: frame streaming (matches libzmq)
+while (true) {
+    const frame = try socket.recvFrame(rt);
+    try processFrame(frame);
+    if (!frame.hasMore()) break;  // End of message
+}
+
+// High-level API: convenience aggregation
+const msg = try socket.recv(rt);  // Returns complete MultipartMessage
+defer msg.deinit();
+```
+
+### HWM Semantics (libzmq Reference)
+
+From `src/pipe.cpp:533-538`:
+```cpp
+bool zmq::pipe_t::check_hwm () const {
+    const bool full = _hwm > 0 && _msgs_written - _peers_msgs_read >= uint64_t(_hwm);
+    return !full;
+}
+```
+
+From `src/pipe.cpp:198-199` - HWM counts **complete messages**:
+```cpp
+if (!(msg_->flags () & msg_t::more) && !msg_->is_routing_id ())
+    _msgs_read++;
+```
+
+**Key behaviors:**
+- Default HWM = 1000 per direction
+- HWM = 0 means **unlimited** (truly unbounded)
+- HWM counts complete messages, not individual frames
+- Per-pipe HWM (each connection independent)
+- Inproc: HWM = sender's sndhwm + receiver's rcvhwm
+
+### Growable Frame Queue
+
+Unlike fixed-capacity channels, ZZMQ uses growable queues to support truly unlimited HWM:
+
+```zig
+/// Growable frame queue - allocates in chunks like libzmq's ypipe
+pub const FrameQueue = struct {
+    /// Linked list of frame chunks
+    chunks: ChunkList,
+    allocator: Allocator,
+
+    /// Read/write positions
+    head: usize = 0,
+    tail: usize = 0,
+
+    /// Signaling for async operations
+    readable: zio.Notify = .{},
+
+    /// Closed flag
+    closed: bool = false,
+
+    /// Like libzmq's message_pipe_granularity = 256
+    pub const chunk_size = 256;
+
+    pub const Chunk = struct {
+        frames: [chunk_size]Frame,
+        next: ?*Chunk = null,
+    };
+
+    const ChunkList = struct {
+        first: ?*Chunk = null,
+        last: ?*Chunk = null,
+        count: usize = 0,
+    };
+
+    pub fn init(allocator: Allocator) FrameQueue {
+        return .{ .chunks = .{}, .allocator = allocator };
+    }
+
+    /// Enqueue a frame - grows as needed (truly unbounded)
+    pub fn enqueue(self: *FrameQueue, frame: Frame) !void {
+        if (self.closed) return error.QueueClosed;
+
+        // Allocate new chunk if needed
+        if (self.needsNewChunk()) {
+            const chunk = try self.allocator.create(Chunk);
+            chunk.* = .{ .frames = undefined, .next = null };
+
+            if (self.chunks.last) |last| {
+                last.next = chunk;
+            } else {
+                self.chunks.first = chunk;
+            }
+            self.chunks.last = chunk;
+            self.chunks.count += 1;
+        }
+
+        // Write frame
+        self.writeFrame(frame);
+    }
+
+    /// Dequeue a frame - blocks if empty
+    pub fn dequeue(self: *FrameQueue, rt: *zio.Runtime) !Frame {
+        while (self.isEmpty() and !self.closed) {
+            try self.readable.wait(rt);
+        }
+
+        if (self.isEmpty()) return error.QueueClosed;
+        return self.readFrame();
+    }
+
+    /// Non-blocking dequeue
+    pub fn tryDequeue(self: *FrameQueue) ?Frame {
+        if (self.isEmpty()) return null;
+        return self.readFrame();
+    }
+
+    /// Signal that data is available (called after flush)
+    pub fn signal(self: *FrameQueue) void {
+        self.readable.set();
+    }
+
+    /// Close the queue
+    pub fn close(self: *FrameQueue) void {
+        self.closed = true;
+        self.readable.set();  // Wake any waiters
+    }
+
+    pub fn isEmpty(self: *FrameQueue) bool {
+        return self.head == self.tail;
+    }
+
+    pub fn deinit(self: *FrameQueue) void {
+        // Free all chunks
+        var chunk = self.chunks.first;
+        while (chunk) |c| {
+            const next = c.next;
+            self.allocator.destroy(c);
+            chunk = next;
+        }
+    }
+
+    // ... internal helpers
+    fn needsNewChunk(self: *FrameQueue) bool { ... }
+    fn writeFrame(self: *FrameQueue, frame: Frame) void { ... }
+    fn readFrame(self: *FrameQueue) Frame { ... }
+};
+```
 
 ### Pipe Structure
 
@@ -1834,33 +2000,65 @@ A pipe represents the bidirectional connection between a socket and a peer (eith
 pub const Pipe = struct {
     id: PipeId,
 
-    /// Channel: socket → engine (outbound messages)
-    /// Capacity = send HWM
-    outbound: *zio.Channel(Message),
+    // === Frame Queues (growable, truly unbounded) ===
 
-    /// Channel: engine → socket (inbound messages)
-    /// Capacity = recv HWM
-    inbound: *zio.Channel(Message),
+    /// Frames from socket to engine (outbound)
+    outbound: FrameQueue,
+
+    /// Frames from engine to socket (inbound)
+    inbound: FrameQueue,
+
+    // === HWM Tracking (counter-based, separate from queue capacity) ===
+
+    /// Complete messages written to outbound (for send HWM)
+    msgs_written: u64 = 0,
+
+    /// Complete messages read from inbound (for recv HWM)
+    msgs_read: u64 = 0,
+
+    /// Last known peer read count (for credit flow)
+    peers_msgs_read: u64 = 0,
+
+    /// Configured HWM (null = unlimited)
+    send_hwm: ?u32,
+    recv_hwm: ?u32,
+
+    // === Multipart State ===
+
+    /// Frames in current outbound multipart (not yet complete)
+    outbound_multipart_frames: u32 = 0,
+
+    /// Currently receiving a multipart message
+    inbound_multipart_active: bool = false,
+
+    // === Flush State ===
+
+    /// Frames written since last flush
+    unflushed_frames: u32 = 0,
+
+    // === Metadata ===
 
     /// Peer identity (assigned during handshake or by ROUTER)
-    routing_id: ?RoutingId,
+    routing_id: ?RoutingId = null,
 
     /// Associated engine (null for inproc)
-    engine: ?*Engine,
+    engine: ?*Engine = null,
 
-    /// State
-    state: State,
+    /// Pipe state
+    state: State = .active,
 
     /// Statistics
-    stats: Stats,
+    stats: Stats = .{},
 
-    /// Options snapshot (from socket at creation time)
+    /// Options
     options: PipeOptions,
+
+    // === Types ===
 
     const State = enum {
         active,
-        draining_outbound,  // Closing, flushing sends
-        draining_inbound,   // Peer closing, receiving remaining
+        closing,        // Graceful shutdown initiated
+        draining,       // Flushing remaining frames
         closed,
     };
 
@@ -1869,66 +2067,152 @@ pub const Pipe = struct {
         messages_recv: u64 = 0,
         bytes_sent: u64 = 0,
         bytes_recv: u64 = 0,
+        frames_sent: u64 = 0,
+        frames_recv: u64 = 0,
     };
 
     const PipeOptions = struct {
-        send_hwm: u32,
-        recv_hwm: u32,
-        conflate: bool,
+        conflate: bool = false,
+        // LWM for credit batching (default: HWM/2)
+        lwm_divisor: u32 = 2,
     };
 
-    /// Write message to outbound channel (socket → network)
-    /// Suspends if channel full (HWM backpressure)
-    pub fn write(self: *Pipe, rt: *zio.Runtime, msg: Message) !void {
-        if (self.state != .active) return error.PipeClosed;
+    // === HWM Enforcement ===
 
-        if (self.options.conflate) {
-            // Conflate mode: replace any pending message
-            _ = self.outbound.tryReceive() catch {};
-        }
-
-        try self.outbound.send(rt, msg);
-        self.stats.messages_sent += 1;
-        self.stats.bytes_sent += msg.len();
+    /// Check if we can start a new message (HWM not reached)
+    /// Called BEFORE writing first frame of a message
+    pub fn canStartMessage(self: *Pipe) bool {
+        const hwm = self.send_hwm orelse return true;  // Unlimited
+        return self.msgs_written - self.peers_msgs_read < hwm;
     }
 
-    /// Try to write without blocking
-    pub fn tryWrite(self: *Pipe, msg: Message) !bool {
+    /// Check if HWM is reached (for pattern logic)
+    pub fn isHwmReached(self: *Pipe) bool {
+        return !self.canStartMessage();
+    }
+
+    // === Frame Writing (Socket → Engine) ===
+
+    /// Write a single frame to the pipe
+    /// For multipart: write all frames, then call flush()
+    pub fn writeFrame(self: *Pipe, frame: Frame) !void {
         if (self.state != .active) return error.PipeClosed;
 
-        if (self.options.conflate) {
-            _ = self.outbound.tryReceive() catch {};
+        try self.outbound.enqueue(frame);
+        self.outbound_multipart_frames += 1;
+        self.unflushed_frames += 1;
+        self.stats.frames_sent += 1;
+        self.stats.bytes_sent += frame.data.len;
+
+        // Track message completion
+        if (!frame.flags.more) {
+            self.msgs_written += 1;
+            self.stats.messages_sent += 1;
+            self.outbound_multipart_frames = 0;
+        }
+    }
+
+    /// Write a complete multipart message atomically
+    pub fn writeMessage(self: *Pipe, msg: MultipartMessage) !void {
+        if (self.state != .active) return error.PipeClosed;
+
+        // HWM check before starting
+        if (!self.canStartMessage()) {
+            return error.HighWaterMark;
         }
 
-        self.outbound.trySend(msg) catch |err| switch (err) {
-            error.ChannelFull => return false,
-            else => return err,
+        // Write all frames
+        for (msg.frames, 0..) |frame, i| {
+            var f = frame;
+            f.flags.more = (i < msg.frames.len - 1);
+            try self.writeFrame(f);
+        }
+
+        // Flush to make visible to engine
+        self.flush();
+    }
+
+    /// Flush written frames to make them visible to reader
+    /// Like libzmq's pipe_t::flush()
+    pub fn flush(self: *Pipe) void {
+        if (self.unflushed_frames > 0) {
+            self.outbound.signal();  // Wake engine reader
+            self.unflushed_frames = 0;
+        }
+    }
+
+    /// Rollback incomplete multipart (discard unflushed frames)
+    /// Like libzmq's pipe_t::rollback()
+    pub fn rollback(self: *Pipe) void {
+        // Remove frames from current incomplete multipart
+        while (self.outbound_multipart_frames > 0) {
+            if (self.outbound.tryDequeue()) |frame| {
+                frame.deinit();
+                self.outbound_multipart_frames -= 1;
+                self.unflushed_frames -|= 1;
+            } else break;
+        }
+    }
+
+    // === Frame Reading (Engine → Socket) ===
+
+    /// Read a single frame (for streaming)
+    pub fn readFrame(self: *Pipe, rt: *zio.Runtime) !Frame {
+        const frame = try self.inbound.dequeue(rt);
+        self.stats.frames_recv += 1;
+        self.stats.bytes_recv += frame.data.len;
+
+        // Track message completion for stats
+        if (!frame.flags.more) {
+            self.msgs_read += 1;
+            self.stats.messages_recv += 1;
+            self.inbound_multipart_active = false;
+
+            // Credit flow: notify peer every LWM messages
+            self.maybeSendCredit();
+        } else {
+            self.inbound_multipart_active = true;
+        }
+
+        return frame;
+    }
+
+    /// Read a complete multipart message (convenience)
+    pub fn readMessage(self: *Pipe, rt: *zio.Runtime, allocator: Allocator) !MultipartMessage {
+        var frames = std.ArrayList(Frame).init(allocator);
+        errdefer {
+            for (frames.items) |f| f.deinit();
+            frames.deinit();
+        }
+
+        while (true) {
+            const frame = try self.readFrame(rt);
+            try frames.append(frame);
+            if (!frame.flags.more) break;
+        }
+
+        return MultipartMessage{
+            .frames = try frames.toOwnedSlice(),
+            .allocator = allocator,
         };
-
-        self.stats.messages_sent += 1;
-        self.stats.bytes_sent += msg.len();
-        return true;
-    }
-
-    /// Read message from inbound channel (network → socket)
-    /// Suspends if channel empty
-    pub fn read(self: *Pipe, rt: *zio.Runtime) !Message {
-        const msg = try self.inbound.receive(rt);
-        self.stats.messages_recv += 1;
-        self.stats.bytes_recv += msg.len();
-        return msg;
     }
 
     /// Try to read without blocking
-    pub fn tryRead(self: *Pipe) !?Message {
-        const msg = self.inbound.tryReceive() catch |err| switch (err) {
-            error.ChannelEmpty => return null,
-            error.ChannelClosed => return error.PipeClosed,
-            else => return err,
-        };
-        self.stats.messages_recv += 1;
-        self.stats.bytes_recv += msg.len();
-        return msg;
+    pub fn tryReadFrame(self: *Pipe) ?Frame {
+        const frame = self.inbound.tryDequeue() orelse return null;
+        self.stats.frames_recv += 1;
+        self.stats.bytes_recv += frame.data.len;
+
+        if (!frame.flags.more) {
+            self.msgs_read += 1;
+            self.stats.messages_recv += 1;
+            self.inbound_multipart_active = false;
+            self.maybeSendCredit();
+        } else {
+            self.inbound_multipart_active = true;
+        }
+
+        return frame;
     }
 
     /// Check if pipe has data to read
@@ -1936,125 +2220,297 @@ pub const Pipe = struct {
         return !self.inbound.isEmpty();
     }
 
-    /// Check if pipe can accept writes
-    pub fn canWrite(self: *Pipe) bool {
-        return self.state == .active and !self.outbound.isFull();
+    // === Credit Flow ===
+
+    /// Send credit to peer (batched at LWM intervals)
+    fn maybeSendCredit(self: *Pipe) void {
+        const hwm = self.recv_hwm orelse return;  // No credit for unlimited
+        const lwm = hwm / self.options.lwm_divisor;
+
+        if (lwm > 0 and self.msgs_read % lwm == 0) {
+            // In ZZMQ, credit is implicit via channel backpressure
+            // This is mainly for statistics/monitoring
+            // For explicit credit (future): self.sendCreditCommand()
+        }
     }
 
+    /// Update peer's read count (for HWM calculation)
+    pub fn updatePeerCredit(self: *Pipe, msgs_read: u64) void {
+        self.peers_msgs_read = msgs_read;
+    }
+
+    // === Lifecycle ===
+
     /// Begin graceful close
-    pub fn close(self: *Pipe, rt: *zio.Runtime) void {
+    pub fn beginClose(self: *Pipe) void {
         if (self.state != .active) return;
+        self.state = .closing;
 
-        self.state = .draining_outbound;
-        self.outbound.close(.graceful);
+        // Rollback any incomplete multipart
+        self.rollback();
 
-        // Engine will detect channel close and finish sending
+        // Close outbound (engine will drain then close)
+        self.outbound.close();
+    }
+
+    /// Force immediate close
+    pub fn forceClose(self: *Pipe) void {
+        self.state = .closed;
+        self.outbound.close();
+        self.inbound.close();
+    }
+
+    pub fn deinit(self: *Pipe, allocator: Allocator) void {
+        self.outbound.deinit();
+        self.inbound.deinit();
+        allocator.destroy(self);
     }
 };
 
 pub const PipeId = u32;
 ```
 
-### High Water Mark (HWM) - Comprehensive Design
+### HWM Modes: Per-Pipe vs Aggregate
 
-HWM is one of the most critical ZMQ semantics. This section details how ZZMQ implements HWM to match libzmq behavior.
-
-#### libzmq HWM Reference
-
-From `src/pipe.cpp:533-538`:
-```cpp
-bool zmq::pipe_t::check_hwm () const
-{
-    const bool full =
-      _hwm > 0 && _msgs_written - _peers_msgs_read >= uint64_t (_hwm);
-    return !full;
-}
-```
-
-Key libzmq behaviors:
-- Default HWM = 1000 (`src/options.cpp:168`)
-- HWM = 0 means **unlimited** (never blocks)
-- Inproc: HWM = sender's sndhwm + receiver's rcvhwm
-- TCP/IPC: Each side uses its own HWMs independently
-- HWM counts **complete messages**, not frames
-
-#### HWM Type Definition
+ZZMQ supports both libzmq-compatible per-pipe HWM and an additional aggregate mode:
 
 ```zig
-/// High water mark value
-/// null = unlimited (0 in libzmq)
-/// value = bounded capacity
-pub const Hwm = ?u32;
+pub const HwmMode = union(enum) {
+    /// Each pipe has independent HWM (libzmq default)
+    /// Total memory = HWM × num_peers
+    per_pipe: struct {
+        send: ?u32 = 1000,
+        recv: ?u32 = 1000,
+    },
 
-pub const HwmDefaults = struct {
-    pub const send: Hwm = 1000;
-    pub const recv: Hwm = 1000;
+    /// Shared HWM across all pipes (ZZMQ extension)
+    /// Bounds total memory regardless of peer count
+    aggregate: struct {
+        send_total: ?u32,
+        recv_total: ?u32,
+        tracker: *AggregateHwmTracker,
+    },
+
+    /// No limit (truly unlimited)
+    unlimited,
 };
 
-/// Convert libzmq-style HWM (0 = unlimited) to ZZMQ
-pub fn fromLibzmq(value: i32) Hwm {
-    return if (value <= 0) null else @intCast(value);
-}
+/// Tracks aggregate HWM across all pipes
+pub const AggregateHwmTracker = struct {
+    /// Total outstanding messages across all pipes
+    total_outstanding: Atomic(u64) = .{ .value = 0 },
 
-/// Convert ZZMQ HWM to libzmq-style
-pub fn toLibzmq(hwm: Hwm) i32 {
-    return hwm orelse 0;
-}
+    /// Configured limit
+    limit: ?u64,
+
+    /// Try to reserve a slot for a new message
+    pub fn tryReserve(self: *AggregateHwmTracker) bool {
+        const lim = self.limit orelse return true;  // Unlimited
+
+        while (true) {
+            const current = self.total_outstanding.load(.acquire);
+            if (current >= lim) return false;  // At limit
+
+            // Try to increment
+            if (self.total_outstanding.cmpxchgWeak(
+                current, current + 1, .acq_rel, .acquire
+            )) |_| {
+                continue;  // Retry
+            } else {
+                return true;  // Reserved
+            }
+        }
+    }
+
+    /// Release a slot when message is consumed
+    pub fn release(self: *AggregateHwmTracker) void {
+        _ = self.total_outstanding.fetchSub(1, .release);
+    }
+
+    /// Get current outstanding count
+    pub fn outstanding(self: *AggregateHwmTracker) u64 {
+        return self.total_outstanding.load(.acquire);
+    }
+};
 ```
 
-#### Channel Capacity from HWM
+**Use cases:**
+
+| Mode | Use Case | Trade-off |
+|------|----------|-----------|
+| Per-pipe (default) | Most applications, libzmq compat | Memory scales with connections |
+| Aggregate | Memory-constrained, many peers | One slow peer can impact others |
+| Unlimited | High-throughput, trusted peers | Risk of OOM |
+
+### Two-Tier Architecture: Comptime vs Runtime
+
+ZZMQ provides both compile-time optimized and runtime-flexible APIs:
 
 ```zig
-/// Calculate effective channel capacity
-/// For unlimited HWM, we use a large but finite buffer
-fn hwmToCapacity(hwm: Hwm) usize {
-    return hwm orelse std.math.maxInt(u32);  // ~4 billion for "unlimited"
+// ============================================
+// Tier 1: Comptime-Optimized (Zig users)
+// ============================================
+
+/// Comptime-configured pipe with optimizations
+pub fn TypedPipe(comptime config: PipeConfig) type {
+    return struct {
+        const Self = @This();
+
+        // Comptime-known HWM enables branch elimination
+        const send_hwm = config.send_hwm;
+        const recv_hwm = config.recv_hwm;
+
+        core: Pipe,
+
+        /// HWM check with comptime optimization
+        pub inline fn canStartMessage(self: *Self) bool {
+            if (send_hwm == null) {
+                // Comptime-known unlimited: no check needed
+                return true;
+            }
+            return self.core.canStartMessage();
+        }
+
+        /// Write with comptime-optimized HWM check
+        pub fn writeMessage(self: *Self, msg: MultipartMessage) !void {
+            if (send_hwm) |hwm| {
+                // Comptime-known bounded: inline check
+                if (self.core.msgs_written - self.core.peers_msgs_read >= hwm) {
+                    return error.HighWaterMark;
+                }
+            }
+            // else: comptime-known unlimited, check eliminated
+
+            try self.core.writeMessage(msg);
+        }
+    };
 }
 
-/// Alternative: truly unbounded using growable buffer
-/// (but this loses backpressure guarantees)
+pub const PipeConfig = struct {
+    send_hwm: ?u32 = 1000,
+    recv_hwm: ?u32 = 1000,
+    conflate: bool = false,
+};
+
+// Usage (Zig):
+const MyPipe = TypedPipe(.{ .send_hwm = 1000, .recv_hwm = null });
+var pipe: MyPipe = ...;
+
+// ============================================
+// Tier 2: Runtime-Flexible (C FFI, dynamic config)
+// ============================================
+
+/// Runtime-configured pipe
+pub const DynamicPipe = struct {
+    core: Pipe,
+
+    pub fn init(allocator: Allocator, config: DynamicPipeConfig) !*DynamicPipe {
+        const self = try allocator.create(DynamicPipe);
+        self.* = .{
+            .core = .{
+                .outbound = FrameQueue.init(allocator),
+                .inbound = FrameQueue.init(allocator),
+                .send_hwm = config.send_hwm,
+                .recv_hwm = config.recv_hwm,
+                .options = .{ .conflate = config.conflate },
+            },
+        };
+        return self;
+    }
+
+    /// Runtime HWM check
+    pub fn canStartMessage(self: *DynamicPipe) bool {
+        return self.core.canStartMessage();
+    }
+
+    /// Update HWM at runtime (for setsockopt)
+    pub fn setHwm(self: *DynamicPipe, send: ?u32, recv: ?u32) void {
+        self.core.send_hwm = send;
+        self.core.recv_hwm = recv;
+    }
+};
+
+pub const DynamicPipeConfig = struct {
+    send_hwm: ?u32 = 1000,
+    recv_hwm: ?u32 = 1000,
+    conflate: bool = false,
+};
+
+// C FFI wrapper:
+export fn zzmq_pipe_create(send_hwm: i32, recv_hwm: i32) ?*DynamicPipe {
+    const config = DynamicPipeConfig{
+        .send_hwm = if (send_hwm <= 0) null else @intCast(send_hwm),
+        .recv_hwm = if (recv_hwm <= 0) null else @intCast(recv_hwm),
+    };
+    return DynamicPipe.init(c_allocator, config) catch null;
+}
 ```
 
-**Design decision**: Even "unlimited" HWM uses a large finite buffer. This prevents:
-- Memory exhaustion from runaway producers
-- Provides eventual backpressure at extreme scales
-- Matches practical libzmq behavior (memory is finite)
+### Flush Semantics and Batching
 
-#### Inproc HWM Calculation
+Like libzmq, ZZMQ uses explicit flush for throughput optimization:
 
-From `src/socket_base.cpp:785-794`:
-```cpp
-// The total HWM for an inproc connection should be the sum of
-// the binder's HWM and the connector's HWM.
-const int sndhwm = peer.socket == NULL ? options.sndhwm
-                   : options.sndhwm != 0 && peer.options.rcvhwm != 0
-                     ? options.sndhwm + peer.options.rcvhwm
-                     : 0;
+```zig
+// Writer side (socket → pipe → engine)
+pub fn sendMultipart(socket: *Socket, frames: []const Frame) !void {
+    const pipe = socket.selectPipeForSend() orelse return error.NoRoute;
+
+    // HWM check before starting
+    if (!pipe.canStartMessage()) {
+        // Either block, drop, or return error based on pattern
+        return error.HighWaterMark;
+    }
+
+    // Write all frames (accumulates in pipe)
+    for (frames, 0..) |frame, i| {
+        var f = frame;
+        f.flags.more = (i < frames.len - 1);
+        try pipe.writeFrame(f);
+    }
+
+    // Flush to make visible to engine
+    // This is the only point that signals the reader
+    pipe.flush();
+}
+
+// Engine side (reads flushed frames)
+fn engineWriterLoop(engine: *Engine) !void {
+    while (engine.state == .ready) {
+        // Wait for flushed data
+        const frame = try engine.pipe.outbound.dequeue(engine.rt);
+
+        // Encode and send to network
+        try engine.sendZmtpFrame(frame);
+    }
+}
 ```
 
-**ZZMQ implementation:**
+**Why flush semantics matter:**
+- Batches signaling (one wake per message, not per frame)
+- Ensures multipart atomicity (all frames visible together)
+- Matches libzmq behavior exactly
+- Reduces context switch overhead
+
+### Inproc HWM Calculation
+
+For inproc connections, libzmq sums both sides' HWM:
 
 ```zig
 /// Calculate effective HWM for inproc connection
-/// libzmq sums both sides; if either is unlimited, total is unlimited
-fn calculateInprocHwm(
-    connector_send: Hwm,
-    binder_recv: Hwm,
-) Hwm {
-    // If either side is unlimited, total is unlimited
-    if (connector_send == null or binder_recv == null) {
-        return null;  // unlimited
-    }
-    // Sum both sides
-    return connector_send.? + binder_recv.?;
+/// libzmq: if either side is unlimited, total is unlimited
+/// otherwise: total = sender's sndhwm + receiver's rcvhwm
+pub fn calculateInprocHwm(sender_hwm: ?u32, receiver_hwm: ?u32) ?u32 {
+    const send = sender_hwm orelse return null;    // Unlimited
+    const recv = receiver_hwm orelse return null;  // Unlimited
+    return send + recv;
 }
 
 /// Create pipe pair for inproc connection
-fn createInprocPipePair(
-    allocator: std.mem.Allocator,
+pub fn createInprocPipePair(
+    allocator: Allocator,
     connector_opts: *const SocketOptions,
     binder_opts: *const SocketOptions,
-) !struct { connector_pipe: *Pipe, binder_pipe: *Pipe } {
+) !struct { connector: *Pipe, binder: *Pipe } {
     // Direction: connector → binder
     const c2b_hwm = calculateInprocHwm(
         connector_opts.send_hwm,
@@ -2067,430 +2523,145 @@ fn createInprocPipePair(
         connector_opts.recv_hwm,
     );
 
-    // Create channels with calculated capacities
-    const c2b_cap = hwmToCapacity(c2b_hwm);
-    const b2c_cap = hwmToCapacity(b2c_hwm);
+    // Create shared frame queues
+    var c2b_queue = FrameQueue.init(allocator);
+    var b2c_queue = FrameQueue.init(allocator);
 
-    const c2b_buf = try allocator.alloc(Message, c2b_cap);
-    const b2c_buf = try allocator.alloc(Message, b2c_cap);
-
-    // Connector's pipe: outbound=c2b, inbound=b2c
-    const connector_pipe = try allocator.create(Pipe);
-    connector_pipe.* = .{
-        .outbound = zio.Channel(Message).init(c2b_buf),
-        .inbound = zio.Channel(Message).init(b2c_buf),
-        .effective_send_hwm = c2b_hwm,
-        .effective_recv_hwm = b2c_hwm,
-        // Track peer's HWM for dynamic updates
-        .peer_send_hwm = binder_opts.send_hwm,
-        .peer_recv_hwm = binder_opts.recv_hwm,
+    // Connector's pipe
+    const connector = try allocator.create(Pipe);
+    connector.* = .{
+        .id = generatePipeId(),
+        .outbound = c2b_queue,
+        .inbound = b2c_queue,
+        .send_hwm = c2b_hwm,
+        .recv_hwm = b2c_hwm,
+        .options = .{},
     };
 
-    // Binder's pipe: shares same channels, reversed direction
-    const binder_pipe = try allocator.create(Pipe);
-    binder_pipe.* = .{
-        .outbound = zio.Channel(Message).init(b2c_buf),
-        .inbound = zio.Channel(Message).init(c2b_buf),
-        .effective_send_hwm = b2c_hwm,
-        .effective_recv_hwm = c2b_hwm,
-        .peer_send_hwm = connector_opts.send_hwm,
-        .peer_recv_hwm = connector_opts.recv_hwm,
+    // Binder's pipe (reversed queues)
+    const binder = try allocator.create(Pipe);
+    binder.* = .{
+        .id = generatePipeId(),
+        .outbound = b2c_queue,
+        .inbound = c2b_queue,
+        .send_hwm = b2c_hwm,
+        .recv_hwm = c2b_hwm,
+        .options = .{},
     };
 
-    return .{ .connector_pipe = connector_pipe, .binder_pipe = binder_pipe };
+    return .{ .connector = connector, .binder = binder };
 }
 ```
 
-#### TCP/IPC HWM (Non-Inproc)
+### Conflate Mode
 
-For TCP connections, each side uses its own HWM independently:
-
-```zig
-/// Create pipe for TCP/IPC connection
-/// Each side uses its own HWM (no summing)
-fn createTcpPipe(
-    allocator: std.mem.Allocator,
-    options: *const SocketOptions,
-) !*Pipe {
-    const send_cap = hwmToCapacity(options.send_hwm);
-    const recv_cap = hwmToCapacity(options.recv_hwm);
-
-    const send_buf = try allocator.alloc(Message, send_cap);
-    const recv_buf = try allocator.alloc(Message, recv_cap);
-
-    const pipe = try allocator.create(Pipe);
-    pipe.* = .{
-        .outbound = zio.Channel(Message).init(send_buf),
-        .inbound = zio.Channel(Message).init(recv_buf),
-        .effective_send_hwm = options.send_hwm,
-        .effective_recv_hwm = options.recv_hwm,
-        .peer_send_hwm = null,  // Unknown for TCP
-        .peer_recv_hwm = null,
-    };
-
-    return pipe;
-}
-```
-
-#### HWM Counts Complete Messages, Not Frames
-
-**Critical semantic**: A 10-frame multipart message counts as ONE message for HWM.
-
-From libzmq `src/pipe.cpp:198-199`:
-```cpp
-if (!(msg_->flags () & msg_t::more) && !msg_->is_routing_id ())
-    _msgs_read++;
-```
-
-**ZZMQ implementation:**
+libzmq's conflate mode keeps only the latest message:
 
 ```zig
-pub const Pipe = struct {
-    outbound: *zio.Channel(Message),
-    inbound: *zio.Channel(Message),
+/// Conflating frame queue - keeps only latest complete message
+pub const ConflatingFrameQueue = struct {
+    latest_message: ?[]Frame = null,
+    allocator: Allocator,
+    readable: zio.Notify = .{},
+    closed: bool = false,
 
-    /// Track messages written (for HWM, not frames)
-    msgs_written: u64 = 0,
-
-    /// Messages in current multipart (not counted until complete)
-    pending_multipart_count: u32 = 0,
-
-    /// Write message to pipe, respecting multipart HWM semantics
-    pub fn write(self: *Pipe, msg: Message, rt: *zio.Runtime) !void {
-        // Always write to channel (channel enforces backpressure)
-        try self.outbound.send(rt, msg);
-
-        // Track for HWM: only count complete messages
-        if (msg.flags.more) {
-            // Part of multipart - don't count yet
-            self.pending_multipart_count += 1;
-        } else {
-            // End of message (single or multipart)
-            // This counts as ONE message for HWM
-            self.msgs_written += 1;
-            self.pending_multipart_count = 0;
+    /// Enqueue overwrites any existing message
+    pub fn enqueue(self: *ConflatingFrameQueue, frames: []Frame) !void {
+        // Free old message
+        if (self.latest_message) |old| {
+            for (old) |f| f.deinit();
+            self.allocator.free(old);
         }
+
+        // Store new message
+        self.latest_message = try self.allocator.dupe(Frame, frames);
+        self.readable.set();
     }
 
-    /// Check if HWM allows writing
-    /// Note: This is for patterns that need to check before writing
-    pub fn canWrite(self: *Pipe) bool {
-        // If unlimited HWM, always writable
-        if (self.effective_send_hwm == null) return true;
+    /// Dequeue gets latest (and only) message
+    pub fn dequeue(self: *ConflatingFrameQueue, rt: *zio.Runtime) ![]Frame {
+        while (self.latest_message == null and !self.closed) {
+            try self.readable.wait(rt);
+        }
 
-        // Check channel capacity
-        return !self.outbound.isFull();
+        if (self.latest_message) |msg| {
+            self.latest_message = null;
+            return msg;
+        }
+
+        return error.QueueClosed;
     }
 };
 ```
 
-**Important**: The channel itself provides frame-level backpressure. The `msgs_written` counter is for statistics and compatibility, but the actual HWM enforcement happens at the channel level. Since multipart messages are written atomically (all frames or none), this works correctly.
-
-#### Dynamic HWM Updates
-
-libzmq allows changing HWM via `setsockopt` after connections exist:
-
-From `src/socket_base.cpp:1586-1588`:
-```cpp
-for (pipes_t::size_type i = 0; i != size; ++i) {
-    _pipes[i]->set_hwms (options.rcvhwm, options.sndhwm);
-    _pipes[i]->send_hwms_to_peer (options.sndhwm, options.rcvhwm);
-}
-```
-
-**ZZMQ challenge**: ZIO channels have fixed capacity at creation. Options:
-
-1. **Recreate channel** (disruptive, loses messages)
-2. **Track logical HWM separately** (channel may be larger than HWM)
-3. **Disallow dynamic HWM changes** (deviation from libzmq)
-
-**ZZMQ approach**: Track logical HWM separately from channel capacity:
-
-```zig
-pub const Pipe = struct {
-    outbound: *zio.Channel(Message),
-
-    /// Physical channel capacity (immutable)
-    channel_capacity: usize,
-
-    /// Logical HWM (can be changed dynamically)
-    effective_send_hwm: Hwm,
-
-    /// For inproc: peer's HWM for boost calculation
-    peer_recv_hwm: Hwm,
-
-    /// Check if logical HWM allows writing
-    pub fn checkLogicalHwm(self: *Pipe) bool {
-        const hwm = self.effective_send_hwm orelse return true;
-
-        // Count messages in channel (not frames)
-        // This requires tracking or counting
-        return self.outstandingMessages() < hwm;
-    }
-
-    /// Update HWM dynamically (for setsockopt)
-    pub fn setHwm(self: *Pipe, new_hwm: Hwm) void {
-        self.effective_send_hwm = new_hwm;
-        // Note: If new HWM > channel_capacity, we're limited by channel
-        // If new HWM < channel_capacity, logical HWM takes effect
-    }
-
-    /// Update peer's HWM (received via command from peer)
-    pub fn setPeerHwm(self: *Pipe, peer_send: Hwm, peer_recv: Hwm) void {
-        self.peer_recv_hwm = peer_recv;
-        // Recalculate effective HWM for inproc
-        self.effective_send_hwm = calculateInprocHwm(
-            self.local_send_hwm,
-            peer_recv,
-        );
-    }
-};
-```
-
-#### Conflate Mode (ZMQ_CONFLATE)
-
-libzmq's conflate mode keeps only the latest message, dropping older ones:
-
-From `src/pipe.cpp:26-27`:
-```cpp
-if (conflate_[0])
-    upipe1 = new (std::nothrow) ypipe_conflate_t ();
-```
-
-**ZZMQ implementation:**
-
-```zig
-/// Conflating channel - keeps only latest message
-pub fn ConflatingChannel(comptime T: type) type {
-    return struct {
-        latest: ?T = null,
-        mutex: std.Thread.Mutex = .{},
-        has_value: std.Thread.Condition = .{},
-        closed: bool = false,
-
-        const Self = @This();
-
-        /// Send overwrites any existing value
-        pub fn send(self: *Self, rt: *zio.Runtime, value: T) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            if (self.closed) return error.ChannelClosed;
-
-            // Drop old value if exists
-            if (self.latest) |*old| {
-                old.deinit();
-            }
-
-            self.latest = value;
-            self.has_value.signal();
-        }
-
-        /// Receive gets latest value (waits if none)
-        pub fn receive(self: *Self, rt: *zio.Runtime) !T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            while (self.latest == null and !self.closed) {
-                // Suspend via ZIO
-                self.has_value.wait(&self.mutex);
-            }
-
-            if (self.latest) |value| {
-                self.latest = null;
-                return value;
-            }
-
-            return error.ChannelClosed;
-        }
-    };
-}
-
-/// Create pipe with conflate support
-fn createPipe(
-    allocator: std.mem.Allocator,
-    options: *const SocketOptions,
-) !*Pipe {
-    if (options.conflate) {
-        // Conflating channels (capacity 1, overwrites)
-        return createConflatePipe(allocator);
-    } else {
-        // Normal bounded channels
-        return createNormalPipe(allocator, options);
-    }
-}
-```
-
-#### HWM Behavior Summary
-
-| Scenario | libzmq Behavior | ZZMQ Implementation |
-|----------|-----------------|---------------------|
-| Default HWM | 1000 | `HwmDefaults.send = 1000` |
-| HWM = 0 | Unlimited | `Hwm = null` |
-| Inproc HWM | Sum of both sides | `calculateInprocHwm()` |
-| TCP HWM | Each side independent | Use socket's own HWM |
-| HWM counting | Complete messages only | Track `msgs_written` on !more |
-| Dynamic HWM | Update via command | `setHwm()` + command to peer |
-| Conflate mode | Keep only latest | `ConflatingChannel` |
-| Either side unlimited | Total unlimited | `null` propagates |
-
-#### Channel Sizing: The HWM-to-Frames Problem
-
-**The Core Mismatch**:
-- **libzmq**: HWM counts complete messages; ypipe is unbounded (linked list of chunks)
-- **ZZMQ**: HWM counts complete messages; ZIO channel is bounded (fixed capacity)
-
-This creates a mapping problem: if HWM = 1000 messages, what should channel capacity be?
-
-**The Variables**:
-- `H` = HWM (complete messages, user-configured)
-- `F` = frames per message (varies: 1 for simple, 3+ for envelopes, 100+ for streaming)
-- `C` = channel capacity (frames, must be set at creation)
-
-**Constraint**: `C >= H * F_max` to avoid channel-full-before-HWM
-
-| Pattern | Typical F | HWM=1000 needs C= |
-|---------|-----------|-------------------|
-| PUSH/PULL simple | 1 | 1,000 |
-| REQ/REP with envelope | 3 | 3,000 |
-| ROUTER with routing | 2-4 | 4,000 |
-| Multipart streaming | 10-100 | 100,000 |
-
-**What happens when C is undersized?**
+### Data Flow Summary
 
 ```
-Scenario: HWM=1000, actual F=5, but C=1000 (sized for F=1)
+User send(MultipartMessage)
+         │
+         ▼
+┌─────────────────────────┐
+│   Pattern Logic         │  LoadBalancer/Router selects pipe
+│   (check canStartMsg)   │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   Pipe.writeFrame()     │  Accumulates frames
+│   (for each frame)      │  HWM tracked via counter
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   Pipe.flush()          │  Signals engine
+│                         │  Makes frames visible
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   FrameQueue            │  Growable storage
+│   (outbound)            │  No fixed capacity limit
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   Engine Writer         │  Dequeues frames
+│   Coroutine             │  Encodes ZMTP
+└───────────┬─────────────┘
+            │
+            ▼
+         Network
 
-After 200 messages (1000 frames): channel is FULL
-HWM says 800 more messages allowed, but channel blocks!
 
-Result: Effective HWM = 200 (not 1000) ← Violates user expectations
+         Network
+            │
+            ▼
+┌─────────────────────────┐
+│   Engine Reader         │  Decodes ZMTP
+│   Coroutine             │  Enqueues frames
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   FrameQueue            │  Growable storage
+│   (inbound)             │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   Pipe.readFrame()      │  Streaming API
+│   or Pipe.readMessage() │  Aggregating API
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│   Pattern Logic         │  FairQueue selects pipe
+│   (tracks multipart)    │  Sticks to pipe mid-message
+└───────────┬─────────────┘
+            │
+            ▼
+User recv() → Frame or MultipartMessage
 ```
-
-**ZZMQ Solution: Dual Backpressure**
-
-```zig
-pub const PipeConfig = struct {
-    /// HWM in complete messages (libzmq semantics)
-    hwm: ?u32 = 1000,
-
-    /// Safety limit on pending multipart frames
-    max_multipart_frames: u32 = 256,
-
-    /// Explicit channel capacity (null = auto-calculate)
-    channel_capacity: ?u32 = null,
-
-    /// Expected frames per message for auto-sizing
-    frames_per_message: u32 = 4,
-
-    /// Calculate channel capacity
-    pub fn effectiveChannelCapacity(self: PipeConfig) u32 {
-        if (self.channel_capacity) |explicit| {
-            return explicit;
-        }
-
-        const hwm = self.hwm orelse return 65536; // Unlimited: large default
-
-        // Formula: HWM * frames_per_msg * headroom
-        const headroom: u32 = 2;  // 2x for bursts
-        return hwm * self.frames_per_message * headroom;
-    }
-};
-```
-
-**Rigorous Pipe Implementation**:
-
-```zig
-pub const Pipe = struct {
-    outbound: *zio.Channel(Message),
-    pending_multipart: std.ArrayList(Message),
-
-    msgs_written: u64 = 0,
-    msgs_read_by_peer: u64 = 0,  // Updated via credit flow
-    config: PipeConfig,
-
-    pub fn write(self: *Pipe, msg: Message, rt: *zio.Runtime) !void {
-        // SAFETY: Limit pending multipart to prevent unbounded growth
-        if (self.pending_multipart.items.len >= self.config.max_multipart_frames) {
-            return error.MultipartTooLarge;
-        }
-
-        try self.pending_multipart.append(msg);
-
-        if (!msg.hasMore()) {
-            // Complete message - enforce HWM at message boundary
-            if (self.config.hwm) |hwm| {
-                while (self.outstandingMessages() >= hwm) {
-                    // Block until receiver drains (or drop for PUB)
-                    try self.waitForCredit(rt);
-                }
-            }
-
-            // Flush all frames to channel
-            // Note: channel.send() may also block if channel full (memory protection)
-            for (self.pending_multipart.items) |frame| {
-                try self.outbound.send(rt, frame);
-            }
-            self.pending_multipart.clearRetainingCapacity();
-            self.msgs_written += 1;
-        }
-    }
-
-    pub fn outstandingMessages(self: *Pipe) u64 {
-        return self.msgs_written - self.msgs_read_by_peer;
-    }
-};
-```
-
-**Two Independent Limits**:
-
-| Limit | Purpose | Blocks When |
-|-------|---------|-------------|
-| Channel capacity | Memory protection | Channel buffer full |
-| HWM counter | libzmq semantics | Message count exceeded |
-
-**Invariant**: Effective limit = min(channel_capacity / F, HWM)
-
-If channel fills before HWM (due to undersized capacity), sender blocks anyway—this is safe but suboptimal. Users with large multipart messages should increase `frames_per_message` or set explicit `channel_capacity`.
-
-**Sizing Guidelines**:
-
-| Use Case | HWM | frames_per_message | Recommended C |
-|----------|-----|-------------------|---------------|
-| High-throughput simple | 10000 | 1 | 20,000 |
-| REQ/REP broker | 1000 | 4 | 8,000 |
-| PUB/SUB fan-out | 1000 | 2 | 4,000 |
-| Multipart streaming | 100 | 32 | 6,400 |
-| Memory-constrained | 100 | 2 | 400 |
-
-#### Backpressure Flow
-
-```
-Socket.send()
-    │
-    ▼
-Pattern.send() ─── check canWrite() for pattern-specific logic
-    │
-    ▼
-Pipe.write()
-    │
-    ├── Channel has space? ─── Yes ──► Immediate write
-    │           │
-    │          No (HWM)
-    │           │
-    │           ▼
-    │   Coroutine suspends
-    │           │
-    │   Engine drains channel
-    │           │
-    │   Channel signals space
-    │           │
-    │   Coroutine resumes
-    │           │
-    └───────────┴──────────► Write completes
-```
-
-This matches libzmq's HWM semantics using ZIO's cooperative scheduling instead of lock-free queues + signaling.
 
 ---
 
@@ -2706,17 +2877,6 @@ fn recvWithTimeout(
     }
 }
 ```
-
-### Performance Characteristics
-
-| Scenario | Behavior |
-|----------|----------|
-| One pipe ready | O(1) - immediate return on first check |
-| All pipes empty | O(n) setup + suspend until any ready |
-| HWM backpressure | Coroutine suspends, zero CPU spin |
-| Many pipes (>8) | Falls back to polling or batched select |
-
-The key insight: ZIO's cooperative scheduling means "waiting" is just coroutine suspension. No busy-waiting, no kernel threads blocked.
 
 ---
 
@@ -3094,332 +3254,9 @@ pub const Engine = struct {
             self.shutdown_notify.set();  // Wake writer and heartbeat
         }
     }
-
-    /// Reader loop - sets state and signals on disconnect
-    fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
-        while (self.state == .ready) {
-            const n = self.stream.recv(rt, self.read_buf, .{}) catch |err| {
-                const reason: DisconnectReason = switch (err) {
-                    error.ConnectionReset, error.BrokenPipe => .peer_closed,
-                    error.Cancelled => return,  // Graceful cancel
-                    else => .protocol_error,
-                };
-                self.initiateShutdown(reason);
-                return;
-            };
-
-            if (n == 0) {
-                self.initiateShutdown(.peer_closed);
-                return;
-            }
-
-            // Process received data...
-            self.processInbound(self.read_buf[0..n]) catch |err| {
-                self.initiateShutdown(.protocol_error);
-                return;
-            };
-        }
-    }
-
-    /// Writer loop - uses select to wait on message OR shutdown
-    fn writerLoop(self: *Engine, rt: *zio.Runtime) void {
-        while (self.state == .ready) {
-            // Prepare async operations for select
-            var msg_op = self.pipe.outbound.asyncReceive();
-            var shutdown_op = self.shutdown_notify.asyncWait();
-
-            // Wait for either message or shutdown signal
-            const result = zio.select(rt, .{
-                .message = &msg_op,
-                .shutdown = &shutdown_op,
-            }) catch |err| {
-                if (err == error.Cancelled) return;
-                self.initiateShutdown(.protocol_error);
-                return;
-            };
-
-            switch (result) {
-                .message => |msg| {
-                    defer msg.deinit();
-
-                    // Double-check state before sending
-                    if (self.state != .ready) {
-                        // Re-queue if linger allows
-                        self.requeueForLinger(msg);
-                        return;
-                    }
-
-                    self.sendMessage(rt, msg) catch |err| {
-                        self.initiateShutdown(.protocol_error);
-                        return;
-                    };
-                },
-                .shutdown => {
-                    // Shutdown signal received - exit gracefully
-                    return;
-                },
-            }
-        }
-    }
-
-    /// Heartbeat loop - uses select for interruptible sleep
-    fn heartbeatLoop(self: *Engine, rt: *zio.Runtime) void {
-        const interval = self.heartbeat.interval orelse return;
-        const timeout = self.heartbeat.timeout;
-
-        while (self.state == .ready) {
-            // Interruptible sleep using select with timeout
-            var shutdown_op = self.shutdown_notify.asyncWait();
-            var timer_op = zio.async.sleep(Duration.fromMilliseconds(interval));
-
-            const result = zio.select(rt, .{
-                .shutdown = &shutdown_op,
-                .timer = &timer_op,
-            }) catch return;
-
-            switch (result) {
-                .shutdown => return,  // Shutdown during sleep
-                .timer => {
-                    // Check for timeout
-                    const now = rt.now();
-                    if (now.since(self.heartbeat.last_recv).toMilliseconds() > timeout) {
-                        self.initiateShutdown(.heartbeat_timeout);
-                        return;
-                    }
-
-                    // Send ping if needed
-                    if (now.since(self.heartbeat.last_send).toMilliseconds() > interval) {
-                        self.sendPing(rt) catch {
-                            self.initiateShutdown(.protocol_error);
-                            return;
-                        };
-                    }
-                },
-            }
-        }
-    }
-
-    fn requeueForLinger(self: *Engine, msg: Message) void {
-        if (self.session.linger_ms != 0) {
-            self.pipe.outbound.trySend(msg) catch {
-                // Queue full or closed - drop message
-            };
-        }
-    }
-};
 ```
 
-### Shutdown Cascade
-
-When shutdown is initiated, the cascade is:
-
-```
-1. Reader detects disconnect (or external close request)
-         ↓
-2. Reader calls initiateShutdown(reason)
-         ↓
-3. initiateShutdown sets state = .closing AND shutdown_notify.set()
-         ↓
-4. Writer's select() returns .shutdown (wakes immediately)
-         ↓
-5. Heartbeat's select() returns .shutdown (wakes immediately)
-         ↓
-6. All coroutines return → group.wait() completes
-         ↓
-7. Engine cleanup runs (deferred)
-```
-
-### Forceful Shutdown (linger=0)
-
-For immediate shutdown, use channel close plus group cancel:
-
-```zig
-pub fn forceShutdown(self: *Engine, rt: *zio.Runtime) void {
-    // Close channels - unblocks any pending receive/send
-    self.pipe.inbound.close();
-    self.pipe.outbound.close();
-
-    // Cancel group - terminates all coroutines at next yield point
-    self.group.cancel(rt);
-
-    // Wait for cleanup
-    self.group.wait(rt) catch {};
-}
-```
-
-### Linger with Deadline
-
-For timed linger, use cancellation shielding with deadline:
-
-```zig
-pub fn shutdownWithLinger(self: *Session, rt: *zio.Runtime, linger_ms: i32) void {
-    if (linger_ms == 0) {
-        // Immediate
-        self.engine.?.forceShutdown(rt);
-        return;
-    }
-
-    // Signal graceful shutdown
-    self.engine.?.initiateShutdown(.local_close);
-
-    if (linger_ms < 0) {
-        // Infinite linger - wait forever
-        self.engine.?.group.wait(rt) catch {};
-    } else {
-        // Timed linger - shield with deadline
-        rt.beginShield();
-        defer rt.endShield();
-
-        const deadline = rt.now().add(Duration.fromMilliseconds(@intCast(linger_ms)));
-
-        // Drain pending messages with deadline
-        while (self.engine.?.hasPendingOutput()) {
-            if (rt.now().compare(deadline) != .lt) {
-                break;  // Deadline exceeded
-            }
-            rt.yield() catch break;
-        }
-
-        // Force remaining
-        self.engine.?.forceShutdown(rt);
-    }
-}
-```
-
-### libzmq Command Mapping
-
-libzmq uses a mailbox system for inter-thread communication with 20+ command types. ZZMQ replaces most with simpler mechanisms:
-
-| libzmq Command | Purpose | ZZMQ Equivalent |
-|----------------|---------|-----------------|
-| `stop` | Terminate I/O thread | `group.cancel(rt)` |
-| `plug` | Register I/O object | Automatic (spawn into group) |
-| `own` | Notify about new object | Direct call (single-threaded) |
-| `attach` | Attach engine to session | Direct assignment |
-| `bind` | Establish pipe | Direct call + channel creation |
-| `activate_read` | Signal data available | ZIO channel (implicit) |
-| `activate_write` | Credit flow - msgs read | ZIO bounded channel (implicit) |
-| `hiccup` | Reconnection handling | Connector state machine |
-| `pipe_term` | Request pipe termination | `shutdown_notify.set()` |
-| `pipe_term_ack` | Acknowledge termination | `group.wait()` completion |
-| `pipe_hwm` | Modify HWM | `options.send_hwm` change |
-| `term_req` | Request shutdown | `initiateShutdown()` |
-| `term` | Start shutdown (with linger) | `shutdownWithLinger()` |
-| `term_ack` | Acknowledge shutdown | Coroutine return |
-| `term_endpoint` | Disconnect endpoint | Direct call |
-| `reap` / `reaped` | Socket deallocation | Zig `defer` + `deinit()` |
-| `pipe_peer_stats` | Monitoring stats | `monitor.broadcast()` |
-| `done` | All sockets deallocated | Context deinit completion |
-
-### Credit Flow (HWM)
-
-libzmq implements HWM credit flow with `activate_read`/`activate_write` commands:
-
-```cpp
-// libzmq: Reader tells writer how many messages read
-struct { uint64_t msgs_read; } activate_write;
-```
-
-ZZMQ uses ZIO bounded channels which handle this automatically:
-
-```zig
-// Channel blocks sender when full (HWM reached)
-// Unblocks when receiver takes a message
-const channel = try zio.Channel(Message).init(rt, hwm);
-
-// Sender blocks when at HWM
-try channel.send(rt, msg);  // Blocks if channel full
-
-// Receiver automatically "credits" by consuming
-const msg = try channel.receive(rt);  // Unblocks a sender
-```
-
-The key difference: libzmq must explicitly signal credit because it's poll-based. ZIO channels provide implicit credit through blocking semantics.
-
-### Pipe Termination Protocol
-
-libzmq uses a two-phase handshake (`pipe_term` / `pipe_term_ack`) to ensure both ends clean up properly:
-
-```
-Reader → Writer: pipe_term (please close your end)
-Writer → Reader: pipe_term_ack (I'm done)
-```
-
-ZZMQ uses group coordination instead:
-
-```zig
-pub const Pipe = struct {
-    inbound: zio.Channel(Message),
-    outbound: zio.Channel(Message),
-    state: PipeState = .active,
-
-    const PipeState = enum {
-        active,
-        closing,      // Initiated termination
-        draining,     // Flushing remaining messages
-        closed,
-    };
-
-    pub fn initiateClose(self: *Pipe) void {
-        self.state = .closing;
-        // Don't close channels yet - allow draining
-    }
-
-    pub fn drain(self: *Pipe, rt: *zio.Runtime) void {
-        self.state = .draining;
-
-        // Flush outbound messages
-        while (self.outbound.tryReceive()) |msg| {
-            // Send to peer (best effort)
-            _ = msg;  // Actual send logic
-        }
-
-        // Close channels
-        self.inbound.close();
-        self.outbound.close();
-        self.state = .closed;
-    }
-};
-```
-
-### Monitoring Events
-
-libzmq uses `pipe_peer_stats` / `pipe_stats_publish` commands for monitoring. ZZMQ uses `BroadcastChannel`:
-
-```zig
-// Engine emits events
-fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
-    // ... on disconnect:
-    self.socket.monitor.?.broadcast(MonitorEvent{
-        .event = .disconnected,
-        .endpoint = self.endpoint,
-        .value = @intFromEnum(self.disconnect_reason.?),
-    });
-}
-
-// Socket close emits event
-fn close(self: *Socket, rt: *zio.Runtime) void {
-    self.monitor.?.broadcast(MonitorEvent{
-        .event = .closed,
-        .endpoint = null,
-        .value = 0,
-    });
-    // ...
-}
-```
-
-### Summary: Why This Design Works
-
-| Aspect | libzmq Challenge | ZZMQ Solution |
-|--------|------------------|---------------|
-| Cross-thread wake | eventfd/pipe signaler | `zio.Notify` |
-| Multiple wait sources | `poll()` on multiple fds | `zio.select()` |
-| Credit flow | Explicit commands | Bounded channel (implicit) |
-| Ordered shutdown | Command sequence | `initiateShutdown()` + `group.wait()` |
-| Linger timeout | Timer callback | Shield + deadline loop |
-| State coordination | Atomic flags + mutex | State enum (single-threaded) |
-
-**Key insight:** libzmq's complexity comes from multi-threaded poll-based I/O. ZZMQ's single-threaded coroutine model with ZIO primitives (Notify, select, bounded channels) provides equivalent functionality with simpler, more explicit code.
+*(Full State Change Propagation content continues in the existing section below)*
 
 ---
 
@@ -3497,254 +3334,46 @@ pub const Connector = struct {
         disconnected,
         connecting,
         connected,
-        reconnecting,
+        terminating,
     };
 
-    const ReconnectState = struct {
-        attempt: u32 = 0,
-        interval: u64,       // Current interval (ms)
-        interval_min: u64,   // ZMQ_RECONNECT_IVL
-        interval_max: u64,   // ZMQ_RECONNECT_IVL_MAX
-
-        fn nextDelay(self: *ReconnectState) u64 {
-            const delay = self.interval;
-
-            // Exponential backoff
-            self.interval = @min(self.interval * 2, self.interval_max);
-            self.attempt += 1;
-
-            // Add jitter (±25%)
-            const jitter = delay / 4;
-            const rand = std.crypto.random.int(u64) % (jitter * 2);
-            return delay - jitter + rand;
-        }
-
-        fn reset(self: *ReconnectState) void {
-            self.attempt = 0;
-            self.interval = self.interval_min;
-        }
-    };
-
-    /// Connection loop coroutine
     pub fn run(self: *Connector, rt: *zio.Runtime) void {
-        while (self.state != .disconnected) {
-            // Attempt connection
+        while (self.state != .terminating) {
             self.state = .connecting;
 
+            // Attempt connection
             const stream = self.endpoint.connect(rt) catch |err| {
-                self.handleConnectFailure(rt, err);
+                self.handleConnectError(rt, err);
                 continue;
             };
 
-            // Connection succeeded
-            self.reconnect.reset();
-            self.state = .connected;
-
-            const engine = Engine.create(self.socket, stream, .client) catch |err| {
+            // Create engine
+            self.engine = Engine.create(self.socket, stream, .client) catch |err| {
                 stream.close(rt);
-                self.handleConnectFailure(rt, err);
+                self.scheduleReconnect(rt);
                 continue;
             };
 
-            self.engine = engine;
+            self.state = .connected;
+            self.reconnect.reset();
 
             // Run engine (blocks until disconnect)
-            engine.run(rt);
+            self.engine.?.run(rt);
 
-            // Engine finished (disconnect)
+            // Engine exited
+            self.engine.?.destroy();
             self.engine = null;
-            engine.destroy();
 
-            if (self.state == .disconnected) break;
-
-            // Reconnect with backoff
-            self.state = .reconnecting;
-            const delay = self.reconnect.nextDelay();
-            zio.time.sleep(rt, .fromMilliseconds(delay)) catch break;
+            if (self.state != .terminating) {
+                self.scheduleReconnect(rt);
+            }
         }
     }
 
-    fn handleConnectFailure(self: *Connector, rt: *zio.Runtime, err: anyerror) void {
-        // Log, notify monitor, schedule retry
-        const delay = self.reconnect.nextDelay();
-        zio.time.sleep(rt, .fromMilliseconds(delay)) catch {};
-    }
-
-    pub fn disconnect(self: *Connector) void {
+    fn scheduleReconnect(self: *Connector, rt: *zio.Runtime) void {
         self.state = .disconnected;
-        if (self.engine) |e| e.stop();
-    }
-};
-```
-
-### Engine (ZMTP protocol handler)
-
-```zig
-pub const Engine = struct {
-    /// The pipe this engine serves
-    pipe: *Pipe,
-
-    /// Network stream
-    stream: zio.net.Stream,
-
-    /// ZMTP codec state
-    codec: ZmtpCodec,
-
-    /// Role (affects handshake)
-    role: Role,
-
-    /// State
-    state: State,
-
-    /// Heartbeat state
-    heartbeat: HeartbeatState,
-
-    /// Group for reader/writer coroutines
-    group: zio.Group,
-
-    const Role = enum { client, server };
-
-    const State = enum {
-        handshaking,
-        ready,
-        closing,
-        closed,
-    };
-
-    const HeartbeatState = struct {
-        interval: ?u64,       // ZMQ_HEARTBEAT_IVL (ms)
-        timeout: u64,         // ZMQ_HEARTBEAT_TIMEOUT (ms)
-        ttl: u64,             // ZMQ_HEARTBEAT_TTL (ms)
-        last_recv: i64,       // Timestamp of last recv
-        last_send: i64,       // Timestamp of last send
-    };
-
-    pub fn run(self: *Engine, rt: *zio.Runtime) void {
-        defer self.cleanup(rt);
-
-        // Perform ZMTP handshake
-        self.performHandshake(rt) catch |err| {
-            self.handleError(err);
-            return;
-        };
-
-        self.state = .ready;
-
-        // Spawn reader and writer coroutines
-        self.group.spawn(rt, Engine.readerLoop, .{ self, rt }) catch return;
-        self.group.spawn(rt, Engine.writerLoop, .{ self, rt }) catch return;
-
-        if (self.heartbeat.interval) |_| {
-            self.group.spawn(rt, Engine.heartbeatLoop, .{ self, rt }) catch return;
-        }
-
-        // Wait for all to finish
-        self.group.wait(rt);
-    }
-
-    /// Reader: network → inbound channel
-    fn readerLoop(self: *Engine, rt: *zio.Runtime) void {
-        var read_buf: [65536]u8 = undefined;
-
-        while (self.state == .ready) {
-            // Read from network (ZIO stream.recv API)
-            const n = self.stream.recv(rt, &read_buf, .{
-                .deadline = self.readDeadline(rt),
-            }) catch |err| {
-                self.handleReadError(err);
-                break;
-            };
-
-            if (n == 0) {
-                // EOF - peer closed
-                break;
-            }
-
-            self.heartbeat.last_recv = rt.now();
-
-            // Decode ZMTP frames
-            var offset: usize = 0;
-            while (offset < n) {
-                const frame = self.codec.decode(read_buf[offset..n]) catch |err| {
-                    self.handleProtocolError(err);
-                    break;
-                } orelse break;  // Need more data
-
-                offset += frame.consumed;
-
-                switch (frame.type) {
-                    .message => {
-                        // Write to inbound channel
-                        self.pipe.inbound.send(rt, frame.message) catch |err| {
-                            self.handleChannelError(err);
-                            break;
-                        };
-                    },
-                    .command => {
-                        self.handleCommand(frame.command);
-                    },
-                }
-            }
-        }
-    }
-
-    /// Writer: outbound channel → network
-    fn writerLoop(self: *Engine, rt: *zio.Runtime) void {
-        var write_buf: [65536]u8 = undefined;
-
-        while (self.state == .ready) {
-            // Read from outbound channel
-            const msg = self.pipe.outbound.receive(rt) catch |err| switch (err) {
-                error.ChannelClosed => break,  // Pipe closing
-                else => {
-                    self.handleChannelError(err);
-                    break;
-                },
-            };
-            defer msg.deinit();
-
-            // Encode to ZMTP
-            const encoded = self.codec.encode(&write_buf, msg) catch |err| {
-                self.handleProtocolError(err);
-                break;
-            };
-
-            // Write to network (ZIO stream.sendAll API)
-            self.stream.sendAll(rt, encoded, .{}) catch |err| {
-                self.handleWriteError(err);
-                break;
-            };
-
-            self.heartbeat.last_send = rt.now();
-        }
-    }
-
-    /// Heartbeat: periodic PING/PONG
-    fn heartbeatLoop(self: *Engine, rt: *zio.Runtime) void {
-        const interval = self.heartbeat.interval orelse return;
-
-        while (self.state == .ready) {
-            rt.sleep(Duration.fromMilliseconds(interval)) catch break;
-
-            // Check for timeout
-            const now = rt.now();
-            const since_recv = now.since(self.heartbeat.last_recv);
-            if (since_recv.toMilliseconds() > self.heartbeat.timeout) {
-                self.handleTimeout();
-                break;
-            }
-
-            // Send PING if needed
-            const since_send = now.since(self.heartbeat.last_send);
-            if (since_send.toMilliseconds() > interval) {
-                self.sendCommand(.ping) catch break;
-            }
-        }
-    }
-
-    fn stop(self: *Engine, rt: *zio.Runtime) void {
-        self.state = .closing;
-        self.group.cancel(rt);
+        const delay = self.reconnect.nextDelay();
+        rt.sleep(Duration.fromMilliseconds(delay)) catch return;
     }
 };
 ```
