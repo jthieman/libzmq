@@ -5731,95 +5731,558 @@ try zzmq.proxy(&frontend, &backend, &capture);
 
 ## Options and Configuration
 
-### Socket Options (libzmq compatible)
+### Socket Options Reference
+
+Complete list of socket options with libzmq compatibility notes.
+
+#### High Water Marks
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `send_hwm` | u32 | 1000 | Send high water mark (messages) |
+| `recv_hwm` | u32 | 1000 | Receive high water mark (messages) |
+| `maxmsgsize` | i64 | -1 | Max message size (-1 = no limit) |
+
+```zig
+try socket.setOption(.send_hwm, 100);
+try socket.setOption(.recv_hwm, 100);
+try socket.setOption(.maxmsgsize, 1024 * 1024);  // 1MB max
+```
+
+#### Timeouts
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `send_timeout` | i32 | -1 | Send timeout in ms (-1 = infinite) |
+| `recv_timeout` | i32 | -1 | Receive timeout in ms (-1 = infinite) |
+| `connect_timeout` | u32 | 0 | Connection timeout in ms (0 = no timeout) |
+| `handshake_ivl` | u32 | 30000 | ZMTP handshake timeout in ms |
+
+```zig
+try socket.setOption(.send_timeout, 5000);  // 5 second timeout
+try socket.setOption(.recv_timeout, 5000);
+try socket.setOption(.connect_timeout, 3000);  // 3s connect timeout
+```
+
+#### Connection Lifecycle
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `linger` | i32 | -1 | Linger time on close (-1 = infinite, 0 = drop) |
+| `reconnect_ivl` | u32 | 100 | Initial reconnect interval in ms |
+| `reconnect_ivl_max` | u32 | 0 | Max reconnect interval (0 = no max, use exponential) |
+| `backlog` | u32 | 100 | Listen backlog for TCP |
+| `immediate` | bool | false | Only queue to completed connections |
+
+```zig
+try socket.setOption(.linger, 1000);  // Wait 1s for pending messages
+try socket.setOption(.reconnect_ivl, 100);
+try socket.setOption(.reconnect_ivl_max, 30000);  // Cap at 30s
+try socket.setOption(.immediate, true);  // Don't queue until connected
+```
+
+#### Identity and Routing
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `routing_id` | []u8 | null | Socket identity (1-255 bytes) |
+| `connect_routing_id` | []u8 | null | Set routing ID for next connect() |
+| `probe_router` | bool | false | Send empty message on connect (DEALER) |
+| `router_mandatory` | bool | false | Error if routing ID not found (ROUTER) |
+| `router_handover` | bool | false | Take over existing routing ID (ROUTER) |
+
+```zig
+try socket.setOption(.routing_id, "worker-1");
+try socket.setOption(.router_mandatory, true);
+```
+
+#### Heartbeat (ZMTP keepalive)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `heartbeat_ivl` | u32 | 0 | Heartbeat interval in ms (0 = disabled) |
+| `heartbeat_timeout` | u32 | 0 | Heartbeat timeout (default: ivl * 2) |
+| `heartbeat_ttl` | u32 | 0 | Heartbeat TTL for remote peer |
+
+```zig
+try socket.setOption(.heartbeat_ivl, 10000);     // Ping every 10s
+try socket.setOption(.heartbeat_timeout, 30000); // 30s timeout
+```
+
+#### Pattern-Specific Options
+
+| Option | Patterns | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `subscribe` | SUB, XSUB | []u8 | - | Subscribe to topic prefix |
+| `unsubscribe` | SUB, XSUB | []u8 | - | Unsubscribe from topic |
+| `req_relaxed` | REQ | bool | false | Allow out-of-order recv |
+| `req_correlate` | REQ | bool | false | Match replies by request ID |
+| `conflate` | PULL, SUB, DEALER | bool | false | Keep only last message |
+| `invert_matching` | XPUB, PUB | bool | false | Invert subscription matching |
+| `xpub_verbose` | XPUB | bool | false | Pass all subscriptions |
+| `xpub_manual` | XPUB | bool | false | Manual subscription handling |
+
+```zig
+// SUB socket
+try socket.setOption(.subscribe, "topic.");
+try socket.setOption(.subscribe, "");  // Subscribe to all
+
+// REQ socket - relaxed mode
+try socket.setOption(.req_relaxed, true);
+try socket.setOption(.req_correlate, true);
+
+// Conflate - keep only latest
+try socket.setOption(.conflate, true);
+```
+
+#### TCP Tuning
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `tcp_keepalive` | i32 | -1 | OS keepalive (-1 = OS default, 0 = off, 1 = on) |
+| `tcp_keepalive_idle` | i32 | -1 | Idle time before keepalive |
+| `tcp_keepalive_cnt` | i32 | -1 | Keepalive probe count |
+| `tcp_keepalive_intvl` | i32 | -1 | Keepalive probe interval |
+| `sndbuf` | i32 | -1 | OS send buffer size (-1 = OS default) |
+| `rcvbuf` | i32 | -1 | OS receive buffer size |
+| `tos` | i32 | 0 | IP Type of Service |
+| `ipv6` | bool | false | Prefer IPv6 |
+
+```zig
+try socket.setOption(.tcp_keepalive, 1);
+try socket.setOption(.tcp_keepalive_idle, 60);
+try socket.setOption(.sndbuf, 128 * 1024);  // 128KB
+try socket.setOption(.ipv6, true);
+```
+
+#### Security Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `plain_server` | bool | false | Enable PLAIN server mode |
+| `plain_username` | []u8 | null | PLAIN username |
+| `plain_password` | []u8 | null | PLAIN password |
+| `curve_server` | bool | false | Enable CURVE server mode |
+| `curve_publickey` | [32]u8 | null | CURVE public key |
+| `curve_secretkey` | [32]u8 | null | CURVE secret key |
+| `curve_serverkey` | [32]u8 | null | CURVE server public key (client) |
+| `zap_domain` | []u8 | "" | ZAP authentication domain |
+
+```zig
+// PLAIN server
+try socket.setOption(.plain_server, true);
+
+// PLAIN client
+try socket.setOption(.plain_username, "admin");
+try socket.setOption(.plain_password, "secret");
+
+// CURVE (post-MVP)
+try socket.setOption(.curve_server, true);
+try socket.setOption(.curve_secretkey, &server_secret);
+try socket.setOption(.curve_publickey, &server_public);
+```
+
+#### Read-Only Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `fd` | i32 | Underlying file descriptor (for external polling) |
+| `events` | u32 | Current poll events (POLLIN, POLLOUT) |
+| `type` | SocketType | Socket type |
+| `last_endpoint` | []u8 | Last endpoint bound/connected |
+| `mechanism` | Mechanism | Current security mechanism |
+| `rcvmore` | bool | More message parts available |
+
+```zig
+const socket_fd = socket.getOption(.fd);
+const events = socket.getOption(.events);
+const has_input = (events & zzmq.POLLIN) != 0;
+const last_ep = socket.getOption(.last_endpoint);
+```
+
+### Socket Options Implementation
 
 ```zig
 pub const SocketOption = enum {
     // High water marks
-    send_hwm,           // ZMQ_SNDHWM - default 1000
-    recv_hwm,           // ZMQ_RCVHWM - default 1000
+    send_hwm,
+    recv_hwm,
+    maxmsgsize,
 
     // Timeouts
-    send_timeout,       // ZMQ_SNDTIMEO - default -1 (infinite)
-    recv_timeout,       // ZMQ_RCVTIMEO - default -1 (infinite)
+    send_timeout,
+    recv_timeout,
+    connect_timeout,
+    handshake_ivl,
 
-    // Connection behavior
-    linger,             // ZMQ_LINGER - default -1 (infinite)
-    reconnect_ivl,      // ZMQ_RECONNECT_IVL - default 100ms
-    reconnect_ivl_max,  // ZMQ_RECONNECT_IVL_MAX - default 0 (no max)
-    connect_timeout,    // ZMQ_CONNECT_TIMEOUT - default 0 (no timeout)
+    // Connection lifecycle
+    linger,
+    reconnect_ivl,
+    reconnect_ivl_max,
+    backlog,
+    immediate,
 
-    // Identity
-    routing_id,         // ZMQ_ROUTING_ID
+    // Identity and routing
+    routing_id,
+    connect_routing_id,
+    probe_router,
+    router_mandatory,
+    router_handover,
 
     // Heartbeat
-    heartbeat_ivl,      // ZMQ_HEARTBEAT_IVL - default 0 (disabled)
-    heartbeat_timeout,  // ZMQ_HEARTBEAT_TIMEOUT
-    heartbeat_ttl,      // ZMQ_HEARTBEAT_TTL
+    heartbeat_ivl,
+    heartbeat_timeout,
+    heartbeat_ttl,
 
     // Pattern-specific
-    subscribe,          // ZMQ_SUBSCRIBE (SUB only)
-    unsubscribe,        // ZMQ_UNSUBSCRIBE (SUB only)
-    req_relaxed,        // ZMQ_REQ_RELAXED
-    req_correlate,      // ZMQ_REQ_CORRELATE
-    router_mandatory,   // ZMQ_ROUTER_MANDATORY
+    subscribe,
+    unsubscribe,
+    req_relaxed,
+    req_correlate,
+    conflate,
+    invert_matching,
+    xpub_verbose,
+    xpub_manual,
 
-    // Behavior
-    conflate,           // ZMQ_CONFLATE - keep only last message
-    immediate,          // ZMQ_IMMEDIATE
-
-    // TCP options
-    tcp_keepalive,      // ZMQ_TCP_KEEPALIVE
-    tcp_keepalive_cnt,
+    // TCP tuning
+    tcp_keepalive,
     tcp_keepalive_idle,
+    tcp_keepalive_cnt,
     tcp_keepalive_intvl,
+    sndbuf,
+    rcvbuf,
+    tos,
+    ipv6,
+
+    // Security
+    plain_server,
+    plain_username,
+    plain_password,
+    curve_server,
+    curve_publickey,
+    curve_secretkey,
+    curve_serverkey,
+    zap_domain,
+
+    // Read-only
+    fd,
+    events,
+    socket_type,
+    last_endpoint,
+    mechanism,
+    rcvmore,
 
     pub fn Type(comptime self: SocketOption) type {
         return switch (self) {
-            .send_hwm, .recv_hwm => u32,
-            .send_timeout, .recv_timeout => i32,  // -1 = infinite
-            .linger => i32,
+            .send_hwm, .recv_hwm, .backlog => u32,
+            .maxmsgsize => i64,
+            .send_timeout, .recv_timeout, .linger => i32,
+            .connect_timeout, .handshake_ivl => u32,
             .reconnect_ivl, .reconnect_ivl_max => u32,
-            .connect_timeout => u32,
-            .routing_id => []const u8,
             .heartbeat_ivl, .heartbeat_timeout, .heartbeat_ttl => u32,
+            .routing_id, .connect_routing_id => []const u8,
             .subscribe, .unsubscribe => []const u8,
-            .req_relaxed, .req_correlate, .router_mandatory => bool,
-            .conflate, .immediate => bool,
-            .tcp_keepalive => i32,
-            .tcp_keepalive_cnt, .tcp_keepalive_idle, .tcp_keepalive_intvl => i32,
+            .plain_username, .plain_password => []const u8,
+            .zap_domain, .last_endpoint => []const u8,
+            .curve_publickey, .curve_secretkey, .curve_serverkey => *const [32]u8,
+            .tcp_keepalive, .tcp_keepalive_idle,
+            .tcp_keepalive_cnt, .tcp_keepalive_intvl => i32,
+            .sndbuf, .rcvbuf, .tos => i32,
+            .fd => std.posix.fd_t,
+            .events => u32,
+            .probe_router, .router_mandatory, .router_handover,
+            .req_relaxed, .req_correlate, .conflate,
+            .invert_matching, .xpub_verbose, .xpub_manual,
+            .plain_server, .curve_server, .ipv6, .immediate, .rcvmore => bool,
+            .socket_type => SocketType,
+            .mechanism => Mechanism,
+        };
+    }
+
+    pub fn isReadOnly(self: SocketOption) bool {
+        return switch (self) {
+            .fd, .events, .socket_type, .last_endpoint, .mechanism, .rcvmore => true,
+            else => false,
         };
     }
 };
 
 pub const SocketOptions = struct {
+    // High water marks
     send_hwm: u32 = 1000,
     recv_hwm: u32 = 1000,
+    maxmsgsize: i64 = -1,
+
+    // Timeouts
     send_timeout: i32 = -1,
     recv_timeout: i32 = -1,
+    connect_timeout: u32 = 0,
+    handshake_ivl: u32 = 30000,
+
+    // Connection lifecycle
     linger: i32 = -1,
     reconnect_ivl: u32 = 100,
     reconnect_ivl_max: u32 = 0,
-    connect_timeout: u32 = 0,
+    backlog: u32 = 100,
+    immediate: bool = false,
+
+    // Identity
     routing_id: ?RoutingId = null,
+    probe_router: bool = false,
+    router_mandatory: bool = false,
+    router_handover: bool = false,
+
+    // Heartbeat
     heartbeat_ivl: u32 = 0,
     heartbeat_timeout: u32 = 0,
     heartbeat_ttl: u32 = 0,
-    conflate: bool = false,
-    immediate: bool = false,
 
-    // TCP
-    tcp_keepalive: i32 = -1,
-    tcp_keepalive_cnt: i32 = -1,
-    tcp_keepalive_idle: i32 = -1,
-    tcp_keepalive_intvl: i32 = -1,
-
-    // Pattern-specific (set by pattern)
+    // Pattern-specific
     req_relaxed: bool = false,
     req_correlate: bool = false,
-    router_mandatory: bool = false,
+    conflate: bool = false,
+    invert_matching: bool = false,
+    xpub_verbose: bool = false,
+    xpub_manual: bool = false,
+
+    // TCP tuning
+    tcp_keepalive: i32 = -1,
+    tcp_keepalive_idle: i32 = -1,
+    tcp_keepalive_cnt: i32 = -1,
+    tcp_keepalive_intvl: i32 = -1,
+    sndbuf: i32 = -1,
+    rcvbuf: i32 = -1,
+    tos: i32 = 0,
+    ipv6: bool = false,
+
+    // Security
+    plain_server: bool = false,
+    plain_username: ?[]const u8 = null,
+    plain_password: ?[]const u8 = null,
+    curve_server: bool = false,
+    curve_publickey: ?*const [32]u8 = null,
+    curve_secretkey: ?*const [32]u8 = null,
+    curve_serverkey: ?*const [32]u8 = null,
+    zap_domain: []const u8 = "",
 };
 ```
+
+### Message Properties (ZMTP Metadata)
+
+ZMTP 3.1 allows peers to exchange metadata during handshake and attach properties to messages.
+
+#### Standard Properties
+
+| Property | Description | When Available |
+|----------|-------------|----------------|
+| `Socket-Type` | Peer's socket type (e.g., "DEALER") | After handshake |
+| `Identity` | Peer's routing ID | After handshake (if set) |
+| `User-Id` | Authenticated user ID | After ZAP authentication |
+| `Peer-Address` | Peer's network address | Always |
+| `Routing-Id` | Message routing ID (ROUTER) | On received messages |
+
+#### Accessing Properties
+
+```zig
+pub const Message = struct {
+    // ... existing fields ...
+
+    /// Metadata properties from ZMTP handshake
+    properties: ?*MessageProperties = null,
+
+    /// Get a property value
+    pub fn getProperty(self: *const Message, name: []const u8) ?[]const u8 {
+        const props = self.properties orelse return null;
+        return props.get(name);
+    }
+};
+
+pub const MessageProperties = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap([]const u8),
+
+    pub fn get(self: *const MessageProperties, name: []const u8) ?[]const u8 {
+        return self.map.get(name);
+    }
+
+    pub fn set(self: *MessageProperties, name: []const u8, value: []const u8) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        const value_copy = try self.allocator.dupe(u8, value);
+        try self.map.put(name_copy, value_copy);
+    }
+
+    pub fn deinit(self: *MessageProperties) void {
+        var iter = self.map.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.map.deinit();
+    }
+};
+```
+
+#### Usage Examples
+
+```zig
+// Receive message and check properties
+const msg = try socket.recv(rt);
+defer msg.deinit();
+
+// Get peer's socket type
+if (msg.getProperty("Socket-Type")) |socket_type| {
+    std.log.info("Received from {s} socket", .{socket_type});
+}
+
+// Get authenticated user (if ZAP used)
+if (msg.getProperty("User-Id")) |user_id| {
+    std.log.info("Message from user: {s}", .{user_id});
+}
+
+// Get peer's address
+if (msg.getProperty("Peer-Address")) |addr| {
+    std.log.info("Peer address: {s}", .{addr});
+}
+```
+
+#### Setting Properties on Send (ZMTP 3.1)
+
+```zig
+// Create message with custom properties
+var msg = try Message.init(allocator, data);
+defer msg.deinit();
+
+// Attach application metadata
+try msg.setProperty("X-Request-Id", request_id);
+try msg.setProperty("X-Timestamp", timestamp_str);
+
+try socket.send(rt, &msg);
+```
+
+#### Property Propagation
+
+Properties are set at different points:
+
+| Property | Set By | Propagated To |
+|----------|--------|---------------|
+| `Socket-Type` | ZMTP handshake | All messages from this peer |
+| `Identity` | ZMTP handshake | All messages from this peer |
+| `User-Id` | ZAP authentication | All messages from this peer |
+| `Peer-Address` | Engine | All messages from this peer |
+| `Routing-Id` | ROUTER pattern | Received messages only |
+| `X-*` (custom) | Sender | Single message |
+
+#### Engine Property Handling
+
+```zig
+pub const Engine = struct {
+    /// Properties from ZMTP handshake (apply to all messages)
+    peer_properties: MessageProperties,
+
+    fn performHandshake(self: *Engine, rt: *zio.Runtime) !void {
+        // Exchange ZMTP greetings and handshakes...
+
+        // Extract properties from READY command
+        if (self.codec.ready_properties) |props| {
+            try self.peer_properties.set("Socket-Type", props.socket_type);
+            if (props.identity) |id| {
+                try self.peer_properties.set("Identity", id);
+            }
+        }
+
+        // Add peer address
+        const addr_str = try std.fmt.allocPrint(
+            self.allocator,
+            "{}",
+            .{self.stream.peerAddress()},
+        );
+        try self.peer_properties.set("Peer-Address", addr_str);
+    }
+
+    fn attachProperties(self: *Engine, msg: *Message) !void {
+        // Clone peer properties to message
+        if (msg.properties == null) {
+            msg.properties = try self.peer_properties.clone(msg.allocator);
+        }
+    }
+};
+```
+
+### STREAM Socket (Raw TCP)
+
+STREAM is a special socket type for raw TCP communication, not following ZMQ patterns.
+Useful for implementing custom protocols or HTTP servers.
+
+**libzmq reference:** `ZMQ_STREAM` (type 11)
+
+```zig
+pub const Stream = struct {
+    pub const State = struct {
+        /// Map of routing ID to pipe (like ROUTER)
+        pipes: std.AutoHashMap(RoutingId, *Pipe),
+        next_routing_id: u32 = 1,
+        notify: bool = true,  // ZMQ_STREAM_NOTIFY
+    };
+
+    pub fn onPipeAttached(state: *State, pipe: *Pipe) void {
+        // Assign routing ID
+        const id = state.next_routing_id;
+        state.next_routing_id += 1;
+        pipe.routing_id = RoutingId.fromInt(id);
+        state.pipes.put(pipe.routing_id.?, pipe) catch {};
+
+        // Send connect notification (empty message with routing ID)
+        if (state.notify) {
+            var notification = Message.initEmpty();
+            notification.routing_id = pipe.routing_id;
+            pipe.inbound.trySend(notification) catch {};
+        }
+    }
+
+    pub fn onPipeDetached(state: *State, pipe: *Pipe) void {
+        if (pipe.routing_id) |id| {
+            _ = state.pipes.remove(id);
+
+            // Send disconnect notification
+            if (state.notify) {
+                var notification = Message.initEmpty();
+                notification.routing_id = id;
+                // Queue to socket somehow...
+            }
+        }
+    }
+
+    /// Send raw data to a specific peer
+    pub fn send(
+        state: *State,
+        msg: *Message,
+        rt: *zio.Runtime,
+    ) SendError!void {
+        // First frame must be routing ID
+        const routing_id = msg.routing_id orelse return error.InvalidMessage;
+
+        const pipe = state.pipes.get(routing_id) orelse return error.HostUnreachable;
+
+        // Send raw (no ZMTP framing)
+        try pipe.sendRaw(rt, msg.data());
+    }
+
+    /// Receive raw data (returns routing ID + data)
+    pub fn recv(
+        state: *State,
+        rt: *zio.Runtime,
+    ) RecvError!Message {
+        // Fair queue from all pipes
+        // Returns message with routing_id set
+        // ...
+    }
+};
+```
+
+**Use cases:**
+- HTTP server implementation
+- Custom protocol handling
+- Bridging ZMQ to non-ZMQ systems
 
 ---
 
