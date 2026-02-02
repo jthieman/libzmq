@@ -481,3 +481,340 @@ const idx = try io.select(&futures);
 ```
 
 Users write straightforward synchronous-looking code. ZZMQ and ZIO handle all the async complexity internally.
+
+## 10. Complete Example: TCP Echo Server with Library Abstraction
+
+This example demonstrates a TCP echo server library that:
+1. **Hides ZIO runtime** - Users never see `zio.Runtime`
+2. **Exposes `std.Io`** - Users can use standard Zig async patterns
+3. **Supports multiple styles** - Blocking, `io.async`, and `io.concurrent`
+
+### 10.1 The Library (server.zig)
+
+```zig
+//! A simple TCP server library that abstracts ZIO runtime management.
+//! Users interact only through std.Io interfaces.
+
+const std = @import("std");
+const zio = @import("zio");
+const Allocator = std.mem.Allocator;
+
+/// TCP Server that manages its own ZIO runtime internally.
+/// Users interact with it using std.Io interfaces.
+pub const TcpServer = struct {
+    runtime: *zio.Runtime,
+    allocator: Allocator,
+    listener: ?std.Io.net.Server,
+
+    const Self = @This();
+
+    /// Initialize the server. Creates and manages ZIO runtime internally.
+    pub fn init(allocator: Allocator) !*Self {
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .runtime = try zio.Runtime.init(allocator, .{}),
+            .allocator = allocator,
+            .listener = null,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.listener) |*l| l.close(self.io());
+        self.runtime.deinit();
+        self.allocator.destroy(self);
+    }
+
+    /// Get std.Io interface for async operations.
+    /// This is the key abstraction - users work with std.Io, not ZIO directly.
+    pub fn io(self: *Self) std.Io {
+        return self.runtime.io();
+    }
+
+    /// Bind and listen on an address.
+    pub fn listen(self: *Self, address: std.net.Address, options: std.Io.net.ListenOptions) !void {
+        self.listener = try address.listen(self.io(), options);
+    }
+
+    /// Accept a connection (blocking-style, but non-blocking internally).
+    pub fn accept(self: *Self) !Connection {
+        const listener = self.listener orelse return error.NotListening;
+        const stream = try listener.accept(self.io(), .{});
+        return Connection{
+            .server = self,
+            .stream = stream,
+        };
+    }
+
+    /// Accept with explicit std.Io (for users managing concurrency themselves).
+    pub fn acceptWithIo(self: *Self, user_io: std.Io) !Connection {
+        const listener = self.listener orelse return error.NotListening;
+        const stream = try listener.accept(user_io, .{});
+        return Connection{
+            .server = self,
+            .stream = stream,
+        };
+    }
+};
+
+/// A client connection handle.
+pub const Connection = struct {
+    server: *TcpServer,
+    stream: std.Io.net.Stream,
+
+    const Self = @This();
+
+    /// Read data (blocking-style).
+    pub fn read(self: *Self, buffer: []u8) !usize {
+        return self.readWithIo(self.server.io(), buffer);
+    }
+
+    /// Read with explicit std.Io.
+    pub fn readWithIo(self: *Self, user_io: std.Io, buffer: []u8) !usize {
+        return self.stream.read(user_io, buffer, .{});
+    }
+
+    /// Write data (blocking-style).
+    pub fn write(self: *Self, data: []const u8) !usize {
+        return self.writeWithIo(self.server.io(), data);
+    }
+
+    /// Write with explicit std.Io.
+    pub fn writeWithIo(self: *Self, user_io: std.Io, data: []const u8) !usize {
+        return self.stream.write(user_io, data, .{});
+    }
+
+    /// Close the connection.
+    pub fn close(self: *Self) void {
+        self.stream.close(self.server.io());
+    }
+};
+```
+
+### 10.2 Usage Style 1: Simple Blocking-Style
+
+The simplest usage - looks synchronous but is non-blocking internally:
+
+```zig
+const std = @import("std");
+const server = @import("server.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // Create server - ZIO runtime is created internally
+    var srv = try server.TcpServer.init(gpa.allocator());
+    defer srv.deinit();
+
+    // Listen on port 8080
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    try srv.listen(addr, .{ .reuse_address = true });
+
+    std.debug.print("Echo server listening on :8080\n", .{});
+
+    // Accept loop - each call suspends until a client connects
+    while (true) {
+        var conn = try srv.accept();  // Suspends, but looks blocking
+        defer conn.close();
+
+        // Echo loop
+        var buf: [1024]u8 = undefined;
+        while (true) {
+            const n = conn.read(&buf) catch break;  // Suspends until data
+            if (n == 0) break;
+            _ = conn.write(buf[0..n]) catch break;  // Suspends until written
+        }
+    }
+}
+```
+
+### 10.3 Usage Style 2: io.async for Background Work
+
+Use `io.async` to start an operation and continue doing other work:
+
+```zig
+const std = @import("std");
+const server = @import("server.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var srv = try server.TcpServer.init(gpa.allocator());
+    defer srv.deinit();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    try srv.listen(addr, .{ .reuse_address = true });
+
+    const io = srv.io();
+
+    var conn = try srv.accept();
+    defer conn.close();
+
+    var buf: [1024]u8 = undefined;
+
+    // Start async read - returns immediately with a future
+    var read_future = io.async(struct {
+        fn doRead(c: *server.Connection, b: []u8, user_io: std.Io) usize {
+            return c.readWithIo(user_io, b) catch 0;
+        }
+    }.doRead, .{ &conn, &buf, io });
+
+    // Do other work while read is in progress...
+    std.debug.print("Read started, doing other work...\n", .{});
+    doSomeOtherWork();
+
+    // Now wait for the read to complete
+    const bytes_read = read_future.await(io);
+    std.debug.print("Read completed: {} bytes\n", .{bytes_read});
+
+    if (bytes_read > 0) {
+        _ = try conn.write(buf[0..bytes_read]);
+    }
+}
+
+fn doSomeOtherWork() void {
+    // Simulate other work
+    std.debug.print("Other work done!\n", .{});
+}
+```
+
+### 10.4 Usage Style 3: io.concurrent for Parallel Clients
+
+Use `io.concurrent` with groups to handle multiple clients in parallel:
+
+```zig
+const std = @import("std");
+const server = @import("server.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var srv = try server.TcpServer.init(gpa.allocator());
+    defer srv.deinit();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    try srv.listen(addr, .{ .reuse_address = true });
+
+    const io = srv.io();
+
+    std.debug.print("Concurrent echo server on :8080\n", .{});
+
+    // Group for managing concurrent client handlers
+    var clients: std.Io.Group = .init;
+    defer clients.cancel(io);
+
+    // Accept loop
+    while (true) {
+        var conn = try srv.accept();
+
+        // Spawn concurrent handler for this client
+        // io.concurrent schedules it to run in parallel
+        try clients.concurrent(io, handleClient, .{ io, conn });
+    }
+}
+
+/// Handle a single client - runs concurrently with other handlers.
+fn handleClient(io: std.Io, conn: server.Connection) std.Io.Cancelable!void {
+    var c = conn;  // Make mutable copy
+    defer c.close();
+
+    var buf: [1024]u8 = undefined;
+
+    while (true) {
+        // Each read/write suspends this coroutine, allowing others to run
+        const n = c.readWithIo(io, &buf) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => break,
+        };
+        if (n == 0) break;
+
+        _ = c.writeWithIo(io, buf[0..n]) catch break;
+    }
+}
+```
+
+### 10.5 Usage Style 4: Mixed Patterns with Select
+
+Combine multiple operations and wait for any to complete:
+
+```zig
+const std = @import("std");
+const server = @import("server.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var srv = try server.TcpServer.init(gpa.allocator());
+    defer srv.deinit();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    try srv.listen(addr, .{ .reuse_address = true });
+
+    const io = srv.io();
+
+    var conn1 = try srv.accept();
+    defer conn1.close();
+
+    var conn2 = try srv.accept();
+    defer conn2.close();
+
+    var buf1: [1024]u8 = undefined;
+    var buf2: [1024]u8 = undefined;
+
+    // Start async reads on both connections
+    var future1 = io.async(readFrom, .{ &conn1, &buf1, io });
+    var future2 = io.async(readFrom, .{ &conn2, &buf2, io });
+
+    // Wait for EITHER to complete (like select/poll)
+    var futures = [_]*std.Io.AnyFuture{
+        @ptrCast(&future1),
+        @ptrCast(&future2),
+    };
+
+    const ready_idx = try io.select(&futures);
+
+    switch (ready_idx) {
+        0 => {
+            const n = future1.await(io);
+            std.debug.print("Connection 1 ready: {} bytes\n", .{n});
+            _ = future2.cancel(io);  // Cancel the other
+        },
+        1 => {
+            const n = future2.await(io);
+            std.debug.print("Connection 2 ready: {} bytes\n", .{n});
+            _ = future1.cancel(io);
+        },
+        else => unreachable,
+    }
+}
+
+fn readFrom(conn: *server.Connection, buf: []u8, io: std.Io) usize {
+    return conn.readWithIo(io, buf) catch 0;
+}
+```
+
+### 10.6 Key Takeaways
+
+| Pattern | When to Use | Complexity |
+|---------|-------------|------------|
+| **Blocking-style** | Simple sequential operations | Lowest |
+| **io.async + await** | Start work, do something else, then collect result | Medium |
+| **io.concurrent + Group** | Handle many things in parallel (e.g., multiple clients) | Medium |
+| **io.select** | Wait for any of multiple events | Higher |
+
+**The library hides all ZIO details:**
+- User never imports `zio`
+- User never creates `zio.Runtime`
+- User works with standard `std.Io` interface
+- All patterns work transparently
+
+**Non-blocking is automatic:**
+- Every `read()`, `write()`, `accept()` suspends the coroutine
+- Other coroutines run while waiting
+- Looks synchronous, behaves asynchronously
