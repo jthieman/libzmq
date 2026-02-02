@@ -818,3 +818,267 @@ fn readFrom(conn: *server.Connection, buf: []u8, io: std.Io) usize {
 - Every `read()`, `write()`, `accept()` suspends the coroutine
 - Other coroutines run while waiting
 - Looks synchronous, behaves asynchronously
+
+## 11. Deep Dive: How Suspension Works Without Users Knowing About ZIO
+
+This section explains the internal mechanics that allow users to write blocking-style code that is actually non-blocking.
+
+### 11.1 The Key Insight: Stackful Coroutines
+
+ZIO uses **stackful coroutines** - each task has its own complete call stack. When a coroutine suspends, its entire call stack is frozen in place. This is different from async/await which requires explicit marking at every suspension point.
+
+With stackful coroutines:
+- Any function can suspend, not just `async` functions
+- The suspension is invisible to callers
+- No "function coloring" problem
+
+### 11.2 The Suspension Chain
+
+Here's what happens when a user calls `conn.read(&buf)`:
+
+```
+User code                    Library code                   ZIO internals
+─────────────────────────────────────────────────────────────────────────────
+conn.read(&buf)
+    │
+    └──► self.readWithIo(self.server.io(), buffer)
+              │
+              └──► self.stream.read(user_io, buffer, .{})
+                        │
+                        │   std.Io dispatches through vtable
+                        ▼
+                   vtable.netRead(userdata, ...)
+                        │
+                        └──► netReadImpl(userdata, ...)           [stdio.zig]
+                                  │
+                                  │   Cast userdata back to Runtime
+                                  ▼
+                             var op = ev.StreamRead.init(...);
+                             try waitForIo(rt, &op.c);            [common.zig:125]
+                                  │
+                                  └──► waiter.wait(1, .allow_cancel)   [common.zig:137]
+                                            │
+                                            └──► executor.yield(...)   [common.zig:83]
+                                                      │
+                                                      │   CONTEXT SWITCH!
+                                                      ▼
+                                                 current_coro.yieldTo(&next_coro)
+                                                      │
+                                            ┌────────┴────────┐
+                                            │   COROUTINE     │
+                                            │   SUSPENDED     │
+                                            │   (stack frozen)│
+                                            └─────────────────┘
+```
+
+### 11.3 The Magic: `yieldTo()` Context Switch
+
+The actual suspension happens in assembly:
+
+```zig
+// In coroutines.zig:869
+pub fn yieldTo(self: *Coroutine, other: *Coroutine) void {
+    switchContext(&self.context, &other.context);
+}
+```
+
+`switchContext` is platform-specific assembly that:
+1. Saves all CPU registers to current coroutine's stack
+2. Switches the stack pointer to another coroutine's stack
+3. Restores that coroutine's registers
+4. **Returns into the middle of that coroutine's code**
+
+The current coroutine is frozen mid-function. The scheduler runs other work.
+
+### 11.4 The Critical Code: `waitForIo()`
+
+This is the suspension point for all I/O operations:
+
+```zig
+// common.zig:125-153
+pub fn waitForIo(rt: *Runtime, c: *ev.Completion) Cancelable!void {
+    var waiter = Waiter.init(rt);
+    c.userdata = &waiter;
+    c.callback = Waiter.callback;      // When I/O done, call this
+
+    // Submit to event loop (epoll/kqueue/io_uring)
+    waiter.task.getExecutor().loop.add(c);
+
+    // This suspends! Waits for callback to signal
+    waiter.wait(1, .allow_cancel);     // ← SUSPENSION POINT
+
+    // When we get here, I/O is complete
+}
+```
+
+And `waiter.wait()` performs the actual yield:
+
+```zig
+// common.zig:67-94
+pub fn wait(self: *Waiter, expected: u32, ...) ... {
+    while (true) {
+        task.state.store(.preparing_to_wait, .release);
+
+        // Already signaled? Don't suspend
+        if (self.signaled.load(.acquire) >= expected) {
+            return;
+        }
+
+        // SUSPEND THE COROUTINE - this is where the magic happens
+        executor.yield(.preparing_to_wait, .waiting, ...);
+
+        // When we resume, check if actually done
+        if (self.signaled.load(.acquire) >= expected) {
+            return;  // Done!
+        }
+        // Spurious wakeup, loop again
+    }
+}
+```
+
+### 11.5 The Resume Path
+
+When the OS signals I/O completion:
+
+```
+Event loop detects readable socket (epoll_wait/kevent returns)
+    │
+    └──► Calls completion callback
+              │
+              └──► Waiter.callback()                    [common.zig:117]
+                        │
+                        └──► waiter.signal()           [common.zig:56]
+                                  │
+                                  ├──► signaled.fetchAdd(1)   // Mark ready
+                                  └──► task.wake()            // Schedule task
+                                            │
+                                            └──► Adds task to runnable queue
+
+Later, scheduler picks up the task:
+    │
+    └──► scheduler.yieldTo(&suspended_task.coro)
+              │
+              │   CONTEXT SWITCH back!
+              ▼
+         // Execution resumes EXACTLY where it left off
+         // Inside waiter.wait(), after the yield() call
+
+         waiter.wait() returns
+              │
+         waitForIo() returns
+              │
+         netReadImpl() returns data
+              │
+         vtable dispatch returns
+              │
+         stream.read() returns
+              │
+         conn.readWithIo() returns
+              │
+         conn.read() returns to user with data!
+```
+
+### 11.6 The Abstraction Layers
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  User Code                                                  │
+│  conn.read(&buf)  ← Looks like a normal blocking call       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Library (e.g., server.zig, ZZMQ)                           │
+│  Calls self.stream.read(self.server.io(), ...)              │
+│  ← Gets std.Io from internal runtime, user doesn't know     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  std.Io Interface                                           │
+│  Dispatches through vtable: vtable.netRead(...)             │
+│  ← Standard Zig interface, implementation-agnostic          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  ZIO's stdio.zig vtable implementation                      │
+│  Casts userdata → Runtime, calls waitForIo()                │
+│  ← User never imports this, never sees it                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  ZIO Runtime (coroutines + event loop)                      │
+│  Suspends coroutine, polls OS, resumes when ready           │
+│  ← Completely hidden, just makes the call "take time"       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.7 Why This Works Transparently
+
+| Layer | What User Sees | What Actually Happens |
+|-------|----------------|----------------------|
+| `conn.read()` | "Blocking" call | Calls through to std.Io |
+| `std.Io` | Standard interface | Dispatches via vtable |
+| vtable impl | Hidden | Calls `waitForIo()` |
+| `waitForIo` | Hidden | Submits I/O, calls `waiter.wait()` |
+| `waiter.wait` | Hidden | Calls `executor.yield()` |
+| `yield()` | Hidden | `yieldTo()` - assembly context switch |
+| Coroutine | Hidden | Stack frozen, scheduler runs others |
+| I/O completion | Hidden | Callback signals, task rescheduled |
+| Resume | Hidden | Context switch back, stack unfreezes |
+| Return | Data arrives! | Looks like call just "finished" |
+
+### 11.8 Comparison with Other Async Models
+
+| Model | Suspension | Pros | Cons |
+|-------|------------|------|------|
+| **ZIO (stackful coroutines)** | Invisible, any function can suspend | No function coloring, natural code | Stack memory per coroutine |
+| **async/await** | Explicit `await` keyword | Clear suspension points | Function coloring, viral async |
+| **Callbacks** | Manual via closures | No runtime overhead | Callback hell, hard to follow |
+| **Threads** | OS-managed preemption | True parallelism | Heavy, synchronization needed |
+
+### 11.9 Memory Layout
+
+Each coroutine has its own stack (default ~64KB, configurable):
+
+```
+┌─────────────────────────────────────────┐
+│           Coroutine A Stack             │
+├─────────────────────────────────────────┤
+│  main()                                 │
+│    └─► handleClient()                   │
+│          └─► conn.read()                │
+│                └─► stream.read()        │
+│                      └─► waitForIo()    │
+│                            └─► yield()  │  ← Suspended here
+│                                 [saved registers]
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│           Coroutine B Stack             │
+├─────────────────────────────────────────┤
+│  main()                                 │
+│    └─► handleClient()                   │
+│          └─► conn.write()               │  ← Currently running
+└─────────────────────────────────────────┘
+```
+
+When the scheduler switches from B to A:
+1. Save B's registers to B's stack
+2. Switch stack pointer to A's stack
+3. Restore A's registers
+4. `ret` instruction returns into A's `yield()` call
+5. A continues as if nothing happened
+
+### 11.10 Key Takeaway
+
+**The user writes `const data = conn.read(&buf)` and it "just works":**
+- Looks like a blocking call
+- Actually non-blocking underneath
+- Other coroutines run while waiting
+- No special syntax needed
+- No knowledge of ZIO required
+
+This is the power of stackful coroutines combined with the `std.Io` abstraction layer.
