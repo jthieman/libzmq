@@ -1,138 +1,133 @@
-# Event Loop Optimization Design for Coroutine Executors
+# Event Loop Optimization Design for Multi-Threaded Coroutine Executors
 
-## Status: DESIGN PROPOSAL
+## Status: DESIGN PROPOSAL (v2)
 
-## Problem Statement
+## Core Constraint
 
-libzmq's current architecture assumes a threading model where each I/O thread
-owns a dedicated OS thread, blocking in `epoll_wait()`, and sockets are owned by
-application threads that block in `poll()/select()` on signaler FDs. This
-model imposes costs that become dominant when the execution model shifts to
-many coroutine executors sharing a single-threaded event loop:
+Modern coroutine runtimes (Tokio, Asio, folly::coro, libunifex, Go runtime)
+run M coroutines across N OS threads with work-stealing. A coroutine that
+writes to a pipe on thread 3 may have its consumer running on thread 7 — or
+the consumer may migrate to thread 3 mid-flight, or both may be on thread 3
+now and different threads next tick.
 
-1. **Signaler syscall overhead**: Every pipe flush that finds the reader asleep
-   triggers `write()` to an eventfd/pipe, and every wakeup triggers `read()`.
-   In a coroutine model, the "reader" is a suspended coroutine on the same
-   thread -- no kernel transition is needed.
+**This means:**
+- Producer and consumer are always potentially on different OS threads
+- All atomic operations in the SPSC protocol must be retained
+- "Wakeup" is not a same-thread callback — it is a cross-thread task
+  submission to an executor, which itself costs ~50-200ns
+- Under high load, redundant wakeups compound: if N flushes each submit
+  a task, the executor processes N scheduling events for what should be
+  one drain loop
 
-2. **Mailbox mutex contention**: `mailbox_t::send()` acquires a mutex to
-   serialize access to the SPSC ypipe. With many coroutines acting as
-   producers, this mutex becomes a serialization bottleneck even on a single
-   thread (where it's pure overhead since there's no actual concurrency).
-
-3. **False sharing in yqueue chunk layout**: `chunk_t` places `values[N]`
-   followed by `prev`/`next` pointers. When N is large (256 for messages),
-   this isn't an issue. But for command pipes (N=16), the navigation pointers
-   sit in the same cache line as data, and reader/writer threads bounce that
-   line.
-
-4. **Per-message modulo in backpressure**: `pipe_t::read()` checks
-   `_msgs_read % _lwm == 0` on every complete message. Integer modulo is
-   ~20-40 cycles on modern CPUs -- avoidable with threshold comparison.
-
-5. **Rigid two-phase command/data separation**: Commands (activate_read,
-   activate_write) travel through mailbox+signaler while data travels through
-   ypipe. For inproc coroutine-to-coroutine messaging, both paths carry
-   unnecessary overhead.
+The design must make the common case fast without assuming colocation, and
+must degrade gracefully under contention rather than amplifying it.
 
 ---
 
-## Current Architecture Analysis
+## Problem Statement
 
-### Data Flow: Send Path
+libzmq's architecture imposes five categories of overhead that become
+dominant under a high-throughput event loop with many coroutine executors:
 
-```
-Application thread                    I/O thread
-    |                                     |
-zmq_send(msg)                             |
-    |                                     |
-socket_base::send()                       |
-    +-- process_commands(0, throttle=true) |
-    |   +-- RDTSC check (skip if <1ms)    |
-    |   +-- mailbox->recv(&cmd, 0)        |
-    |                                     |
-    +-- xsend(msg)                        |
-        +-- pipe_t::write(msg)            |
-        |   +-- check_hwm()               |
-        |   +-- ypipe::write(msg, more)   |
-        |       +-- yqueue::back() = msg  |
-        |       +-- yqueue::push()        |
-        |       +-- _f = &back() if !more |
-        |                                 |
-        +-- pipe_t::flush()               |
-            +-- ypipe::flush()            |
-            |   +-- CAS(_w, _f) on _c     |
-            |   +-- returns false if      |
-            |       reader was asleep     |
-            |                             |
-            +-- send_activate_read(peer)  |
-                +-- mailbox::send(cmd)    |
-                    +-- mutex lock        |
-                    +-- cpipe.write(cmd)  |
-                    +-- cpipe.flush()     |
-                    +-- mutex unlock      |
-                    +-- signaler.send()   |
-                        +-- write(eventfd)|  <-- SYSCALL
-                                          |
-                                     epoll_wait() returns
-                                          |
-                                     io_thread::in_event()
-                                          +-- mailbox.recv()
-                                          |   +-- signaler.recv()  <-- SYSCALL
-                                          |   +-- cpipe.read(&cmd)
-                                          +-- cmd.dest->process_command(cmd)
-                                              +-- pipe_t::process_activate_read()
-                                                  +-- sink->read_activated(pipe)
-```
+### 1. Signaler syscall overhead (~1000ns per transition)
 
-### Data Flow: Recv Path
+Every pipe flush where the reader is asleep triggers `write()` to an
+eventfd/pipe (`signaler_t::send`, signaler.cpp:146-201). Every wakeup
+triggers `read()` from it (`signaler_t::recv`, signaler.cpp:275-309).
+These are full kernel transitions. Under load with 1000 pipes flushing
+per millisecond, this is 2000 syscalls/ms — ~2 million/sec of pure
+kernel overhead.
+
+An executor-based notification can replace these with a thread-safe task
+submission (~50-200ns cross-thread, ~5-10ns same-thread), but only if
+redundant submissions are suppressed.
+
+### 2. Mailbox mutex serialization
+
+`mailbox_t::send()` (mailbox.cpp:32-40) acquires `_sync` mutex to
+serialize writers into the SPSC ypipe. Under fan-in (many coroutines
+sending commands to one I/O thread), this mutex becomes a convoy:
 
 ```
-Application thread
-    |
-zmq_recv(msg)
-    |
-socket_base::recv()
-    +-- ++_ticks
-    +-- if _ticks == 100:        <-- every 100 messages
-    |       process_commands(0)
-    |       _ticks = 0
-    |
-    +-- xrecv(msg)
-        +-- pipe_t::read(msg)
-            +-- ypipe::check_read()
-            |   +-- if front != _r: return true (prefetched)
-            |   +-- _r = CAS(&front, NULL) on _c
-            |   +-- return _r != &front && _r != NULL
-            |
-            +-- ypipe::read(msg)
-            |   +-- *msg = queue.front()
-            |   +-- queue.pop()
-            |
-            +-- _msgs_read++
-            +-- if _msgs_read % _lwm == 0:    <-- MODULO per message
-                    send_activate_write(peer)  <-- command via mailbox
+Coroutine A: lock → write → flush → unlock     (holds lock ~30-50ns)
+Coroutine B: spin-wait for lock...              (wastes ~30-50ns)
+Coroutine C: spin-wait for lock...              (wastes ~60-100ns)
 ```
 
-### Cost Breakdown Per Message (Steady State, Inproc)
+With 100 coroutines funneling commands to one I/O thread, the tail
+latency is 100x the single-operation cost. A lock-free MPSC queue
+reduces the push cost to a single atomic exchange (~5-8ns) with zero
+convoy effects.
 
-| Operation | Cost | Notes |
-|-----------|------|-------|
-| ypipe::write + push | ~5-10ns | Store to array, increment index |
-| ypipe::flush (CAS) | ~15-25ns | Atomic CAS on `_c`, amortized across batch |
-| signaler::send | ~500-1000ns | `write()` syscall to eventfd |
-| signaler::recv | ~500-1000ns | `read()` syscall from eventfd |
-| mailbox mutex lock/unlock | ~20-50ns | Uncontended; ~500ns+ contended |
-| ypipe::check_read (CAS) | ~15-25ns | Atomic CAS on `_c` |
-| ypipe::read + pop | ~5-10ns | Load from array, increment index |
-| pipe_t msgs_read % lwm | ~20-40ns | Integer division |
-| mailbox::send for activate_write | ~1000-2000ns | mutex + ypipe + signaler |
-| process_commands overhead | ~100-500ns | RDTSC + mailbox recv attempt |
+### 3. False sharing in data structure layouts
 
-**Total inproc message round-trip: ~3-5 microseconds**
+`yqueue_t` (yqueue.hpp:172-177) lays out reader fields (`_begin_chunk`,
+`_begin_pos`) contiguously with writer fields (`_back_chunk`, `_back_pos`,
+`_end_chunk`, `_end_pos`). On a 64-byte cache line, these share a line.
+Every writer push invalidates the reader's cached `_begin_chunk`, and
+every reader pop invalidates the writer's cached `_end_chunk`.
 
-The signaler syscalls dominate. In a coroutine event loop where producer and
-consumer run on the same thread, this overhead is entirely eliminable.
+With coroutines on different physical cores (the common case under
+work-stealing), this causes cache line bouncing at the L3/interconnect
+level: ~40-80ns per invalidation on modern multi-socket systems.
+
+`ypipe_t` (ypipe.hpp:150-172) has the same problem: `_w`, `_r`, `_f`,
+`_c` are 32 bytes contiguous with no alignment control.
+
+### 4. Per-message modulo in backpressure
+
+`pipe_t::read()` (pipe.cpp:201) checks `_msgs_read % _lwm == 0` on
+every complete message. Integer modulo by a non-power-of-2 is a
+division: ~20-40 cycles. At 10M msgs/sec this is 200-400M wasted cycles/sec.
+
+### 5. Wakeup amplification under fan-out
+
+A PUB socket flushing to 100 subscriber pipes triggers 100 independent
+`send_activate_read` commands, each going through the mailbox + signaler
+path. Under an executor model, this becomes 100 cross-thread task
+submissions in rapid succession. The executor's work-stealing queue
+becomes a bottleneck, and the consumer thread processes 100 scheduling
+events to drain what could be handled in a single batch.
+
+---
+
+## Current Architecture: What Works and What Doesn't
+
+### What works well (retain as-is)
+
+**The ypipe_t SPSC CAS protocol** (ypipe.hpp:76-122) is near-optimal
+for cross-thread single-producer single-consumer queues:
+- One CAS per flush batch (amortized across N writes)
+- Reader CAS sets `_c = NULL` to signal sleep — this is the dedup
+  mechanism that prevents redundant wakeups
+- Writer detects `_c == NULL` and knows to notify exactly once
+
+**The yqueue_t chunk allocator** (yqueue.hpp:78-97) amortizes malloc
+overhead by 1/N and reuses one spare chunk via atomic exchange. For
+message pipes (N=256, chunk=16KB), this is excellent.
+
+**The msg_t layout** (msg.hpp:148-156) at exactly 64 bytes (one cache
+line) with VSM inline storage is optimal. Sequential access through
+yqueue chunks gives excellent hardware prefetch behavior.
+
+### What doesn't work
+
+**The notification layer** (signaler + mailbox mutex) was designed for a
+world where threads own pollers and block in `epoll_wait()`. An executor
+doesn't block in epoll — it runs a task queue. The signaler's eventfd
+was the right way to wake a blocked OS thread; it's the wrong way to
+schedule a coroutine.
+
+**The command path** (object.cpp:520-522 → ctx.cpp:642-644 →
+mailbox.cpp:32-40) forces every inter-object notification through a
+centralized mutex + signaler bottleneck, even for high-frequency
+operations like `activate_read`/`activate_write` that happen on every
+pipe flush and every LWM crossing.
+
+**The timer implementation** (poller_base.cpp:54-92) uses `std::multimap`
+with O(log N) insertion and requires `clock_t::now_ms()` — a syscall or
+VDSO call — on every operation. Under an executor, timers should
+integrate with the executor's own timer wheel.
 
 ---
 
@@ -140,611 +135,866 @@ consumer run on the same thread, this overhead is entirely eliminable.
 
 ### Design Principle
 
-Rather than replacing the existing architecture, we introduce a parallel
-set of data structures and integration points optimized for same-thread
-coroutine execution, selectable at pipe creation time.
+Replace the **notification and dispatch layer** while retaining the
+**data structures and lock-free protocols**. The ypipe CAS protocol and
+yqueue chunk allocator are good. The signaler, mailbox mutex, and rigid
+thread-to-poller binding are what need to change.
 
-### 1. Coroutine-Aware Pipe: `ypipe_coro_t`
+Every optimization must be correct under the assumption that producer
+and consumer are on different OS threads. Same-thread execution is a
+welcome fast-path, not a design requirement.
 
-**Goal**: Eliminate signaler syscalls and mailbox mutex for same-event-loop pipes.
+### 1. Executor-Abstract Notifier: `i_notifier_t`
+
+**Goal**: Replace the signaler with a pluggable, thread-safe, idempotent
+notification mechanism that works with any executor.
 
 ```cpp
-// New file: src/ypipe_coro.hpp
+// src/i_notifier.hpp
 //
-// SPSC pipe optimized for coroutine executors where producer and consumer
-// run on the same event loop thread. "Wakeup" is a callback/coroutine
-// reschedule rather than a kernel signal.
+// Thread-safe, idempotent notification interface.
+// Implementations must guarantee:
+//   1. notify() is safe to call from any thread concurrently
+//   2. Multiple notify() calls before the consumer acts collapse
+//      into a single wakeup (idempotency)
+//   3. The consumer observes all data written before notify()
+//      (acquire-release ordering)
 
-template <typename T, int N>
-class ypipe_coro_t : public ypipe_base_t<T>
+class i_notifier_t
 {
-public:
-    using wakeup_fn_t = void (*)(void *ctx);
+  public:
+    virtual ~i_notifier_t() = default;
 
-    ypipe_coro_t(wakeup_fn_t reader_wakeup, void *reader_ctx)
-        : _reader_wakeup(reader_wakeup)
-        , _reader_ctx(reader_ctx)
-    {
-        _queue.push();
-        _r = _w = _f = &_queue.back();
-        _c.set(&_queue.back());
-    }
+    // Called by producer thread(s) to signal that work is available.
+    // Must be thread-safe. Must be idempotent: calling notify() 10
+    // times before the consumer runs has the same effect as calling
+    // it once.
+    virtual void notify() = 0;
 
-    // Same write() as ypipe_t -- no change needed.
-    void write(const T &value_, bool incomplete_)
-    {
-        _queue.back() = value_;
-        _queue.push();
-        if (!incomplete_)
-            _f = &_queue.back();
-    }
-
-    // flush() replaces signaler::send() with direct callback.
-    // Returns true if reader was already awake.
-    bool flush()
-    {
-        if (_w == _f)
-            return true;
-
-        // In single-threaded coroutine mode, we can use a simple
-        // flag instead of CAS. The _c atomic is retained for
-        // compatibility but the fast path avoids it entirely.
-        if (_reader_sleeping) {
-            _reader_sleeping = false;
-            _w = _f;
-            // Direct wakeup -- no syscall, no mailbox, no mutex.
-            // This reschedules the consumer coroutine on the event loop.
-            _reader_wakeup(_reader_ctx);
-            return false;
-        }
-
-        _w = _f;
-        return true;
-    }
-
-    bool check_read()
-    {
-        if (&_queue.front() != _r && _r)
-            return true;
-
-        // Single-threaded: simple load instead of CAS
-        if (_w != _f) {
-            // Writer has unflushed data -- shouldn't happen in
-            // well-behaved code, but handle gracefully.
-        }
-
-        _r = _f;  // Directly read the flush pointer
-        if (&_queue.front() == _r || !_r) {
-            _reader_sleeping = true;  // Mark as sleeping
-            return false;
-        }
-        return true;
-    }
-
-    bool read(T *value_)
-    {
-        if (!check_read())
-            return false;
-        *value_ = _queue.front();
-        _queue.pop();
-        return true;
-    }
-
-private:
-    yqueue_t<T, N> _queue;
-    T *_w;
-    T *_r;
-    T *_f;
-    atomic_ptr_t<T> _c;  // Retained for cross-thread fallback
-
-    bool _reader_sleeping{false};
-    wakeup_fn_t _reader_wakeup;
-    void *_reader_ctx;
+    // Called by consumer to arm for next notification. After this
+    // call, the next notify() will trigger a wakeup. Between arm()
+    // and the next notify(), additional notify() calls are no-ops.
+    // Must be called from the consumer context only.
+    virtual void arm() = 0;
 };
 ```
 
-**Key insight**: When producer and consumer are on the same event loop thread,
-there is no actual concurrency. The `_c` atomic CAS can be replaced by plain
-loads/stores. The "wakeup" is a function pointer call that enqueues the
-consumer coroutine for the next event loop iteration, costing ~2ns instead of
-~1000ns.
+**Why idempotent + arm/notify instead of signal/wait:**
 
-**Migration path**: `ypipe_base_t` already provides the virtual interface.
-`ypipe_coro_t` derives from it, so `pipe_t` can use it transparently.
+The existing ypipe `_c` pointer protocol already implements exactly this
+pattern at the data level:
+- `_c = NULL` means "reader is sleeping" (armed)
+- `flush()` CAS detects this and returns false exactly once (notify)
+- Subsequent flushes before the reader wakes see `_c != NULL` (no-op)
 
-### 2. MPSC Lock-Free Command Queue: `mpsc_queue_t`
+The `i_notifier_t` generalizes this to the notification transport layer,
+replacing the signaler's eventfd with an executor-appropriate mechanism.
 
-**Goal**: Eliminate mutex in mailbox for multi-producer command dispatch.
-
-The current mailbox wraps an SPSC ypipe with a mutex for multi-producer
-access. This is correct but suboptimal. We replace it with an intrusive
-MPSC queue based on Dmitry Vyukov's design:
+**Implementations:**
 
 ```cpp
-// New file: src/mpsc_queue.hpp
-//
-// Lock-free multi-producer single-consumer queue.
-// Producers: any thread/coroutine. Consumer: the owning event loop.
-// Based on Vyukov's MPSC queue with acquire-release semantics.
-
-template <typename T>
-class mpsc_queue_t
+// For legacy poller integration (epoll/kqueue/select)
+class signaler_notifier_t : public i_notifier_t
 {
-public:
-    struct node_t
-    {
-        std::atomic<node_t *> next{nullptr};
-        T value;
-    };
+    signaler_t _signaler;
+    std::atomic<bool> _armed{true};
 
-    mpsc_queue_t()
+    void notify() override {
+        // Only send if transition from armed to notified.
+        // This is the key: one eventfd write per batch, not per flush.
+        if (_armed.exchange(false, std::memory_order_acq_rel)) {
+            _signaler.send();
+        }
+    }
+
+    void arm() override {
+        _signaler.recv_failable();  // drain
+        _armed.store(true, std::memory_order_release);
+    }
+};
+
+// For executor-based event loops (Asio, Tokio, io_uring, etc.)
+class executor_notifier_t : public i_notifier_t
+{
+    using post_fn_t = void (*)(void *executor_ctx);
+
+    post_fn_t _post;          // executor's thread-safe post function
+    void *_executor_ctx;
+    std::atomic<bool> _armed{true};
+
+    void notify() override {
+        if (_armed.exchange(false, std::memory_order_acq_rel)) {
+            _post(_executor_ctx);  // cross-thread task submission
+        }
+        // If already notified, this is a no-op — no redundant
+        // task submissions, no wakeup amplification.
+    }
+
+    void arm() override {
+        _armed.store(true, std::memory_order_release);
+    }
+};
+```
+
+**Critical property — wakeup suppression under load:**
+
+Under steady-state high throughput, the pattern is:
+```
+Writer 1: write, write, write, flush → notify() → _armed was true → post task
+Writer 2: write, flush → notify() → _armed is false → NO-OP
+Writer 3: write, flush → notify() → _armed is false → NO-OP
+...
+Consumer runs (on some executor thread):
+  arm()         → _armed = true, ready for next batch
+  drain_all()   → reads everything from all writers
+  [goes idle or processes other tasks]
+
+Writer 4: write, flush → notify() → _armed was true → post task (new batch)
+```
+
+Under load: 1 task submission per drain cycle, regardless of how many
+writers flush between drains. Under light load: 1 task submission per
+message (no batching needed since messages are infrequent).
+
+This **adapts automatically** to load without tuning constants.
+
+### 2. Lock-Free MPSC Mailbox: `mailbox_mpsc_t`
+
+**Goal**: Eliminate the mutex that serializes command producers into the
+SPSC ypipe.
+
+The current mailbox (mailbox.cpp:32-40) wraps a single-producer ypipe
+with a mutex to support multiple producers. This converts a lock-free
+data structure into a lock-based one. Under fan-in from many executor
+threads, the mutex creates a convoy.
+
+Replace with an intrusive MPSC queue (Vyukov design) that is
+wait-free for producers:
+
+```cpp
+// src/mailbox_mpsc.hpp
+//
+// Lock-free MPSC mailbox. Producers (any thread) push commands
+// with a single atomic exchange. Consumer (one thread/coroutine)
+// pops in FIFO order.
+
+class mailbox_mpsc_t : public i_mailbox
+{
+  public:
+    mailbox_mpsc_t(i_notifier_t *notifier)
+        : _notifier(notifier)
     {
         _stub.next.store(nullptr, std::memory_order_relaxed);
         _head.store(&_stub, std::memory_order_relaxed);
         _tail = &_stub;
     }
 
-    // Producer: lock-free, wait-free push. O(1).
-    // Multiple producers can call this concurrently with no mutex.
-    void push(node_t *node)
-    {
-        node->next.store(nullptr, std::memory_order_relaxed);
-        node_t *prev = _head.exchange(node, std::memory_order_acq_rel);
-        // This store completes the link. The consumer will spin
-        // briefly if it reaches this node before the store completes.
-        prev->next.store(node, std::memory_order_release);
-    }
-
-    // Consumer: single-threaded pop. Returns nullptr if empty.
-    // May return nullptr transiently even if push() is in progress
-    // (the "incomplete" window is ~1 instruction wide).
-    node_t *pop()
-    {
-        node_t *tail = _tail;
-        node_t *next = tail->next.load(std::memory_order_acquire);
-        if (tail == &_stub) {
-            if (next == nullptr)
-                return nullptr;
-            _tail = next;
-            tail = next;
-            next = next->next.load(std::memory_order_acquire);
-        }
-        if (next != nullptr) {
-            _tail = next;
-            tail->value = std::move(tail->value);
-            return tail;
-        }
-        node_t *head = _head.load(std::memory_order_acquire);
-        if (tail != head)
-            return nullptr;  // push in progress, retry later
-        // Re-insert stub to allow future pushes
-        _stub.next.store(nullptr, std::memory_order_relaxed);
-        node_t *prev = _head.exchange(&_stub, std::memory_order_acq_rel);
-        prev->next.store(&_stub, std::memory_order_release);
-        next = tail->next.load(std::memory_order_acquire);
-        if (next != nullptr) {
-            _tail = next;
-            return tail;
-        }
-        return nullptr;
-    }
-
-private:
-    // Producers push onto head. Consumer pops from tail.
-    // Separated by padding to avoid false sharing.
-    alignas(64) std::atomic<node_t *> _head;
-    alignas(64) node_t *_tail;
-    node_t _stub;
-};
-```
-
-**Benefit**: Eliminates the `mutex_t _sync` in `mailbox_t`. Producers simply
-do an atomic exchange (one instruction on x86) instead of lock + ypipe write +
-ypipe flush + unlock.
-
-**Trade-off**: Each command needs its own `node_t` allocation. We mitigate
-this with a per-thread node freelist (or arena).
-
-### 3. Optimized yqueue Chunk Layout
-
-**Goal**: Better cache behavior for command pipes and separation of reader/writer metadata.
-
-Current `chunk_t` layout:
-```
-+---------------------------+
-| values[0..N-1]            |  N * sizeof(T) bytes
-| prev pointer              |  8 bytes
-| next pointer              |  8 bytes
-+---------------------------+
-```
-
-For message pipes (N=256, T=msg_t at 64 bytes): chunk is 16KB + 16 bytes.
-`prev`/`next` sit at the end, separate from where reader/writer are active.
-This is already fine.
-
-For command pipes (N=16, T=command_t): chunk is much smaller, and `prev`/`next`
-may share a cache line with the last few `values[]` entries. We propose:
-
-```cpp
-// Revised chunk_t with explicit padding for small N
-
-template <typename T, int N>
-struct chunk_t
-{
-    T values[N];
-
-    // Pad to ensure navigation pointers are on their own cache line
-    // when the values array doesn't fill one.
-    static constexpr size_t values_end = sizeof(T) * N;
-    static constexpr size_t pad_needed =
-        (values_end % 64 == 0) ? 0 : (64 - (values_end % 64));
-    char _pad[pad_needed > 0 ? pad_needed : 1];
-
-    chunk_t *prev;
-    chunk_t *next;
-};
-```
-
-Additionally, separate reader-only and writer-only fields in `yqueue_t`
-into distinct cache lines:
-
-```cpp
-template <typename T, int N>
-class yqueue_t
-{
-    // Reader-only fields (reader thread / coroutine)
-    alignas(64) struct {
-        chunk_t<T,N> *begin_chunk;
-        int begin_pos;
-    } _reader;
-
-    // Writer-only fields (writer thread / coroutine)
-    alignas(64) struct {
-        chunk_t<T,N> *back_chunk;
-        int back_pos;
-        chunk_t<T,N> *end_chunk;
-        int end_pos;
-    } _writer;
-
-    // Shared (atomic exchange between reader and writer)
-    alignas(64) atomic_ptr_t<chunk_t<T,N>> _spare_chunk;
-};
-```
-
-**Benefit**: Eliminates false sharing between reader and writer fields.
-Currently all six fields (`_begin_chunk`, `_begin_pos`, `_back_chunk`,
-`_back_pos`, `_end_chunk`, `_end_pos`) are laid out contiguously with no
-alignment guarantees. On a 64-byte cache line, reader and writer fields
-will frequently share cache lines, causing coherency traffic.
-
-### 4. Threshold-Based Backpressure
-
-**Goal**: Replace per-message modulo with branch-predicted threshold check.
-
-Current code in `pipe_t::read()`:
-```cpp
-if (_lwm > 0 && _msgs_read % _lwm == 0)    // ~20-40 cycle modulo
-    send_activate_write(_peer, _msgs_read);
-```
-
-Proposed:
-```cpp
-if (unlikely(_msgs_read >= _next_activate_threshold)) {
-    _next_activate_threshold = _msgs_read + _lwm;
-    send_activate_write(_peer, _msgs_read);
-}
-```
-
-**Benefit**: Replaces integer modulo (~20-40 cycles) with comparison (~1 cycle).
-The threshold is computed once per activation, not per message. Branch
-prediction will correctly predict "not taken" ~99.5% of the time (for LWM=50
-with HWM=100).
-
-**Additional consideration**: For same-thread coroutine pipes, the
-`send_activate_write` can be a direct function call instead of a command
-through the mailbox, eliminating another signaler round-trip.
-
-### 5. Coroutine-Aware Mailbox: `mailbox_coro_t`
-
-**Goal**: Provide a mailbox variant that integrates with the event loop
-without kernel signaling.
-
-```cpp
-// New file: src/mailbox_coro.hpp
-//
-// Mailbox for coroutine event loop. Uses MPSC queue + event loop
-// callback instead of signaler + mutex + ypipe.
-
-class mailbox_coro_t : public i_mailbox
-{
-public:
-    using notify_fn_t = void (*)(void *ctx);
-
-    mailbox_coro_t(notify_fn_t notify, void *ctx)
-        : _notify(notify), _ctx(ctx), _active(false) {}
-
+    // Producer: lock-free push. O(1). Any thread.
+    // Cost: one atomic exchange (~5-8ns) + conditional notify.
     void send(const command_t &cmd_) override
     {
-        auto *node = _node_pool.allocate();
-        node->value = cmd_;
-        _queue.push(node);
+        node_t *n = _pool.allocate();  // thread-local pool
+        n->cmd = cmd_;
+        n->next.store(nullptr, std::memory_order_relaxed);
 
-        // If consumer is sleeping, wake it via event loop callback.
-        // No mutex, no syscall.
-        if (!_active) {
-            _notify(_ctx);
-        }
+        // Swing head to new node. This is the linearization point.
+        node_t *prev = _head.exchange(n, std::memory_order_acq_rel);
+        // Link previous head to new node. Consumer spins briefly
+        // if it reaches this node before the store is visible
+        // (~1 cycle window on x86, wider on ARM).
+        prev->next.store(n, std::memory_order_release);
+
+        // Notify consumer. Idempotent: only the first notify()
+        // after arm() actually posts a task.
+        _notifier->notify();
     }
 
+    // Consumer: drain all available commands. Single-threaded.
     int recv(command_t *cmd_, int timeout_) override
     {
-        auto *node = _queue.pop();
-        if (node) {
-            *cmd_ = std::move(node->value);
-            _node_pool.deallocate(node);
-            _active = true;
+        node_t *n = pop();
+        if (n) {
+            *cmd_ = n->cmd;
+            _pool.deallocate(n);
             return 0;
         }
 
-        _active = false;
+        // No commands available. Arm the notifier so the next
+        // send() will wake us.
+        _notifier->arm();
+
+        // Double-check after arming to close the race where
+        // send() happened between our pop() and arm().
+        n = pop();
+        if (n) {
+            *cmd_ = n->cmd;
+            _pool.deallocate(n);
+            return 0;
+        }
 
         if (timeout_ == 0) {
             errno = EAGAIN;
             return -1;
         }
 
-        // For blocking recv in coroutine context:
-        // Suspend the coroutine and set up a timer if timeout > 0.
-        // The event loop will resume us when send() calls _notify().
+        // Blocking wait is handled by the executor: the notifier
+        // will post a task when commands arrive. Timeout is
+        // handled by the executor's timer facility.
         errno = EAGAIN;
         return -1;
     }
 
-private:
-    mpsc_queue_t<command_t> _queue;
-    node_pool_t<command_t> _node_pool;  // Per-thread freelist
-    notify_fn_t _notify;
-    void *_ctx;
-    bool _active;
+  private:
+    struct node_t {
+        std::atomic<node_t *> next;
+        command_t cmd;
+    };
+
+    // Vyukov MPSC: head is producer-side (atomic exchange),
+    // tail is consumer-side (plain pointer).
+    alignas(64) std::atomic<node_t *> _head;
+    alignas(64) node_t *_tail;
+    node_t _stub;
+
+    i_notifier_t *_notifier;
+    pool_t<node_t> _pool;   // Per-thread freelist, see §2.1
+
+    node_t *pop(); // Standard Vyukov MPSC pop, see below
 };
 ```
 
-### 6. Batched Flush with Coalescing
+#### 2.1 Node Pool Design
 
-**Goal**: Reduce the number of wakeup notifications per event loop tick.
-
-In a coroutine event loop, multiple coroutines may write to different pipes
-before yielding. Each flush currently triggers an independent wakeup. We
-propose a **deferred flush** mechanism:
+The MPSC queue requires per-node allocation. Under high load this would
+be a malloc/free per command — unacceptable. We use a thread-local
+freelist with bounded overflow to the global allocator:
 
 ```cpp
-class event_loop_integration_t
+template <typename T>
+class pool_t
 {
-public:
-    // Called by pipe_t::flush() instead of immediate signaler send.
-    void schedule_activation(pipe_t *pipe)
+  public:
+    // Each thread keeps up to 64 nodes in its local freelist.
+    // Overflow goes to a shared lock-free stack (Treiber stack)
+    // which itself overflows to malloc/free.
+    static constexpr int local_capacity = 64;
+    static constexpr int shared_capacity = 1024;
+
+    T *allocate()
     {
-        _pending_activations.push_back(pipe);
-        if (!_flush_scheduled) {
-            _flush_scheduled = true;
-            // Schedule a single callback for end of current event loop tick
-            schedule_microtask([this]() { flush_all(); });
-        }
+        // Fast path: thread-local freelist (~2ns)
+        if (_local_count > 0)
+            return _local[--_local_count];
+
+        // Medium path: shared Treiber stack (~10-15ns)
+        T *n = _shared.pop();
+        if (n) return n;
+
+        // Slow path: malloc (~50-200ns, amortized with batching)
+        return static_cast<T *>(
+            aligned_alloc(64, sizeof(T)));
     }
 
-private:
-    void flush_all()
+    void deallocate(T *n)
     {
-        for (auto *pipe : _pending_activations) {
-            pipe->process_activate_read();
+        // Fast path: return to local freelist
+        if (_local_count < local_capacity) {
+            _local[_local_count++] = n;
+            return;
         }
-        _pending_activations.clear();
-        _flush_scheduled = false;
+
+        // Overflow: return to shared stack
+        if (!_shared.push(n))
+            free(n);  // Shared stack full, release to OS
     }
 
-    std::vector<pipe_t *> _pending_activations;
-    bool _flush_scheduled = false;
+  private:
+    static thread_local T *_local[local_capacity];
+    static thread_local int _local_count;
+    static treiber_stack_t<T> _shared;
 };
 ```
 
-**Benefit**: N pipe flushes in the same event loop tick result in exactly 1
-event loop callback instead of N signaler writes. This matters when a single
-coroutine fans out to many peers (e.g., PUB socket with many subscribers).
+**Cost model**: Under steady state, nodes cycle through the thread-local
+freelist. Allocation cost is ~2ns (array index decrement + pointer load).
+The Treiber stack handles thread-to-thread migration of nodes without
+malloc. Only sustained imbalance hits malloc.
 
-### 7. Adaptive Command Throttling
+### 3. Cache-Line Partitioned Data Structures
 
-**Goal**: Replace fixed RDTSC/tick-counter throttling with event-loop-aware
-batching.
+**Goal**: Eliminate false sharing between reader and writer fields across
+all data structures. This is critical when coroutines migrate between
+cores via work-stealing.
 
-Current design:
-- **Send path**: RDTSC-based, skip `process_commands` if <1ms since last check
-- **Recv path**: Counter-based, check every 100 messages
+#### 3.1 yqueue_t layout
 
-These heuristics assume OS-thread blocking semantics. In a coroutine event
-loop, commands should be processed at natural yield points:
+Current (yqueue.hpp:172-182):
+```
+_begin_chunk    8B  ← reader
+_begin_pos      4B  ← reader
+_back_chunk     8B  ← writer    ← likely same cache line as _begin_*
+_back_pos       4B  ← writer
+_end_chunk      8B  ← writer
+_end_pos        4B  ← writer
+// padding (compiler-dependent)
+_spare_chunk    8B  ← shared (atomic)
+```
 
+Proposed:
 ```cpp
-// In coroutine-aware socket:
-int send_coro(msg_t *msg)
+template <typename T, int N>
+class yqueue_t
 {
-    // Process all pending commands at start of each user operation.
-    // This is cheap because mailbox_coro_t::recv is a simple
-    // pointer check (~1ns) when empty, not a syscall.
-    process_all_pending_commands();
+    // Reader fields: only touched by pop()/front()
+    alignas(64) chunk_t *_begin_chunk;
+    int _begin_pos;
+    // 52 bytes padding to fill cache line
 
-    int rc = xsend(msg);
-    if (rc == 0)
-        return 0;
+    // Writer fields: only touched by push()/back()/unpush()
+    alignas(64) chunk_t *_back_chunk;
+    int _back_pos;
+    chunk_t *_end_chunk;
+    int _end_pos;
+    // 32 bytes padding to fill cache line
 
-    if (errno == EAGAIN) {
-        // Suspend coroutine, resume when pipe becomes writable
-        co_await writable_event(this);
-        return xsend(msg);
-    }
-    return rc;
+    // Shared: atomic exchange between reader (pop) and writer (push)
+    alignas(64) atomic_ptr_t<chunk_t> _spare_chunk;
+};
+```
+
+**Cost**: 192 bytes per yqueue instead of ~52 bytes. One per pipe
+(negligible vs. chunk allocations).
+
+**Benefit**: Reader pop() and writer push() never invalidate each
+other's cache lines. The spare_chunk atomic exchange is the only
+cross-core traffic, and it happens once per N operations (N=256 for
+message pipes).
+
+#### 3.2 ypipe_t layout
+
+Current (ypipe.hpp:150-172):
+```
+yqueue_t _queue  [variable]
+T *_w            8B  ← writer
+T *_r            8B  ← reader    ← same cache line as _w
+T *_f            8B  ← writer
+atomic_ptr_t _c  8B  ← shared   ← same cache line as _r
+```
+
+Proposed:
+```cpp
+template <typename T, int N>
+class ypipe_t : public ypipe_base_t<T>
+{
+  protected:
+    yqueue_t<T, N> _queue;
+
+    // Writer-only: touched on every write() and flush()
+    alignas(64) T *_w;
+    T *_f;
+
+    // Reader-only: touched on every check_read()
+    alignas(64) T *_r;
+
+    // Shared: the single point of contention. Own cache line
+    // ensures CAS doesn't invalidate reader or writer state.
+    alignas(64) atomic_ptr_t<T> _c;
+};
+```
+
+**Benefit**: The CAS on `_c` in `flush()` and `check_read()` no longer
+bounces the cache lines containing `_w`/`_f` or `_r`. Under cross-core
+execution this eliminates ~40-80ns of coherency latency per flush/read
+cycle.
+
+#### 3.3 command_t alignment
+
+`command_t` (command.hpp:186-193) is already aligned to cache line size
+on POSIX systems via `__attribute__((aligned(ZMQ_CACHELINE_SIZE)))`.
+This is correct and should be retained.
+
+### 4. Threshold-Based Backpressure
+
+**Goal**: Replace per-message integer division with a branch-predicted
+comparison.
+
+Current (pipe.cpp:201):
+```cpp
+if (_lwm > 0 && _msgs_read % _lwm == 0)
+    send_activate_write(_peer, _msgs_read);
+```
+
+Proposed:
+```cpp
+// In pipe_t constructor, and after each HWM reconfiguration:
+_next_activate_threshold = _lwm;
+
+// In pipe_t::read():
+if (unlikely(_msgs_read >= _next_activate_threshold)) {
+    _next_activate_threshold += _lwm;
+    send_activate_write(_peer, _msgs_read);
 }
 ```
 
-**Benefit**: Eliminates RDTSC reads on the send path and tick-counter
-bookkeeping on the recv path. Commands are processed at every yield point
-with negligible cost because the check is a simple NULL pointer comparison.
+**Why this matters**: Integer division/modulo by a non-power-of-2 value
+compiles to a `mul` + shift sequence on x86 (~20-40 cycles). A comparison
+is 1 cycle. The branch predictor correctly predicts "not taken" with
+>99% accuracy (taken once per LWM messages). At 10M msgs/sec, this
+saves ~200-400 million cycles/sec.
 
----
+**No behavioral change**: The activation fires at exactly the same
+message counts. The only difference is the computation method.
 
-## Cache Line and Memory Layout Analysis
+### 5. Integrated Notification: Pipe Flush Without Mailbox
 
-### msg_t (64 bytes -- exactly 1 cache line)
+**Goal**: For the highest-frequency commands (`activate_read`,
+`activate_write`), bypass the mailbox entirely and use the notifier
+directly.
 
-```
-Offset  Field                   Size    Access Pattern
-------  -----                   ----    --------------
-0       metadata *              8       Read on recv, rarely
-8       data/content/unused     varies  Read/write on data access
-56      type                    1       Read on every operation
-57      flags                   1       Read on every recv (more check)
-58-61   routing_id              4       Read on ROUTER/SERVER sockets
-62+     group                   varies  Read on RADIO/DISH sockets
-```
+Currently, every pipe flush that finds the reader asleep triggers:
+1. `pipe_t::flush()` calls `send_activate_read(_peer)` (pipe.cpp:256)
+2. `object_t::send_command(cmd)` (object.cpp:520-522)
+3. `ctx_t::send_command(tid, cmd)` (ctx.cpp:642-644)
+4. `_slots[tid]->send(cmd)` → mailbox mutex + ypipe + signaler
 
-**Observation**: `msg_t` is exactly 64 bytes (1 cache line). This is
-intentional and optimal. When stored in `yqueue_t` with N=256:
-- Each chunk holds 256 * 64 = 16,384 bytes = 256 cache lines of data
-- Sequential access pattern has excellent hardware prefetch behavior
-- One chunk fits in ~25% of a typical 64KB L1d cache
+This is 4 layers of indirection for a 1-bit signal ("you have data").
+The ypipe's `_c` pointer already carries this information atomically.
+What's missing is the notification to the consumer's executor.
 
-**No change recommended** for `msg_t` layout.
+Proposed: attach the notifier directly to the pipe, not to the mailbox:
 
-### ypipe_t Member Layout
-
-```
-Current layout (no alignment control):
-  yqueue_t _queue    [variable size, contains 6 fields + spare_chunk]
-  T *_w              8 bytes  -- WRITER ONLY
-  T *_r              8 bytes  -- READER ONLY
-  T *_f              8 bytes  -- WRITER ONLY
-  atomic_ptr_t _c    8 bytes  -- SHARED (atomic)
-```
-
-**Problem**: `_w`, `_r`, `_f`, `_c` are likely on the same cache line (32
-bytes total). Writer touches `_w` and `_f` on every flush. Reader touches `_r`
-on every check_read. `_c` is touched atomically by both. All four sharing a
-cache line means every write to `_w`/`_f` invalidates the reader's cached
-`_r`, and vice versa.
-
-**Proposed layout**:
 ```cpp
-alignas(64) struct { T *_w; T *_f; } _writer_state;
-alignas(64) struct { T *_r; }        _reader_state;
-alignas(64) atomic_ptr_t<T> _c;      // Shared, own cache line
+class pipe_t
+{
+    // ...existing members...
+
+    // Notifier for the read side. When flush() returns false
+    // (reader sleeping), notify directly instead of routing
+    // through mailbox.
+    i_notifier_t *_read_notifier;   // set by consumer side
+    i_notifier_t *_write_notifier;  // set by producer side
+
+    void flush()
+    {
+        if (_state == term_ack_sent)
+            return;
+
+        if (_out_pipe && !_out_pipe->flush()) {
+            // Reader is sleeping. Notify directly.
+            if (_read_notifier) {
+                _read_notifier->notify();
+            } else {
+                // Fallback: legacy path through mailbox
+                send_activate_read(_peer);
+            }
+        }
+    }
+};
 ```
 
-**Cost**: 192 bytes instead of 32 bytes for the state fields. This is a
-one-time allocation per pipe, negligible compared to the chunks.
+**Benefit**: Eliminates the mailbox entirely for the hottest path.
+The flush returns false (reader sleeping) → one atomic exchange on
+the notifier's `_armed` flag → conditional task post to executor.
+No mutex, no command serialization, no ypipe write for a command that
+carries zero data.
 
-**Benefit**: Eliminates false sharing between reader, writer, and the
-shared atomic pointer. Each can be modified without invalidating the
-other's cache line.
+**For activate_write** (backpressure signal, pipe.cpp:202): same
+pattern, but through `_write_notifier`:
+
+```cpp
+bool pipe_t::read(msg_t *msg_)
+{
+    // ...existing read logic...
+
+    if (unlikely(_msgs_read >= _next_activate_threshold)) {
+        _next_activate_threshold += _lwm;
+        if (_write_notifier) {
+            _peers_msgs_read_cache = _msgs_read;
+            _write_notifier->notify();
+        } else {
+            send_activate_write(_peer, _msgs_read);
+        }
+    }
+    return true;
+}
+```
+
+**The mailbox remains** for infrequent commands (bind, term, hiccup,
+pipe_hwm, etc.) which don't need this optimization. Only
+`activate_read` and `activate_write` — which account for >95% of
+command traffic under load — bypass it.
+
+### 6. Batch-Aware Consumer Drain Loop
+
+**Goal**: When the consumer is notified, drain all available work across
+all pipes before re-arming the notifier. This amortizes the notification
+cost across many messages.
+
+```cpp
+// Consumer-side drain loop (replaces io_thread_t::in_event
+// and socket_base_t::process_commands for executor mode)
+
+class executor_consumer_t
+{
+    i_notifier_t *_notifier;
+    std::vector<pipe_t *> _active_pipes;
+    mailbox_mpsc_t *_mailbox;
+
+    // Called by executor when notifier fires.
+    void on_notify()
+    {
+        // Phase 1: Process all pending mailbox commands.
+        // These are infrequent (bind, term, etc.).
+        command_t cmd;
+        while (_mailbox->recv(&cmd, 0) == 0) {
+            cmd.destination->process_command(cmd);
+        }
+
+        // Phase 2: Drain all readable pipes.
+        // Each pipe's ypipe may have many messages batched.
+        for (auto *pipe : _active_pipes) {
+            msg_t msg;
+            while (pipe->read(&msg)) {
+                process_message(pipe, &msg);
+            }
+        }
+
+        // Phase 3: Re-arm for next notification.
+        _notifier->arm();
+
+        // Phase 4: Double-check after arming.
+        // Handles the race where a writer notified between
+        // our last read attempt and arm().
+        bool more_work = false;
+        if (_mailbox->recv(&cmd, 0) == 0) {
+            cmd.destination->process_command(cmd);
+            more_work = true;
+        }
+        for (auto *pipe : _active_pipes) {
+            if (pipe->check_read()) {
+                more_work = true;
+                break;
+            }
+        }
+        if (more_work) {
+            // Re-enter drain loop without waiting for notification.
+            // Post to executor to avoid stack growth.
+            _notifier->notify();
+        }
+    }
+};
+```
+
+**Key property — self-tuning batch size:**
+
+Under low load: one message arrives → notify → drain 1 message → arm.
+Latency-optimal: message is processed as soon as it arrives.
+
+Under high load: thousands of messages arrive while consumer processes →
+all are drained in one pass → arm → next batch. Throughput-optimal:
+one notification per drain cycle, regardless of arrival rate.
+
+This replaces the hardcoded constants `inbound_poll_rate = 100` and
+`max_command_delay = 3,000,000` ticks (config.hpp:26,43) with adaptive
+behavior that emerges from the arm/notify protocol.
+
+### 7. Executor Integration Interface
+
+**Goal**: Provide a minimal, stable interface that executor libraries
+implement to integrate with libzmq's pipe and command infrastructure.
+
+```cpp
+// src/i_executor.hpp
+//
+// Minimal interface an executor must provide. Implementations
+// exist for each supported runtime (Asio, Tokio FFI, raw epoll,
+// io_uring, etc.).
+
+class i_executor_t
+{
+  public:
+    virtual ~i_executor_t() = default;
+
+    // Post a callable to be executed on this executor.
+    // Thread-safe. The callable will run on one of the executor's
+    // worker threads. If the executor is single-threaded, it runs
+    // on that thread.
+    //
+    // This is the ONLY cross-thread operation. Everything else
+    // (arm, drain, process) happens within the executor's context.
+    virtual void post(void (*fn)(void *), void *arg) = 0;
+
+    // Create a notifier bound to this executor. When notify()
+    // is called, the executor will eventually invoke the given
+    // callback. The notifier handles dedup internally.
+    virtual i_notifier_t *create_notifier(void (*fn)(void *),
+                                          void *arg) = 0;
+};
+```
+
+**Integration with existing poller:**
+
+The existing `worker_poller_base_t` (poller_base.hpp:135-166) owns a
+dedicated OS thread running `loop()`. This is itself an executor — a
+single-threaded run loop. The `signaler_notifier_t` maps naturally
+onto it: `notify()` writes to eventfd, `loop()` wakes from
+`epoll_wait()`, drains, `arm()` reads from eventfd.
+
+New executor backends plug in at the same level without changing the
+pipe, ypipe, or yqueue code.
 
 ---
 
-## Quantified Improvement Estimates
+## Cost Model: Current vs Proposed
 
-### Inproc, Same-Thread Coroutine Pipe
+### Per-message costs (steady-state, cross-thread, inproc)
 
 | Operation | Current | Proposed | Savings |
-|-----------|---------|----------|---------|
-| Pipe flush wakeup | ~1000ns (eventfd write) | ~2ns (callback) | 99.8% |
-| Mailbox send for activate_write | ~1500ns (mutex+ypipe+signaler) | ~5ns (direct call) | 99.7% |
-| Mailbox send for activate_read | ~1500ns | ~5ns | 99.7% |
-| check_read CAS | ~20ns | ~1ns (plain load) | 95% |
-| Backpressure modulo | ~30ns | ~1ns (comparison) | 97% |
-| Command processing check | ~100ns (RDTSC or counter) | ~1ns (pointer check) | 99% |
+|---|---|---|---|
+| ypipe::write + push | 5-10ns | 5-10ns | (unchanged) |
+| ypipe::flush CAS | 15-25ns | 15-25ns | (unchanged, required for cross-thread) |
+| Notification (reader sleeping) | ~1000ns (eventfd write) | ~8ns (atomic exchange, no-op if already notified) | 99.2% |
+| Notification (reader awake) | 0ns (CAS succeeds) | 0ns (CAS succeeds) | (unchanged) |
+| Mailbox for activate_read | ~1500ns (mutex+ypipe+signaler) | 0ns (direct notifier, bypassed) | 100% |
+| ypipe::check_read CAS | 15-25ns | 15-25ns | (unchanged) |
+| ypipe::read + pop | 5-10ns | 5-10ns | (unchanged) |
+| Backpressure check | 20-40ns (modulo) | 1ns (comparison) | 97% |
+| Mailbox for activate_write | ~1500ns (mutex+ypipe+signaler) | ~8ns (direct notifier) | 99.5% |
+| False sharing penalty | ~40-80ns (per cross-core access) | 0ns (cache-line separated) | 100% |
+| process_commands overhead | 100-500ns (RDTSC/counter) | ~2ns (pointer null check on mailbox) | 99% |
 
-**Estimated inproc round-trip**: ~3-5us (current) -> ~50-100ns (proposed)
+### Aggregate per-message (amortized over batch)
 
-### Cross-Thread Pipe (Fallback to Existing Path)
+| Scenario | Current | Proposed |
+|---|---|---|
+| Inproc, cross-thread, reader awake | ~100-200ns | ~30-50ns |
+| Inproc, cross-thread, reader sleeping | ~3000-5000ns | ~80-150ns |
+| Inproc, same-thread, reader sleeping | ~3000-5000ns | ~30-60ns |
+| Fan-out to 100 pipes, all sleeping | ~150,000ns | ~500ns (1 notify, batch drain) |
 
-No regression. The existing ypipe_t/signaler path remains the default for
-cross-thread pipes. The optimization is opt-in at pipe creation time based
-on whether both endpoints are on the same event loop.
+### Notification count under load
+
+| Scenario | Current notifications/sec | Proposed notifications/sec |
+|---|---|---|
+| 1M msgs/sec, 1 pipe | ~1M signaler writes | ~10K-50K notifier posts (self-batching) |
+| 1M msgs/sec, 100 pipes | ~100M signaler writes | ~10K-50K notifier posts (coalesced) |
+| 10K msgs/sec, 1 pipe (light) | ~10K signaler writes | ~10K notifier posts (no batching) |
+
+The key insight: under high load, the arm/notify protocol naturally
+collapses O(messages) notifications into O(drain_cycles) notifications.
+Under light load, it degrades to at most O(messages) — no worse than
+current.
 
 ---
 
 ## Implementation Strategy
 
-### Phase 1: Foundation (Non-Breaking)
+### Phase 1: Cache-Line Alignment (Low Risk, Immediate Benefit)
 
-1. **Cache-line alignment for ypipe_t and yqueue_t fields**
-   - Add `alignas(64)` to reader/writer field groups
-   - Add padding in `chunk_t` for small N
-   - Zero API change, measurable throughput improvement
+**Changes:**
+- Add `alignas(64)` to reader/writer field groups in `yqueue_t`
+- Add `alignas(64)` to `_w`/`_f`, `_r`, `_c` in `ypipe_t`
+- Replace modulo with threshold comparison in `pipe_t::read()`
+- Add `_next_activate_threshold` field to `pipe_t`
 
-2. **Threshold-based backpressure in pipe_t**
-   - Replace `_msgs_read % _lwm == 0` with threshold comparison
-   - Add `_next_activate_threshold` member to `pipe_t`
-   - Zero API change, ~20-40 cycle savings per message recv
+**Impact**: Zero API change. Zero behavioral change. Measurable
+throughput improvement on multi-core systems (~10-30% for cross-thread
+inproc benchmarks based on false-sharing elimination alone).
 
-### Phase 2: Coroutine Integration Points
+**Risk**: Increased struct sizes by ~128-192 bytes per pipe. Negligible
+compared to per-chunk allocations (16KB each).
 
-3. **`ypipe_coro_t`**: Same-thread SPSC pipe with callback wakeup
-   - Implement as new ypipe_base_t subclass
-   - Wire into pipepair() with a new `coro_mode` flag
-   - Test with synthetic event loop benchmark
+### Phase 2: Notifier Abstraction
 
-4. **`mpsc_queue_t`**: Lock-free multi-producer command queue
-   - Implement Vyukov MPSC queue with node pool
-   - Create `mailbox_coro_t` using it
-   - Benchmark against current mailbox_t
+**Changes:**
+- Introduce `i_notifier_t` interface
+- Implement `signaler_notifier_t` wrapping existing `signaler_t`
+- Add `_read_notifier` / `_write_notifier` to `pipe_t`
+- Modify `pipe_t::flush()` to use notifier when available
+- Modify `pipe_t::read()` to use notifier for backpressure
 
-### Phase 3: Event Loop Integration
+**Impact**: Existing code paths unchanged when notifiers are NULL
+(legacy mode). New code paths activated when an executor sets notifiers
+on its pipes.
 
-5. **`event_loop_integration_t`**: Batched flush coalescing
-   - Deferred activation callback
-   - Integrate with coroutine scheduler interface
+### Phase 3: MPSC Mailbox
 
-6. **Adaptive command throttling**
-   - Replace RDTSC/tick-counter with yield-point processing
-   - Coroutine-aware blocking with `co_await`
+**Changes:**
+- Implement `mailbox_mpsc_t` with Vyukov MPSC queue
+- Implement `pool_t<node_t>` with thread-local freelist
+- Add as alternative `i_mailbox` implementation selectable at
+  context creation time
 
-### Phase 4: Benchmarking and Tuning
+**Impact**: Optional replacement for `mailbox_t`. Legacy path remains
+default. Executor-mode contexts use `mailbox_mpsc_t`.
 
-7. **Micro-benchmarks**
-   - ypipe_t vs ypipe_coro_t throughput (messages/sec)
-   - mailbox_t vs mailbox_coro_t command dispatch latency
-   - End-to-end inproc latency comparison
+### Phase 4: Executor Integration
 
-8. **Tuning constants**
-   - `message_pipe_granularity`: 256 is good for throughput but uses 16KB
-     per chunk. Consider 128 (8KB) for better L1 residency with many pipes.
-   - `command_pipe_granularity`: 16 is fine.
-   - `inbound_poll_rate`: irrelevant for coroutine mode (always check).
-   - `max_command_delay`: irrelevant for coroutine mode (always check).
+**Changes:**
+- Introduce `i_executor_t` interface
+- Implement `executor_notifier_t`
+- Implement `executor_consumer_t` drain loop with arm/notify/drain cycle
+- Create `executor_io_thread_t` as alternative to `io_thread_t`
+  (no dedicated OS thread; uses executor's thread pool)
+
+**Impact**: New context option `ZMQ_EXECUTOR` to provide an executor
+implementation. When set, I/O "threads" are executor tasks rather than
+OS threads.
+
+### Phase 5: Benchmarking and Tuning
+
+**Benchmarks:**
+- Inproc latency: 1-to-1, 1-to-N, N-to-1 pipe configurations
+- Inproc throughput: messages/sec at various batch sizes
+- Command dispatch latency: mailbox_t vs mailbox_mpsc_t
+- Notification overhead: signaler vs executor_notifier under load
+- Cache miss rates: before/after alignment changes (perf stat)
+- Work-stealing interaction: latency under thread migration
+
+**Tuning parameters to evaluate:**
+- `message_pipe_granularity`: 256 is good for throughput (16KB chunks,
+  99.6% allocation amortization). Consider 128 for workloads with
+  many pipes (8KB, better L1 residency). Expose as pipe option rather
+  than compile-time constant.
+- `pool_t::local_capacity`: 64 nodes per thread. May need tuning based
+  on command fan-in degree.
+- Drain batch limit: Should the consumer drain ALL available messages
+  per notification, or cap at some limit for fairness? Default: drain
+  all. Make configurable for latency-sensitive workloads.
 
 ---
 
-## Risk Analysis
+## Correctness Arguments
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Single-threaded assumption violated | Data corruption | Runtime check: assert producer/consumer on same thread in debug builds |
-| Node allocation overhead in MPSC | Memory fragmentation | Per-thread freelist with bounded size |
-| Callback wakeup ordering | Priority inversion | FIFO processing of pending activations |
-| ABI compatibility | Existing users break | All new types, existing types unchanged |
-| Increased binary size | Larger library | Conditional compilation with cmake flag |
+### 1. ypipe CAS protocol is unchanged
+
+The lock-free protocol (ypipe.hpp:76-122) is retained exactly. All
+atomics, memory orderings, and the `_c` pointer lifecycle are preserved.
+The only change is what happens AFTER `flush()` returns false — instead
+of writing to an eventfd, we call `_notifier->notify()`.
+
+This is a pure substitution of the notification transport. The data
+consistency guarantee comes from the CAS (acquire-release ordering),
+not from the signaler.
+
+### 2. Notifier idempotency prevents lost wakeups
+
+The arm/notify protocol has a potential race:
+
+```
+Consumer:                    Producer:
+  drain (reads everything)
+                             write + flush → _c was NULL → need notify
+  arm()                      notify() → _armed was true → post task
+```
+
+This is correct: producer's notify() fires because _armed was true.
+
+The dangerous race is:
+```
+Consumer:                    Producer:
+  drain (reads everything)
+                             write + flush → _c was NULL → need notify
+                             notify() → _armed was true → post task
+  arm()
+  double-check → finds data → re-enters drain
+```
+
+Also correct: the double-check after arm() catches data that arrived
+between the last drain and arm(). The re-entry via self-notify()
+ensures the consumer processes it.
+
+The truly subtle case:
+```
+Consumer:                    Producer:
+  drain (reads everything)
+  arm() → _armed = true
+                             write + flush → notify() → _armed was true → post
+  double-check → finds data → processes it
+                             [task from notify arrives]
+  on_notify() → drain → nothing to read → arm()
+```
+
+Correct but wasteful: one spurious wakeup. This is acceptable — the
+cost is one empty drain cycle (~50ns), not a lost message.
+
+### 3. MPSC queue linearizability
+
+The Vyukov MPSC queue has a well-known proof of linearizability. The
+linearization point for push is the `_head.exchange()`. The consumer's
+pop observes all pushes that completed their `prev->next.store()` before
+the consumer's `tail->next.load()`.
+
+The brief window where `prev->next` is not yet set (between exchange and
+store) is handled by the consumer returning nullptr — it will retry on
+the next drain cycle. Under the arm/notify protocol, the producer's
+notify() ensures the consumer will retry.
+
+### 4. Thread safety of pool_t
+
+Thread-local freelists are inherently thread-safe (no sharing). The
+shared Treiber stack uses a standard lock-free push/pop with CAS. Nodes
+that migrate between threads (allocated on thread A, freed on thread B)
+go to thread B's local freelist, which is correct because the freelist
+holds raw memory, not thread-affine state.
+
+---
+
+## What This Design Does NOT Do
+
+1. **Does not assume same-thread execution.** Every optimization works
+   correctly when producer and consumer are on different cores. Same-
+   thread is faster (cache hits) but not required.
+
+2. **Does not replace the ypipe protocol.** The CAS-based SPSC
+   protocol is retained. It is already near-optimal for the cross-
+   thread case.
+
+3. **Does not require a specific executor.** The `i_executor_t` /
+   `i_notifier_t` interfaces are minimal and map naturally onto Asio's
+   `post()`, Tokio's `spawn()`, Go's goroutine scheduling, raw
+   `io_uring`, or a custom event loop.
+
+4. **Does not break existing users.** All changes are additive. The
+   existing signaler/mailbox/poller path is the default. Executor
+   integration is opt-in via new context options.
+
+5. **Does not add per-message overhead.** The optimizations reduce or
+   eliminate per-message costs. No new per-message work is introduced.
+   The only new per-message cost is a comparison (`_msgs_read >=
+   threshold`) which replaces a more expensive modulo.
 
 ---
 
 ## Appendix: Key Source Files and Line References
 
 | Component | File | Key Lines | Role |
-|-----------|------|-----------|------|
-| yqueue_t | src/yqueue.hpp | 78-97 (push), 131-145 (pop) | Chunk-based storage |
-| ypipe_t | src/ypipe.hpp | 47-56 (write), 76-98 (flush), 101-122 (check_read) | Lock-free SPSC protocol |
-| pipe_t | src/pipe.cpp | 170-205 (read), 222-234 (write), 249-257 (flush) | Bidirectional pipe + HWM |
-| mailbox_t | src/mailbox.cpp | 32-40 (send), 42-74 (recv) | Mutex + SPSC + signaler |
-| signaler_t | src/signaler.cpp | 146-201 (send), 275-309 (recv) | Kernel wakeup (eventfd/pipe) |
-| io_thread_t | src/io_thread.cpp | 54-69 (in_event command loop) | I/O thread event dispatch |
-| socket_base_t | src/socket_base.cpp | 1205-1291 (send), 1293-1387 (recv), 1452-1500 (process_commands) | Application-thread hot path |
-| config.hpp | src/config.hpp | 15 (granularity=256), 26 (poll_rate=100), 43 (cmd_delay=3M) | Tuning constants |
-| atomic_ptr_t | src/atomic_ptr.hpp | 163-175 (xchg), 181-194 (cas) | CAS/exchange primitives |
-| msg_t | src/msg.hpp | 148-156 (size=64, max_vsm_size) | 64-byte message container |
+|---|---|---|---|
+| yqueue_t fields | src/yqueue.hpp | 172-182 | False-sharing layout problem |
+| yqueue_t push | src/yqueue.hpp | 78-97 | Writer hot path |
+| yqueue_t pop | src/yqueue.hpp | 131-145 | Reader hot path |
+| yqueue_t spare | src/yqueue.hpp | 86, 142 | Atomic exchange (only cross-thread op) |
+| ypipe_t fields | src/ypipe.hpp | 150-172 | False-sharing layout problem |
+| ypipe_t flush | src/ypipe.hpp | 76-98 | CAS protocol, writer side |
+| ypipe_t check_read | src/ypipe.hpp | 101-122 | CAS protocol, reader side |
+| pipe_t read | src/pipe.cpp | 170-205 | Modulo backpressure, activate_write |
+| pipe_t flush | src/pipe.cpp | 249-257 | activate_read trigger |
+| pipe_t write | src/pipe.cpp | 222-234 | HWM check |
+| mailbox_t send | src/mailbox.cpp | 32-40 | Mutex + SPSC + signaler |
+| mailbox_t recv | src/mailbox.cpp | 42-74 | Signaler wait + SPSC read |
+| signaler_t send | src/signaler.cpp | 146-201 | eventfd write (~1000ns) |
+| signaler_t recv | src/signaler.cpp | 275-309 | eventfd read (~1000ns) |
+| signaler_t wait | src/signaler.cpp | 203-273 | poll() on signaler fd |
+| io_thread_t in_event | src/io_thread.cpp | 54-69 | Command drain loop |
+| object_t send_command | src/object.cpp | 520-522 | TID-based routing |
+| ctx_t send_command | src/ctx.cpp | 642-644 | Mailbox dispatch |
+| socket_base_t send | src/socket_base.cpp | 1205-1291 | RDTSC throttle + xsend |
+| socket_base_t recv | src/socket_base.cpp | 1293-1387 | Tick counter + xrecv |
+| socket_base_t process_commands | src/socket_base.cpp | 1452-1500 | Throttled command processing |
+| config.hpp constants | src/config.hpp | 15-58 | Granularity, poll rate, cmd delay |
+| command_t | src/command.hpp | 22-194 | Command types and layout |
+| i_mailbox | src/i_mailbox.hpp | 13-28 | Mailbox interface |
+| ypipe_base_t | src/ypipe_base.hpp | 15-26 | Pipe virtual interface |
+| mailbox_safe_t | src/mailbox_safe.cpp | 50-67 | Multi-signaler broadcast pattern |
+| epoll_t::loop | src/epoll.cpp | 140-193 | Poller event loop |
+| worker_poller_base_t | src/poller_base.hpp | 135-166 | Thread-per-poller model |
