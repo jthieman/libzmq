@@ -900,7 +900,7 @@ pub fn sendMultipart(pipe: *Pipe, frames: []Msg) !void {
             return error.HighWaterMarkReached;
         }
     }
-    pipe.flushPipe();
+    pipe.flush();
 }
 
 /// Receive a complete multi-part message.
@@ -969,6 +969,566 @@ to `deinit()` frees the data.
 data is inline in the Msg struct, which is copied by value into the
 ypipe queue slot. This is a 64-byte memcpy, which is one cache line
 write — optimal on all architectures.
+
+---
+
+## Layer 6: Transport Layer (TCP, IPC, inproc)
+
+### Architecture
+
+The Pipe is always inproc — it connects two coroutines within the same
+process. What differs per transport is what sits on the other end:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ inproc                                                                   │
+│                                                                          │
+│   App coroutine A ↔ Pipe ↔ App coroutine B                              │
+│                                                                          │
+│   No session, no codec, no I/O. Pure pipe throughput.                   │
+│   Pipe pair connects two sockets directly.                              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ tcp / ipc                                                                │
+│                                                                          │
+│   App coroutine ↔ Pipe ↔ Session coroutine ↔ ZMTP codec ↔ zio Stream   │
+│                                                                          │
+│   Session bridges pipe to network. ZMTP encodes/decodes on the wire.    │
+│   Stream is either TCP (IpAddress) or Unix domain socket (UnixAddress). │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Full picture: two peers connected over TCP                               │
+│                                                                          │
+│   App ↔ Pipe ↔ Session ↔ ZMTP ↔ [TCP] ↔ ZMTP ↔ Session ↔ Pipe ↔ App   │
+│             ▲                                              ▲             │
+│             │         These are the same Pipe              │             │
+│             │         as Layers 1-4 above.                 │             │
+│             │         All batch/spin/CAS                   │             │
+│             │         optimizations apply.                 │             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The Pipe's batch flush, adaptive spin, and CAS protocol don't care what's
+on the other end. For TCP, the "reader coroutine" on one side of the pipe
+is the Session, which drains the pipe and writes to the network. The
+"writer coroutine" on the other side is also the Session, which reads from
+the network and fills the pipe. The Session is just another coroutine from
+the Pipe's perspective.
+
+### Session Coroutine
+
+Each TCP/IPC connection gets a Session — a coroutine that runs two
+concurrent loops: one for sending (pipe → network) and one for receiving
+(network → pipe).
+
+```zig
+pub const Session = struct {
+    // Pipe endpoint (our side of the pipe pair)
+    pipe: *Pipe,
+
+    // Network stream (TCP or Unix domain socket)
+    stream: zio.net.Stream,
+
+    // ZMTP codec state
+    codec: ZmtpCodec,
+
+    // Scratch buffers for vectored I/O
+    iov_storage: [16]std.os.iovec_const = undefined,
+
+    allocator: Allocator,
+
+    /// Run the session. Spawns send and receive loops as concurrent
+    /// coroutines. Returns when the connection closes or errors.
+    pub fn run(self: *Session) !void {
+        // ZMTP greeting + handshake
+        try self.codec.handshake(&self.stream);
+
+        // Run send and receive concurrently.
+        // Both are coroutines on the same executor (or wherever
+        // zio schedules them — doesn't matter, pipes handle it).
+        var group = try zio.TaskGroup.init(self.allocator);
+        defer group.deinit();
+
+        try group.spawn(sendLoop, .{self});
+        try group.spawn(recvLoop, .{self});
+        try group.wait();
+    }
+
+    // -------------------------------------------------------
+    // Send loop: Pipe → Network
+    // -------------------------------------------------------
+
+    fn sendLoop(self: *Session) !void {
+        while (true) {
+            // Drain pipe into ZMTP frames, write to network.
+            // Batch: accumulate multiple messages, write as one writev.
+            const msg = self.pipe.recvBlocking() catch |err| switch (err) {
+                error.PipeClosed => return,
+                else => return err,
+            };
+
+            // Encode ZMTP frame header + collect data pointers for writev
+            var batch_buf: [8]Msg = undefined;
+            var batch_count: u32 = 1;
+            batch_buf[0] = msg;
+
+            // Opportunistically drain more messages without blocking
+            while (batch_count < batch_buf.len) {
+                const next = self.pipe.recv() orelse break;
+                batch_buf[batch_count] = next;
+                batch_count += 1;
+            }
+
+            // Encode and write the batch
+            try self.writeBatch(batch_buf[0..batch_count]);
+
+            // Clean up sent messages
+            for (batch_buf[0..batch_count]) |*m| m.deinit(self.allocator);
+        }
+    }
+
+    /// Encode multiple messages as ZMTP frames and write with writev.
+    /// Up to 16 iovecs: pairs of (header, body) for up to 8 messages.
+    fn writeBatch(self: *Session, msgs: []const Msg) !void {
+        var iovecs: [16]std.os.iovec_const = undefined;
+        var headers: [8]ZmtpCodec.FrameHeader = undefined;
+        var iov_count: usize = 0;
+
+        for (msgs, 0..) |*msg, i| {
+            const data = msg.dataSlice();
+
+            // Encode ZMTP frame header (1-9 bytes)
+            headers[i] = self.codec.encodeFrameHeader(
+                data.len,
+                msg.flags.more,
+                msg.flags.command,
+            );
+
+            // iovec 1: frame header
+            iovecs[iov_count] = .{
+                .iov_base = &headers[i].bytes,
+                .iov_len = headers[i].len,
+            };
+            iov_count += 1;
+
+            // iovec 2: frame body (zero-copy from Msg data)
+            if (data.len > 0) {
+                iovecs[iov_count] = .{
+                    .iov_base = data.ptr,
+                    .iov_len = data.len,
+                };
+                iov_count += 1;
+            }
+        }
+
+        // Single writev syscall for the entire batch
+        try self.stream.writeVecAll(iovecs[0..iov_count], .none);
+    }
+
+    // -------------------------------------------------------
+    // Receive loop: Network → Pipe
+    // -------------------------------------------------------
+
+    fn recvLoop(self: *Session) !void {
+        // Read buffer: one contiguous allocation for network reads.
+        // ZMTP frames are decoded in-place, then copied into Msg structs
+        // (VSM for small) or zero-copy referenced (LMSG for large).
+        var read_buf: [16384]u8 = undefined;
+        var buf_pos: usize = 0;
+        var buf_len: usize = 0;
+
+        while (true) {
+            // Read more data from the network
+            if (buf_pos >= buf_len) {
+                buf_len = self.stream.read(&read_buf, .none) catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => return err,
+                };
+                if (buf_len == 0) return;  // connection closed
+                buf_pos = 0;
+            }
+
+            // Decode ZMTP frames from the buffer
+            var batch_count: u32 = 0;
+            while (buf_pos < buf_len) {
+                const frame = self.codec.decodeFrame(
+                    read_buf[buf_pos..buf_len],
+                ) orelse break;  // incomplete frame, need more data
+
+                // Create Msg from decoded frame
+                var msg = try Msg.initSize(self.allocator, frame.body_len);
+                @memcpy(msg.dataMut()[0..frame.body_len], frame.body);
+                msg.flags.more = frame.more;
+                msg.flags.command = frame.command;
+
+                // Write to pipe (no flush yet — batch it)
+                if (!try self.pipe.send(&msg)) {
+                    // HWM hit — block until space available
+                    try self.pipe.sendBlocking(&msg);
+                }
+                batch_count += 1;
+                buf_pos += frame.total_len;
+            }
+
+            // Flush the batch: one CAS for all decoded messages
+            if (batch_count > 0) {
+                self.pipe.flush();
+            }
+
+            // Shift remaining bytes to front of buffer
+            if (buf_pos > 0 and buf_pos < buf_len) {
+                std.mem.copyForwards(u8, &read_buf, read_buf[buf_pos..buf_len]);
+                buf_len -= buf_pos;
+                buf_pos = 0;
+            } else if (buf_pos >= buf_len) {
+                buf_pos = 0;
+                buf_len = 0;
+            }
+        }
+    }
+};
+```
+
+### ZMTP Codec
+
+ZMTP 3.1 frame format on the wire:
+
+```
+Short frame:  Flags(1) + Size(1) + Body(0..255)
+Long frame:   Flags(1) + Size(8) + Body(0..2^63)
+
+Flags byte:
+  bit 0: MORE    - more frames in this logical message
+  bit 1: LONG    - size field is 8 bytes (not 1)
+  bit 2: COMMAND - this is a command frame (not data)
+```
+
+```zig
+pub const ZmtpCodec = struct {
+    pub const FrameHeader = struct {
+        bytes: [9]u8,  // max header size: 1 flags + 8 size
+        len: u8,       // actual header length (2 or 9)
+    };
+
+    pub const DecodedFrame = struct {
+        body: []const u8,
+        body_len: usize,
+        total_len: usize,  // header + body
+        more: bool,
+        command: bool,
+    };
+
+    /// Encode a ZMTP frame header. Does not copy body data —
+    /// the caller uses writev to send header + body together.
+    pub fn encodeFrameHeader(
+        self: *ZmtpCodec,
+        body_len: usize,
+        more: bool,
+        command: bool,
+    ) FrameHeader {
+        var header: FrameHeader = .{ .bytes = undefined, .len = undefined };
+        var flags: u8 = 0;
+        if (more) flags |= 0x01;
+        if (command) flags |= 0x04;
+
+        if (body_len <= 255) {
+            // Short frame: 1 byte flags + 1 byte size
+            header.bytes[0] = flags;
+            header.bytes[1] = @intCast(body_len);
+            header.len = 2;
+        } else {
+            // Long frame: 1 byte flags + 8 byte size
+            flags |= 0x02;  // LONG bit
+            header.bytes[0] = flags;
+            std.mem.writeInt(u64, header.bytes[1..9], @intCast(body_len), .big);
+            header.len = 9;
+        }
+        return header;
+    }
+
+    /// Decode a ZMTP frame from the buffer. Returns null if the buffer
+    /// doesn't contain a complete frame (need more data from the network).
+    pub fn decodeFrame(self: *ZmtpCodec, buf: []const u8) ?DecodedFrame {
+        if (buf.len < 2) return null;  // need at least flags + 1 byte size
+
+        const flags = buf[0];
+        const more = (flags & 0x01) != 0;
+        const long = (flags & 0x02) != 0;
+        const command = (flags & 0x04) != 0;
+
+        var body_len: usize = undefined;
+        var header_len: usize = undefined;
+
+        if (long) {
+            if (buf.len < 9) return null;  // need 8-byte size
+            header_len = 9;
+            body_len = @intCast(std.mem.readInt(u64, buf[1..9], .big));
+        } else {
+            header_len = 2;
+            body_len = buf[1];
+        }
+
+        const total_len = header_len + body_len;
+        if (buf.len < total_len) return null;  // incomplete body
+
+        return .{
+            .body = buf[header_len..total_len],
+            .body_len = body_len,
+            .total_len = total_len,
+            .more = more,
+            .command = command,
+        };
+    }
+
+    /// Perform ZMTP 3.1 greeting and handshake on a new connection.
+    pub fn handshake(self: *ZmtpCodec, stream: *zio.net.Stream) !void {
+        // Greeting: 64-byte exchange
+        //   Bytes 0-9:   Signature (0xFF + 8 padding + 0x7F)
+        //   Byte 10:     Major version (3)
+        //   Byte 11:     Minor version (1)
+        //   Bytes 12-31: Mechanism ("NULL" + padding)
+        //   Byte 32:     as-server flag
+        //   Bytes 33-63: Padding (zeros)
+        var greeting: [64]u8 = .{0} ** 64;
+        greeting[0] = 0xFF;
+        greeting[9] = 0x7F;
+        greeting[10] = 3;  // major
+        greeting[11] = 1;  // minor
+        @memcpy(greeting[12..16], "NULL");
+
+        // Send greeting and read peer's greeting concurrently.
+        // (In practice, send first then read — simpler and works fine
+        // because TCP buffers absorb the 64 bytes.)
+        try stream.writeAll(&greeting, .none);
+
+        var peer_greeting: [64]u8 = undefined;
+        try stream.readAll(&peer_greeting, .none);
+
+        // Validate peer greeting
+        if (peer_greeting[0] != 0xFF or peer_greeting[9] != 0x7F)
+            return error.InvalidGreeting;
+        if (peer_greeting[10] < 3)
+            return error.UnsupportedVersion;
+
+        // NULL mechanism: send READY command, receive READY
+        try self.sendReady(stream);
+        try self.recvReady(stream);
+    }
+
+    fn sendReady(self: *ZmtpCodec, stream: *zio.net.Stream) !void {
+        // READY command frame with socket type property
+        const ready_body = "\x05READY" ++ // command name
+            "\x0bSocket-Type" ++ // property name (11 bytes)
+            "\x00\x00\x00\x04" ++ // property value length
+            "PAIR"; // socket type (varies)
+        const header = self.encodeFrameHeader(ready_body.len, false, true);
+        var iovecs: [2]std.os.iovec_const = .{
+            .{ .iov_base = &header.bytes, .iov_len = header.len },
+            .{ .iov_base = ready_body.ptr, .iov_len = ready_body.len },
+        };
+        try stream.writeVecAll(&iovecs, .none);
+    }
+
+    fn recvReady(self: *ZmtpCodec, stream: *zio.net.Stream) !void {
+        // Read and validate READY command from peer
+        var header_buf: [9]u8 = undefined;
+        try stream.readAll(header_buf[0..2], .none);
+        // ... decode and validate READY command
+    }
+};
+```
+
+### Transport Bindings
+
+All transports produce the same thing: a `Session` with a `Pipe` and
+a `zio.net.Stream`. The only difference is how the `Stream` is obtained.
+
+```zig
+pub const Transport = struct {
+    /// TCP transport: connect to remote host
+    pub fn tcpConnect(
+        allocator: Allocator,
+        addr: zio.net.IpAddress,
+        pipe: *Pipe,
+    ) !*Session {
+        var stream = try addr.connect(.{});
+        errdefer stream.close();
+
+        // TCP_NODELAY: critical for latency. Without it, Nagle's algorithm
+        // delays small writes by up to 40ms waiting to coalesce.
+        try stream.socket.setNoDelay(true);
+
+        const session = try allocator.create(Session);
+        session.* = .{
+            .pipe = pipe,
+            .stream = stream,
+            .codec = .{},
+            .allocator = allocator,
+        };
+        return session;
+    }
+
+    /// TCP transport: accept incoming connection
+    pub fn tcpAccept(
+        allocator: Allocator,
+        server: zio.net.Server,
+        pipe: *Pipe,
+    ) !*Session {
+        var stream = try server.accept();
+        errdefer stream.close();
+
+        try stream.socket.setNoDelay(true);
+
+        const session = try allocator.create(Session);
+        session.* = .{
+            .pipe = pipe,
+            .stream = stream,
+            .codec = .{},
+            .allocator = allocator,
+        };
+        return session;
+    }
+
+    /// IPC transport: connect via Unix domain socket
+    pub fn ipcConnect(
+        allocator: Allocator,
+        path: []const u8,
+        pipe: *Pipe,
+    ) !*Session {
+        const addr = try zio.net.UnixAddress.init(path);
+        var stream = try addr.connect(.{});
+        errdefer stream.close();
+
+        const session = try allocator.create(Session);
+        session.* = .{
+            .pipe = pipe,
+            .stream = stream,
+            .codec = .{},
+            .allocator = allocator,
+        };
+        return session;
+    }
+
+    /// IPC transport: accept via Unix domain socket
+    pub fn ipcAccept(
+        allocator: Allocator,
+        server: zio.net.Server,
+        pipe: *Pipe,
+    ) !*Session {
+        var stream = try server.accept();
+        errdefer stream.close();
+
+        const session = try allocator.create(Session);
+        session.* = .{
+            .pipe = pipe,
+            .stream = stream,
+            .codec = .{},
+            .allocator = allocator,
+        };
+        return session;
+    }
+};
+```
+
+### Transport Hot Path Analysis
+
+For TCP/IPC, the hot path has two segments: the Pipe (inproc) and the
+network I/O. The Pipe segment is identical to pure inproc and benefits
+from all the same optimizations. The network segment is dominated by
+syscall and kernel overhead.
+
+```
+App coroutine                 Session coroutine                Network
+     |                              |                              |
+  send(&msg)  ← ~5ns              |                              |
+  flush()     ← ~20ns CAS         |                              |
+  [wakeReader if needed]           |                              |
+                                recvBlocking()                    |
+                                  spin → catch data               |
+                                  recv() × N  ← ~5ns/msg          |
+                                  writeBatch() →→→→→→→→→→→→→ writev()
+                                    encode headers ← ~3ns/msg     |  ← ~500-2000ns
+                                    writev (batch)                |     (syscall +
+                                    ← one syscall for N msgs      |      kernel copy)
+                                                                  |
+                              recvLoop():                     read()
+                                stream.read() ←←←←←←←←←←← ← ~500-2000ns
+                                decode frames ← ~5ns/frame        |
+                                pipe.send() × N ← ~5ns/msg        |
+                                pipe.flush() ← ~20ns CAS          |
+                                [wakeReader if needed]             |
+```
+
+**Key insight**: The network syscall (~500-2000ns) dominates over the pipe
+operations (~5-25ns). This means:
+
+1. **Batching matters even more for TCP**: Each writev/read is a syscall.
+   The session's send loop batches multiple messages into one writev
+   (up to 8 messages = 16 iovecs of header+body pairs).
+
+2. **The pipe's adaptive spin helps TCP too**: The session's recv loop
+   decodes frames and writes to the pipe in batches, flushing once per
+   read() syscall return. The app coroutine's adaptive spin catches
+   these batches without parking.
+
+3. **TCP_NODELAY is mandatory**: Without it, Nagle's algorithm adds up
+   to 40ms latency on small writes. With it, each writev goes out
+   immediately. The batching in writeBatch() replaces Nagle's role of
+   coalescing small writes.
+
+4. **Zero-copy where possible**: For LMSG (large messages), the session's
+   writev uses the Msg's Content data pointer directly in the iovec —
+   no memcpy. For VSM (small messages ≤48 bytes), the data is inline
+   in the Msg struct and gets copied into the ZMTP frame, which is
+   unavoidable but fast (one cache line).
+
+5. **Session placement doesn't matter**: The session coroutine can be on
+   any executor. If it ends up on the same executor as the app, pipe
+   operations are ~5ns (L1 CAS). If different, ~20-25ns (cross-core
+   CAS). Either way, the network syscall dominates.
+
+### Reconnection
+
+When a TCP connection drops, the session detects it (read returns 0 or
+error) and exits. The socket layer handles reconnection:
+
+```zig
+// Reconnection is a socket-layer concern, not a session concern.
+// The socket spawns a new session coroutine on reconnect.
+fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
+    var backoff: u64 = 100;  // ms, initial backoff
+    const max_backoff: u64 = 30_000;  // 30s max
+
+    while (socket.active) {
+        // Create pipe pair for the new connection
+        var pipes = try pipePair(socket.allocator, socket.hwm, socket.hwm);
+
+        // Connect
+        const session = Transport.tcpConnect(
+            socket.allocator, addr, &pipes[1],
+        ) catch {
+            // Connection failed — exponential backoff
+            zio.time.sleep(backoff * std.time.ns_per_ms);
+            backoff = @min(backoff * 2, max_backoff);
+            continue;
+        };
+
+        backoff = 100;  // reset on success
+
+        // Attach pipe to socket
+        socket.attachPipe(&pipes[0]);
+
+        // Run session (blocks until disconnect)
+        session.run() catch {};
+
+        // Detach pipe, clean up
+        socket.detachPipe(&pipes[0]);
+        session.stream.close();
+    }
+}
+```
 
 ---
 
@@ -1062,37 +1622,58 @@ is the regime where most real-world applications live.
 - `Pipe` struct with HWM/LWM backpressure
 - `pipePair()` factory
 - Threshold-based backpressure (comparison, not modulo)
-- Blocking send/recv using zio `Waiter`
+- Batch send/recv APIs (`sendBatch`, `recvBatch`)
+- Blocking send/recv with adaptive spin (`recvBlocking`, `sendBlocking`)
 - Multi-part send/recv with rollback
 - Cross-thread tests (two executors, producer/consumer on different threads)
+- Benchmark: measure adaptive spin convergence across throughput regimes
 
-### Phase 3: Socket Layer
+### Phase 3: ZMTP Codec + Session
+
+- `ZmtpCodec` with frame encode/decode (short + long frames)
+- ZMTP 3.1 greeting and NULL mechanism handshake
+- `Session` coroutine with concurrent send/receive loops
+- Vectored I/O: batch encode → writev for send path
+- Stream decode: read buffer → frame decode → batch pipe write for recv path
+- Unit tests for codec (round-trip encode/decode)
+- Integration tests: two sessions connected via TCP loopback
+
+### Phase 4: Transport Bindings
+
+- TCP transport: `tcpConnect`, `tcpAccept` with TCP_NODELAY
+- IPC transport: `ipcConnect`, `ipcAccept` via UnixAddress
+- inproc transport: direct pipe pair, no session
+- TCP listener coroutine (accept loop, spawn sessions)
+- Reconnection with exponential backoff
+- Graceful shutdown (linger, drain pipe before close)
+
+### Phase 5: Socket Layer
 
 - Socket types (PUSH/PULL, PUB/SUB, REQ/REP, PAIR)
 - Pipe management (attach, detach, terminate)
 - Fair queuing (round-robin recv across multiple pipes)
 - Load balancing (round-robin send across multiple pipes)
-- inproc transport
+- Socket options (HWM, linger, connect timeout)
+- Transport-agnostic bind/connect API
 
-### Phase 4: Network Transport
+### Phase 6: Benchmarks
 
-- TCP transport using zio's `net.IpAddress.listen/connect`
-- ZMTP wire protocol (greeting, handshake, framing)
-- Session management
-- Reconnection logic
-
-### Phase 5: Benchmarks
-
-- Inproc latency: single-message round-trip between two coroutines
-- Inproc throughput: messages/sec at various sizes (VSM, 1KB, 64KB)
-- Fan-out: PUB to N SUBs
-- Fan-in: N PUSHers to 1 PULLer
-- Comparison with libzmq's `inproc_lat` and `inproc_thr` benchmarks
-- Cross-executor vs same-executor performance delta
+- **Inproc latency**: single-message round-trip between two coroutines
+- **Inproc throughput**: messages/sec at various sizes (VSM, 1KB, 64KB)
+- **TCP latency**: round-trip over loopback
+- **TCP throughput**: messages/sec over loopback at various sizes
+- **IPC latency/throughput**: Unix domain socket performance
+- **Fan-out**: PUB to N SUBs (inproc + TCP)
+- **Fan-in**: N PUSHers to 1 PULLer (inproc + TCP)
+- **Cross-executor delta**: same executor vs different executor for each transport
+- **Adaptive spin tuning**: measure spin convergence under varying load
+- Comparison with libzmq's `inproc_lat`, `inproc_thr`, `local_lat`, `local_thr`
 
 ---
 
 ## Appendix: zio Internals Referenced
+
+### Runtime & Scheduling
 
 | Component | File | Key Lines | Role |
 |---|---|---|---|
@@ -1108,3 +1689,22 @@ is the regime where most real-world applications live.
 | Channel | src/sync/channel.zig | 24-100 | MPMC reference (mutex-based) |
 | Completion lifecycle | src/ev/completion.zig | 55-100 | new→running→completed→dead |
 | Context switch | src/coro/coroutines.zig | (asm) | ~100ns register save/restore |
+
+### Network I/O
+
+| Component | File | Key Lines | Role |
+|---|---|---|---|
+| IpAddress.listen | src/net.zig | 608-620 | TCP server socket (bind + listen) |
+| IpAddress.connect | src/net.zig | 622-628 | TCP client connection |
+| UnixAddress.listen | src/net.zig | 672-680 | Unix domain socket server |
+| UnixAddress.connect | src/net.zig | 682-690 | Unix domain socket client |
+| Server.accept | src/net.zig | 1075-1095 | Accept incoming connection → Stream |
+| Stream.read/write | src/net.zig | 1097-1172 | Single-buffer async I/O |
+| Stream.readVec/writeVec | src/net.zig | 1097-1172 | Vectored I/O (up to 16 iovecs) |
+| Stream.readAll/writeAll | src/net.zig | 1097-1172 | Loop until complete |
+| Socket.setNoDelay | src/net.zig | 893-895 | TCP_NODELAY for latency |
+| Socket.setReuseAddress | src/net.zig | 848-850 | SO_REUSEADDR |
+| ReadBuf / WriteBuf | src/ev/buf.zig | 1-37 | iovec wrappers for vectored I/O |
+| NetAccept (io_uring) | src/ev/backends/io_uring.zig | 265-275 | Async accept submission |
+| NetRecv/NetSend (io_uring) | src/ev/backends/io_uring.zig | 277-320 | Async recvmsg/sendmsg |
+| waitForIo | src/common.zig | 139-153 | Park coroutine on I/O completion |
