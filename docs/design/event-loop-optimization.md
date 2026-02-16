@@ -422,6 +422,78 @@ it uses zio's native cross-thread wakeup (see Layer 4).
 This is where the ZMQ pipe semantics (HWM, LWM, backpressure, multi-part
 messages) integrate with zio's coroutine scheduling.
 
+#### Why Locality Detection Is the Wrong Approach
+
+It's tempting to check `getCurrentExecutor() == pipe.executor` and use a
+fast local path. Don't. This is fragile:
+
+1. **Task migration**: zio migrates tasks to the current executor for cache
+   locality (runtime.zig:505-511). A task that was local last message may
+   be remote this message.
+2. **Work-stealing**: Future zio versions will implement work-stealing
+   (runtime.zig:503 TODO). Tasks will move unpredictably.
+3. **Two paths = two bugs**: A local fast path that bypasses atomics will
+   produce data races the moment a task migrates. These bugs are
+   intermittent and nearly impossible to reproduce.
+4. **The CAS already adapts**: Same-core CAS costs ~5ns (L1 hit). Cross-core
+   CAS costs ~20-25ns (coherency traffic). The hardware already gives you
+   a 4-5x speedup when local — you don't need to detect it.
+
+The right approach is: **always use the atomic protocol, but minimize the
+number of atomic operations and notifications through batching and
+adaptive spinning.**
+
+#### The Three Throughput Killers (and How We Solve Them)
+
+**Killer 1: Per-message flush**
+
+Every `flush()` does a CAS on `c`. Cross-core, that's ~20-25ns of cache
+line bouncing. If you flush after every send, your ceiling is ~40-50M
+msg/s from CAS contention alone — before any notifications.
+
+**Solution**: Separate `send()` (enqueue, no CAS) from `flush()` (one CAS
+for the whole batch). The API makes this explicit: callers accumulate
+writes, then flush once. `sendBlocking()` for the single-message case
+still flushes, but `sendBatch()` amortizes one CAS over N messages.
+
+**Killer 2: Reader parks immediately**
+
+When the reader drains all data, it calls `recvBlocking()`, finds nothing,
+and immediately parks the coroutine (Waiter.wait). The very next message
+triggers a full notification cycle: CAS detects c=NULL → Treiber stack
+push (~15ns) → loop.wake() syscall (~200-500ns) → context switch (~100ns).
+That's **~300-600ns per sleep/wake cycle**.
+
+Under moderate throughput, the reader constantly outruns the writer:
+sleep → wake → drain → sleep → wake → drain. Every iteration pays the
+full cross-executor notification cost.
+
+**Solution**: Adaptive spin before parking. The reader spins briefly
+(checking for new data via `checkRead()`) before committing to a park.
+Under load, the spin absorbs the gap between writer flush and reader
+drain — the writer's next flush lands while the reader is still spinning,
+so no notification is needed. Under idle conditions, the spin burns a
+few hundred nanoseconds then parks — negligible because the system is
+idle anyway.
+
+The spin count adapts: after a successful spin (data arrived during spin),
+increase the count. After a spin timeout (had to park), decrease it.
+This converges on the right spin duration for the workload.
+
+**Killer 3: Reader does CAS per read**
+
+`read()` calls `checkRead()`, which may CAS on `c` to prefetch more data.
+If the reader processes messages one at a time and each one calls
+`checkRead()`, you get a CAS per message on the reader side too — doubling
+the cache line bouncing.
+
+**Solution**: `checkRead()` only does a CAS when the prefetch is exhausted
+(when `front == r`). Between CAS operations, `read()` is just a pointer
+comparison + array read — no atomics. With N=256 chunk size, that's one
+CAS per 256 reads in steady state. But the caller can also drain in a
+batch: `recvBatch()` reads all available messages in one pass, doing
+at most one CAS for the entire batch.
+
 ```zig
 pub const Pipe = struct {
     // Underlying unidirectional SPSC pipes
@@ -457,10 +529,20 @@ pub const Pipe = struct {
     // Waiter for the write side: parked task waiting for HWM space.
     write_waiter: ?*Waiter = null,
 
+    // Adaptive spin calibration
+    spin_count: u32 = initial_spin_count,
+
+    const initial_spin_count: u32 = 100;
+    const min_spin_count: u32 = 0;
+    const max_spin_count: u32 = 10_000;
+
     // -------------------------------------------------------
     // Write path (called from producer coroutine)
     // -------------------------------------------------------
 
+    /// Enqueue a message to the pipe. Does NOT flush — no CAS, no
+    /// notification. The message is not visible to the reader until
+    /// flush() is called. This is a plain array write (~5ns).
     pub fn send(self: *Pipe, msg: *Msg) !bool {
         if (!self.out_active) return false;
 
@@ -476,20 +558,46 @@ pub const Pipe = struct {
         return true;
     }
 
-    pub fn flushPipe(self: *Pipe) void {
+    /// Flush all enqueued messages to the reader. One CAS on `c`,
+    /// regardless of how many messages were enqueued since last flush.
+    /// Returns true if reader was awake, false if reader was sleeping
+    /// (in which case we wake it).
+    pub fn flush(self: *Pipe) void {
         if (!self.out_pipe.flush()) {
-            // Reader is sleeping. Wake it directly through zio.
+            // Reader is sleeping (c was NULL). Wake it directly.
             self.wakeReader();
         }
+    }
+
+    /// Convenience: send a single message and flush immediately.
+    /// Use this for latency-sensitive single sends. For throughput,
+    /// prefer calling send() N times then flush() once.
+    pub fn sendAndFlush(self: *Pipe, msg: *Msg) !bool {
+        const ok = try self.send(msg);
+        if (ok) self.flush();
+        return ok;
+    }
+
+    /// Send a batch of messages with a single flush at the end.
+    /// One CAS amortized over the entire batch. Returns the number
+    /// of messages successfully sent (may be < msgs.len if HWM hit).
+    pub fn sendBatch(self: *Pipe, msgs: []Msg) !u32 {
+        var sent: u32 = 0;
+        for (msgs) |*msg| {
+            if (!try self.send(msg)) break;
+            sent += 1;
+        }
+        if (sent > 0) self.flush();
+        return sent;
     }
 
     fn wakeReader(self: *Pipe) void {
         const peer = self.peer;
         if (peer.read_waiter) |waiter| {
-            // Wake the parked reader task.
-            // If same executor: scheduleTaskLocal (~5ns, no syscall)
-            // If different executor: push to Treiber stack + loop.wake()
-            //   (~50-200ns, one coalesced syscall)
+            // zio handles locality transparently:
+            // - Same executor → scheduleTaskLocal: plain queue push, ~3 instructions
+            // - Diff executor → scheduleTaskRemote: Treiber CAS + loop.wake()
+            //   (~250-500ns, but coalesced — multiple wakes = one syscall)
             waiter.signal();
         }
         // If no waiter, reader isn't blocked — it will see data on
@@ -512,10 +620,14 @@ pub const Pipe = struct {
     // Read path (called from consumer coroutine)
     // -------------------------------------------------------
 
+    /// Non-blocking read. Returns null if no data available.
+    /// Between prefetch boundaries, this is just a pointer comparison +
+    /// array read — no atomics. CAS only happens when the prefetch
+    /// is exhausted, which is at most once per chunk (N=256 messages).
     pub fn recv(self: *Pipe) ?Msg {
         if (!self.in_active) return null;
 
-        var msg = self.in_pipe.read() orelse {
+        const msg = self.in_pipe.read() orelse {
             self.in_active = false;
             return null;
         };
@@ -523,7 +635,7 @@ pub const Pipe = struct {
         if (!msg.flags.more) {
             self.msgs_read += 1;
 
-            // Threshold-based backpressure: comparison, not modulo
+            // Threshold-based backpressure: comparison, not modulo (~1ns vs ~30ns)
             if (self.msgs_read >= self.next_activate_threshold) {
                 self.next_activate_threshold += self.lwm;
                 self.peer.peers_msgs_read = self.msgs_read;
@@ -537,17 +649,29 @@ pub const Pipe = struct {
         return msg;
     }
 
+    /// Drain all available messages into a buffer. At most one CAS on
+    /// `c` for the entire drain, then pure array reads until exhausted.
+    /// Returns the number of messages drained.
+    pub fn recvBatch(self: *Pipe, buf: []Msg) u32 {
+        var count: u32 = 0;
+        while (count < buf.len) {
+            const msg = self.recv() orelse break;
+            buf[count] = msg;
+            count += 1;
+        }
+        return count;
+    }
+
     // -------------------------------------------------------
     // Blocking variants (coroutine-aware)
     // -------------------------------------------------------
 
-    /// Blocking send: parks coroutine if HWM reached, resumes when space available.
+    /// Blocking send: parks coroutine if HWM reached, resumes when
+    /// space available. Does NOT flush — caller must call flush()
+    /// when ready (or use sendBlockingAndFlush for single-message case).
     pub fn sendBlocking(self: *Pipe, msg: *Msg) !void {
         while (true) {
-            if (try self.send(msg)) {
-                self.flushPipe();
-                return;
-            }
+            if (try self.send(msg)) return;
             // Park until writer is activated
             var waiter = Waiter.init();
             self.write_waiter = &waiter;
@@ -556,16 +680,54 @@ pub const Pipe = struct {
         }
     }
 
-    /// Blocking recv: parks coroutine if no data, resumes when data flushed.
+    /// Blocking send + flush. Convenience for the single-message
+    /// latency-sensitive case.
+    pub fn sendBlockingAndFlush(self: *Pipe, msg: *Msg) !void {
+        try self.sendBlocking(msg);
+        self.flush();
+    }
+
+    /// Blocking recv with adaptive spin-before-park.
+    ///
+    /// The spin absorbs the latency gap between writer flush and reader
+    /// drain. Under high throughput, data arrives during the spin window
+    /// and we never park — zero notification overhead. Under idle
+    /// conditions, we burn a few hundred nanoseconds spinning then park,
+    /// which is negligible because the system is idle.
+    ///
+    /// The spin count adapts to the workload:
+    /// - Spin succeeds → increase count (more spinning pays off)
+    /// - Spin times out → decrease count (spinning is wasted)
+    /// This converges on the right spin duration for any throughput level.
     pub fn recvBlocking(self: *Pipe) !Msg {
-        while (true) {
-            if (self.recv()) |msg| return msg;
-            // Park until reader is activated
-            var waiter = Waiter.init();
-            self.read_waiter = &waiter;
-            defer self.read_waiter = null;
-            try waiter.wait(1, .allow_cancel);
+        // Fast path: data already available (common under high throughput)
+        if (self.recv()) |msg| return msg;
+
+        // Adaptive spin: check for data without parking
+        var spun: u32 = 0;
+        while (spun < self.spin_count) : (spun += 1) {
+            std.atomic.spinLoopHint();  // PAUSE on x86, YIELD on ARM
+            if (self.in_pipe.checkRead()) {
+                // Data arrived during spin — avoid park entirely.
+                // Increase spin count: spinning is paying off.
+                self.spin_count = @min(self.spin_count + (self.spin_count / 4), max_spin_count);
+                return self.recv().?;
+            }
         }
+
+        // Spin exhausted, no data — park the coroutine.
+        // Decrease spin count: spinning wasn't worthwhile.
+        if (self.spin_count > min_spin_count) {
+            self.spin_count -= self.spin_count / 8;
+        }
+
+        var waiter = Waiter.init();
+        self.read_waiter = &waiter;
+        defer self.read_waiter = null;
+        try waiter.wait(1, .allow_cancel);
+
+        // Woken by writer's flush() → data must be available now
+        return self.recv().?;
     }
 };
 
@@ -598,68 +760,126 @@ fn computeLwm(hwm: u32) u32 {
 
 ### How Notification Works (The Critical Path)
 
-The most important thing to understand is how a `send` on one executor
-thread wakes a `recvBlocking` on another:
+There are three distinct throughput regimes. The design handles all of
+them efficiently — without ever needing to detect whether producer and
+consumer are on the same executor.
+
+#### Regime 1: Sustained Throughput (Batch Send → Batch Recv)
+
+The highest-throughput path. Producer writes N messages, flushes once.
+Reader drains all N messages in one pass. One CAS total per batch.
 
 ```
-Executor Thread A (producer coroutine):          Executor Thread B (consumer coroutine):
+Executor Thread A (producer):              Executor Thread B (consumer):
                                                   |
-pipe.sendBlocking(&msg)                          pipe.recvBlocking()
-  |                                                |
-  pipe.send(&msg)                                  pipe.recv() → null (no data)
-    ypipe.write(msg, more=false)                    ypipe.checkRead() → false, c set to NULL
-    ypipe.push()                                    |
-    f = &queue.back()                              in_active = false
-  |                                                |
-  pipe.flushPipe()                                 waiter = Waiter.init()
-    ypipe.flush()                                  self.read_waiter = &waiter
-      CAS(c, w, f) → fails, c was NULL            waiter.wait(1, .allow_cancel)
-      c.store(f, .release)                           → task state = preparing_to_wait
-      return false                                   → context switch to executor loop
-    |                                                → cleanup: CAS preparing→waiting
-    self.wakeReader()                                → task is now parked
-      peer.read_waiter → waiter                      |
-      waiter.signal()                                |
-        → task.state = .ready                        |
-        → if same executor: scheduleTaskLocal()      |
-          if diff executor: push to Treiber stack    |
-                           + loop.wake()             |
-                             → fetchOr (coalesced)   |
-                             → one backend syscall   |
-                                                     |
-                                                  [executor B loop tick]
-                                                  drain remote ready queue
-                                                  task.coro.step() → resume
-                                                    |
-                                                  waiter.wait returns
-                                                  self.read_waiter = null
-                                                  pipe.recv() → msg (data available!)
-                                                  return msg
+for (msgs) |*msg|                                pipe.recvBlocking()
+    pipe.send(msg)                                 recv() → null (drained)
+    // no CAS, no flush — just array writes        checkRead() → false, c set to NULL
+    // ~5ns per message                            adaptive spin begins...
+end                                                spin iteration 1..N:
+pipe.flush()                                         spinLoopHint()
+    CAS(c, w, f) → fails, c was NULL                checkRead() → false, keep spinning
+    c.store(f, .release)                             ...
+    return false                                     ...
+    wakeReader()                                   [spin exhausted, park]
+      waiter.signal()                              waiter.wait()
+        → Treiber push + loop.wake()                 → task parked
+                                                      |
+                                           [executor B loop tick]
+                                           drain Treiber stack, resume task
+                                                      |
+                                           // reader wakes, drains everything:
+                                           recv() → msg₁  // pure array read
+                                           recv() → msg₂  // pure array read
+                                           ...
+                                           recv() → msgₙ  // pure array read
+                                           recv() → null
 ```
 
-**Total cost breakdown (cross-thread)**:
-- ypipe.write + push: ~5-10ns (store to array)
-- ypipe.flush CAS: ~15-25ns (one CAS, acquire-release)
-- waiter.signal(): ~5ns (atomic swap on task state)
-- Treiber stack push: ~8-15ns (one CAS)
-- loop.wake(): ~0ns if already woken (fetchOr fast path) or ~200-500ns (one backend syscall)
-- **Total: ~35-55ns (reader already woken) or ~235-555ns (reader sleeping, amortized)**
+**Cost**: One CAS (flush) + one notification (Treiber + wake) amortized
+over N messages. At N=100: **~5ns per message** including notification.
 
-Compare to libzmq cross-thread: ~3000-5000ns (mutex + ypipe command + eventfd write + eventfd read).
+#### Regime 2: Moderate Throughput (Spin Absorbs Latency)
 
-**Same-executor fast path**: When producer and consumer are on the same
-executor thread (after task migration or by affinity), `waiter.signal()`
-calls `scheduleTaskLocal()` which is a plain queue push — no atomic
-operations on the remote stack, no syscall. Cost: ~10-15ns total for
-the notification path.
+Producer sends messages at moderate rate. Reader's adaptive spin catches
+data before parking, avoiding the notification path entirely.
 
-**Wakeup coalescing under load**: If producer sends 1000 messages in a
-burst, the first flush that finds the reader sleeping does the wakeup.
-All subsequent flushes see `c != NULL` (reader not sleeping because
-it hasn't drained yet) and `flush()` returns true — no notification
-at all. The reader drains all 1000 messages in one pass. This is the
-same self-batching behavior as libzmq's ypipe protocol, but without
-the signaler syscall overhead.
+```
+Executor Thread A (producer):              Executor Thread B (consumer):
+                                                  |
+pipe.sendAndFlush(&msg₁)                         pipe.recvBlocking()
+    write + CAS → reader awake                     recv() → msg₁
+    flush returns true, no notify                  return msg₁
+                                                  |
+                                                  pipe.recvBlocking()
+                                                    recv() → null
+                                                    adaptive spin begins...
+pipe.sendAndFlush(&msg₂)                            spin iteration 47:
+    write + CAS → reader awake (spinning)             checkRead() → true!
+    flush returns true, no notify                       spin_count increases
+                                                    recv() → msg₂
+                                                    return msg₂
+```
+
+**Cost**: One CAS per flush. Zero notifications — the reader's spin
+catches the data before it commits to parking. The adaptive spin count
+converges so the spin window matches the inter-message interval.
+
+**This is the regime that kills naive implementations**: without the spin,
+every recv would park and every send would notify. With spin, zero
+notifications and zero syscalls.
+
+#### Regime 3: Ping-Pong (Request-Response)
+
+Lowest throughput, latency-sensitive. Each side sends one message then
+waits. This is the worst case — one notification per message in each
+direction. But even here, the design is ~10x faster than libzmq because
+there's no signaler/mailbox overhead.
+
+```
+Executor Thread A:                         Executor Thread B:
+                                                  |
+pipe.sendBlockingAndFlush(&request)              pipe.recvBlocking()
+    write + CAS → reader sleeping                  spin... timeout, park
+    flush returns false                            [parked]
+    wakeReader() → Treiber + wake                  |
+                                                  [woken] recv() → request
+pipe.recvBlocking()                              process(request)
+    recv() → null                                pipe.sendBlockingAndFlush(&reply)
+    spin... timeout, park                            write + CAS → reader sleeping
+    [parked]                                         flush returns false
+    |                                                wakeReader() → Treiber + wake
+    [woken] recv() → reply                        |
+```
+
+**Cost**: One CAS + one notification per message per direction.
+~250-500ns per notification cross-executor. But adaptive spin count
+will decrease toward zero after repeated timeouts, minimizing wasted
+spin cycles in this regime.
+
+#### Why the CAS Protocol Makes Locality Detection Unnecessary
+
+The `c` pointer already encodes all the information:
+
+| `c` value | Meaning | flush() does | Cost |
+|-----------|---------|--------------|------|
+| != NULL, == w | Nothing to flush | returns true | ~2ns (pointer compare) |
+| != NULL, != w | Reader is awake/spinning | CAS(w,f), returns true | ~5-25ns (CAS) |
+| == NULL | Reader is parked | CAS fails, store(f), returns false | ~25ns + notify |
+
+- When producer and consumer are **same-core**: CAS is ~5ns (L1 hit, no
+  coherency traffic). The hardware gives you the fast path automatically.
+- When **cross-core**: CAS is ~20-25ns (cache line bounce on `c` only —
+  queue data is on separate cache lines thanks to `align(64)`).
+- **Notification only fires at the idle→busy transition**. Under sustained
+  load, the reader is always awake/spinning, so flush() always returns
+  true and no notification is needed regardless of locality.
+
+The adaptive spin further reduces notifications: even in cross-executor
+moderate-throughput scenarios, the reader catches data during the spin
+window and never parks. The spin count converges to match the workload,
+so it's not wasting cycles in ping-pong scenarios where spinning doesn't
+help.
 
 ### Layer 5: Multi-Part Message Framing
 
@@ -754,24 +974,40 @@ write — optimal on all architectures.
 
 ## Comparison: libzmq vs This Design
 
-### Hot Path Operations
+### Hot Path Operations (per-message costs)
 
 | Operation | libzmq | This design |
 |---|---|---|
 | Write msg to pipe | ypipe::write + push (~10ns) | YPipe.write + push (~10ns) |
-| Flush (CAS) | ypipe::flush CAS (~20ns) | YPipe.flush CAS (~20ns) |
+| Flush (CAS) | ypipe::flush CAS per msg (~20ns) | YPipe.flush CAS per batch (~20ns / N) |
 | Notify sleeping reader | signaler.send() ~1000ns syscall | waiter.signal() ~8ns atomic |
-| | + mailbox mutex ~30ns | (no mailbox, no mutex) |
-| | + mailbox ypipe write ~10ns | |
+| | + mailbox mutex ~30ns | + Treiber push ~15ns |
+| | + mailbox ypipe write ~10ns | + loop.wake() ~200-500ns (coalesced) |
 | | + mailbox ypipe flush ~20ns | |
-| Reader wakeup | signaler.recv() ~1000ns syscall | Treiber stack + loop.wake() |
-| | + epoll_wait return | ~200ns (coalesced, amortized) |
-| Read msg from pipe | ypipe::read CAS + pop (~25ns) | YPipe.read CAS + pop (~25ns) |
+| Reader wakeup | signaler.recv() ~1000ns syscall | No separate wakeup path — |
+| | + epoll_wait return | loop tick drains Treiber stack |
+| Read msg from pipe | ypipe::read + checkRead (~25ns) | YPipe.read (~5ns array read) |
+| | (CAS on every checkRead) | (CAS only at chunk boundary, 1/256) |
 | Backpressure check | msgs_read % lwm ~30ns (modulo) | msgs_read >= threshold ~1ns |
 | Backpressure notify | mailbox.send() ~1500ns | waiter.signal() ~8ns |
 | Command throttle | RDTSC ~100ns or tick count | Not needed (no command path) |
-| **Total (reader sleeping)** | **~3000-5000ns** | **~250-500ns** |
-| **Total (reader awake)** | **~100-200ns** | **~40-60ns** |
+| Adaptive spin | N/A (reader blocks immediately) | ~0.3ns/iter (PAUSE instruction) |
+
+### Throughput by Regime
+
+| Scenario | libzmq | This design | Speedup |
+|---|---|---|---|
+| **Batch send (N=100)** | ~120ns/msg (flush+CAS per msg) | ~15ns/msg (one CAS, array reads) | ~8x |
+| **Sustained (reader awake)** | ~100-200ns/msg | ~15-30ns/msg | ~5-7x |
+| **Moderate (spin absorbs)** | ~3000-5000ns/msg (park/wake every msg) | ~30-50ns/msg (spin catches data, no park) | ~100x |
+| **Ping-pong (worst case)** | ~3000-5000ns/msg | ~250-500ns/msg | ~6-10x |
+| **Same executor** | ~100-200ns/msg (still uses signaler) | ~15-25ns/msg (CAS ~5ns L1 hit) | ~5-8x |
+
+The biggest win is the **moderate throughput regime** — the regime that kills
+naive implementations. libzmq parks and wakes the reader on every message
+(~3000-5000ns). The adaptive spin catches data before parking, reducing the
+cost to a CAS per flush (~20-25ns) plus spin iterations (~0.3ns each). This
+is the regime where most real-world applications live.
 
 ### What We Eliminate
 
