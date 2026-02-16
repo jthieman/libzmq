@@ -1,1000 +1,874 @@
-# Event Loop Optimization Design for Multi-Threaded Coroutine Executors
+# ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v2)
+## Status: DESIGN PROPOSAL (v3)
 
-## Core Constraint
+## Context
 
-Modern coroutine runtimes (Tokio, Asio, folly::coro, libunifex, Go runtime)
-run M coroutines across N OS threads with work-stealing. A coroutine that
-writes to a pipe on thread 3 may have its consumer running on thread 7 — or
-the consumer may migrate to thread 3 mid-flight, or both may be on thread 3
-now and different threads next tick.
+We are implementing a ZMQ-compatible message pipe layer in Zig, using
+[zio](https://github.com/lalinsky/zio) as the event loop and coroutine
+runtime. The goal is to match libzmq's wire semantics (messages, frames,
+multi-part, HWM backpressure) while delivering equal or better hot-path
+performance, natively integrated with zio's multi-threaded executor model.
 
-**This means:**
-- Producer and consumer are always potentially on different OS threads
-- All atomic operations in the SPSC protocol must be retained
-- "Wakeup" is not a same-thread callback — it is a cross-thread task
-  submission to an executor, which itself costs ~50-200ns
-- Under high load, redundant wakeups compound: if N flushes each submit
-  a task, the executor processes N scheduling events for what should be
-  one drain loop
-
-The design must make the common case fast without assuming colocation, and
-must degrade gracefully under contention rather than amplifying it.
+This is not a port of libzmq. It is a ground-up design that takes the
+proven data structure concepts (ypipe SPSC protocol, yqueue chunk
+allocator, pipe backpressure) and adapts them to Zig's type system and
+zio's completion-based, multi-executor runtime.
 
 ---
 
-## Problem Statement
+## zio Runtime Model (What We Build On)
 
-libzmq's architecture imposes five categories of overhead that become
-dominant under a high-throughput event loop with many coroutine executors:
+### Executor Architecture
 
-### 1. Signaler syscall overhead (~1000ns per transition)
+zio runs M coroutines across N executor threads (default: 1 per CPU core).
+Each `Executor` owns:
 
-Every pipe flush where the reader is asleep triggers `write()` to an
-eventfd/pipe (`signaler_t::send`, signaler.cpp:146-201). Every wakeup
-triggers `read()` from it (`signaler_t::recv`, signaler.cpp:275-309).
-These are full kernel transitions. Under load with 1000 pipes flushing
-per millisecond, this is 2000 syscalls/ms — ~2 million/sec of pure
-kernel overhead.
+- An `ev.Loop` (epoll/io_uring/kqueue/IOCP backend)
+- A local `ready_queue` (FIFO of runnable tasks)
+- A `next_ready_queue_remote` (lock-free Treiber stack for cross-thread wakeups)
+- A `current_tick` counter and `tick_task_count` for fairness
 
-An executor-based notification can replace these with a thread-safe task
-submission (~50-200ns cross-thread, ~5-10ns same-thread), but only if
-redundant submissions are suppressed.
+Task scheduling (runtime.zig:477-517):
+- Tasks are assigned to executors round-robin at spawn time
+- A task woken by a thread other than its home executor uses `scheduleTaskRemote()`:
+  atomic push to Treiber stack + `loop.wake()` (one syscall, coalesced via `fetchOr`)
+- A task woken by the same executor thread uses `scheduleTaskLocal()`: plain queue push, no syscall
+- Tasks may migrate to the current executor for cache locality (runtime.zig:505-511)
 
-### 2. Mailbox mutex serialization
+### Cross-Thread Notification
 
-`mailbox_t::send()` (mailbox.cpp:32-40) acquires `_sync` mutex to
-serialize writers into the SPSC ypipe. Under fan-in (many coroutines
-sending commands to one I/O thread), this mutex becomes a convoy:
+`loop.wake()` (loop.zig:295-301) uses `fetchOr` on an atomic `wake_requested`
+flag. Multiple wakes between loop ticks collapse into a single backend
+syscall (eventfd write, io_uring futex, etc.). This is exactly the
+arm/notify idempotent pattern — zio already has it.
 
-```
-Coroutine A: lock → write → flush → unlock     (holds lock ~30-50ns)
-Coroutine B: spin-wait for lock...              (wastes ~30-50ns)
-Coroutine C: spin-wait for lock...              (wastes ~60-100ns)
-```
+### Completion Model
 
-With 100 coroutines funneling commands to one I/O thread, the tail
-latency is 100x the single-operation cost. A lock-free MPSC queue
-reduces the push cost to a single atomic exchange (~5-8ns) with zero
-convoy effects.
+All I/O goes through `ev.Completion` objects (completion.zig). Operations
+are submitted to the loop, and the loop calls back when complete. The
+coroutine layer wraps this: `waitForIo()` (common.zig) parks the current
+task, submits the completion, and resumes the task when the callback fires.
 
-### 3. False sharing in data structure layouts
+### Channel Primitive
 
-`yqueue_t` (yqueue.hpp:172-177) lays out reader fields (`_begin_chunk`,
-`_begin_pos`) contiguously with writer fields (`_back_chunk`, `_back_pos`,
-`_end_chunk`, `_end_pos`). On a 64-byte cache line, these share a line.
-Every writer push invalidates the reader's cached `_begin_chunk`, and
-every reader pop invalidates the writer's cached `_end_chunk`.
-
-With coroutines on different physical cores (the common case under
-work-stealing), this causes cache line bouncing at the L3/interconnect
-level: ~40-80ns per invalidation on modern multi-socket systems.
-
-`ypipe_t` (ypipe.hpp:150-172) has the same problem: `_w`, `_r`, `_f`,
-`_c` are 32 bytes contiguous with no alignment control.
-
-### 4. Per-message modulo in backpressure
-
-`pipe_t::read()` (pipe.cpp:201) checks `_msgs_read % _lwm == 0` on
-every complete message. Integer modulo by a non-power-of-2 is a
-division: ~20-40 cycles. At 10M msgs/sec this is 200-400M wasted cycles/sec.
-
-### 5. Wakeup amplification under fan-out
-
-A PUB socket flushing to 100 subscriber pipes triggers 100 independent
-`send_activate_read` commands, each going through the mailbox + signaler
-path. Under an executor model, this becomes 100 cross-thread task
-submissions in rapid succession. The executor's work-stealing queue
-becomes a bottleneck, and the consumer thread processes 100 scheduling
-events to drain what could be handled in a single batch.
+zio provides `sync/channel.zig` — an MPMC bounded channel with mutex-based
+synchronization, sender/receiver wait queues, and graceful close semantics.
+This is a useful reference but too heavyweight for the pipe hot path
+(mutex per send/recv, memcpy of arbitrary-size elements).
 
 ---
 
-## Current Architecture: What Works and What Doesn't
+## Design: What We Build
 
-### What works well (retain as-is)
+### Layer 1: Message (`Msg`)
 
-**The ypipe_t SPSC CAS protocol** (ypipe.hpp:76-122) is near-optimal
-for cross-thread single-producer single-consumer queues:
-- One CAS per flush batch (amortized across N writes)
-- Reader CAS sets `_c = NULL` to signal sleep — this is the dedup
-  mechanism that prevents redundant wakeups
-- Writer detects `_c == NULL` and knows to notify exactly once
+The fundamental unit of data. Matches libzmq's `msg_t` semantics:
+small messages inline, large messages reference-counted, zero-copy handoff.
 
-**The yqueue_t chunk allocator** (yqueue.hpp:78-97) amortizes malloc
-overhead by 1/N and reuses one spare chunk via atomic exchange. For
-message pipes (N=256, chunk=16KB), this is excellent.
-
-**The msg_t layout** (msg.hpp:148-156) at exactly 64 bytes (one cache
-line) with VSM inline storage is optimal. Sequential access through
-yqueue chunks gives excellent hardware prefetch behavior.
-
-### What doesn't work
-
-**The notification layer** (signaler + mailbox mutex) was designed for a
-world where threads own pollers and block in `epoll_wait()`. An executor
-doesn't block in epoll — it runs a task queue. The signaler's eventfd
-was the right way to wake a blocked OS thread; it's the wrong way to
-schedule a coroutine.
-
-**The command path** (object.cpp:520-522 → ctx.cpp:642-644 →
-mailbox.cpp:32-40) forces every inter-object notification through a
-centralized mutex + signaler bottleneck, even for high-frequency
-operations like `activate_read`/`activate_write` that happen on every
-pipe flush and every LWM crossing.
-
-**The timer implementation** (poller_base.cpp:54-92) uses `std::multimap`
-with O(log N) insertion and requires `clock_t::now_ms()` — a syscall or
-VDSO call — on every operation. Under an executor, timers should
-integrate with the executor's own timer wheel.
-
----
-
-## Proposed Design
-
-### Design Principle
-
-Replace the **notification and dispatch layer** while retaining the
-**data structures and lock-free protocols**. The ypipe CAS protocol and
-yqueue chunk allocator are good. The signaler, mailbox mutex, and rigid
-thread-to-poller binding are what need to change.
-
-Every optimization must be correct under the assumption that producer
-and consumer are on different OS threads. Same-thread execution is a
-welcome fast-path, not a design requirement.
-
-### 1. Executor-Abstract Notifier: `i_notifier_t`
-
-**Goal**: Replace the signaler with a pluggable, thread-safe, idempotent
-notification mechanism that works with any executor.
-
-```cpp
-// src/i_notifier.hpp
-//
-// Thread-safe, idempotent notification interface.
-// Implementations must guarantee:
-//   1. notify() is safe to call from any thread concurrently
-//   2. Multiple notify() calls before the consumer acts collapse
-//      into a single wakeup (idempotency)
-//   3. The consumer observes all data written before notify()
-//      (acquire-release ordering)
-
-class i_notifier_t
-{
-  public:
-    virtual ~i_notifier_t() = default;
-
-    // Called by producer thread(s) to signal that work is available.
-    // Must be thread-safe. Must be idempotent: calling notify() 10
-    // times before the consumer runs has the same effect as calling
-    // it once.
-    virtual void notify() = 0;
-
-    // Called by consumer to arm for next notification. After this
-    // call, the next notify() will trigger a wakeup. Between arm()
-    // and the next notify(), additional notify() calls are no-ops.
-    // Must be called from the consumer context only.
-    virtual void arm() = 0;
-};
-```
-
-**Why idempotent + arm/notify instead of signal/wait:**
-
-The existing ypipe `_c` pointer protocol already implements exactly this
-pattern at the data level:
-- `_c = NULL` means "reader is sleeping" (armed)
-- `flush()` CAS detects this and returns false exactly once (notify)
-- Subsequent flushes before the reader wakes see `_c != NULL` (no-op)
-
-The `i_notifier_t` generalizes this to the notification transport layer,
-replacing the signaler's eventfd with an executor-appropriate mechanism.
-
-**Implementations:**
-
-```cpp
-// For legacy poller integration (epoll/kqueue/select)
-class signaler_notifier_t : public i_notifier_t
-{
-    signaler_t _signaler;
-    std::atomic<bool> _armed{true};
-
-    void notify() override {
-        // Only send if transition from armed to notified.
-        // This is the key: one eventfd write per batch, not per flush.
-        if (_armed.exchange(false, std::memory_order_acq_rel)) {
-            _signaler.send();
-        }
-    }
-
-    void arm() override {
-        _signaler.recv_failable();  // drain
-        _armed.store(true, std::memory_order_release);
-    }
-};
-
-// For executor-based event loops (Asio, Tokio, io_uring, etc.)
-class executor_notifier_t : public i_notifier_t
-{
-    using post_fn_t = void (*)(void *executor_ctx);
-
-    post_fn_t _post;          // executor's thread-safe post function
-    void *_executor_ctx;
-    std::atomic<bool> _armed{true};
-
-    void notify() override {
-        if (_armed.exchange(false, std::memory_order_acq_rel)) {
-            _post(_executor_ctx);  // cross-thread task submission
-        }
-        // If already notified, this is a no-op — no redundant
-        // task submissions, no wakeup amplification.
-    }
-
-    void arm() override {
-        _armed.store(true, std::memory_order_release);
-    }
-};
-```
-
-**Critical property — wakeup suppression under load:**
-
-Under steady-state high throughput, the pattern is:
-```
-Writer 1: write, write, write, flush → notify() → _armed was true → post task
-Writer 2: write, flush → notify() → _armed is false → NO-OP
-Writer 3: write, flush → notify() → _armed is false → NO-OP
-...
-Consumer runs (on some executor thread):
-  arm()         → _armed = true, ready for next batch
-  drain_all()   → reads everything from all writers
-  [goes idle or processes other tasks]
-
-Writer 4: write, flush → notify() → _armed was true → post task (new batch)
-```
-
-Under load: 1 task submission per drain cycle, regardless of how many
-writers flush between drains. Under light load: 1 task submission per
-message (no batching needed since messages are infrequent).
-
-This **adapts automatically** to load without tuning constants.
-
-### 2. Lock-Free MPSC Mailbox: `mailbox_mpsc_t`
-
-**Goal**: Eliminate the mutex that serializes command producers into the
-SPSC ypipe.
-
-The current mailbox (mailbox.cpp:32-40) wraps a single-producer ypipe
-with a mutex to support multiple producers. This converts a lock-free
-data structure into a lock-based one. Under fan-in from many executor
-threads, the mutex creates a convoy.
-
-Replace with an intrusive MPSC queue (Vyukov design) that is
-wait-free for producers:
-
-```cpp
-// src/mailbox_mpsc.hpp
-//
-// Lock-free MPSC mailbox. Producers (any thread) push commands
-// with a single atomic exchange. Consumer (one thread/coroutine)
-// pops in FIFO order.
-
-class mailbox_mpsc_t : public i_mailbox
-{
-  public:
-    mailbox_mpsc_t(i_notifier_t *notifier)
-        : _notifier(notifier)
-    {
-        _stub.next.store(nullptr, std::memory_order_relaxed);
-        _head.store(&_stub, std::memory_order_relaxed);
-        _tail = &_stub;
-    }
-
-    // Producer: lock-free push. O(1). Any thread.
-    // Cost: one atomic exchange (~5-8ns) + conditional notify.
-    void send(const command_t &cmd_) override
-    {
-        node_t *n = _pool.allocate();  // thread-local pool
-        n->cmd = cmd_;
-        n->next.store(nullptr, std::memory_order_relaxed);
-
-        // Swing head to new node. This is the linearization point.
-        node_t *prev = _head.exchange(n, std::memory_order_acq_rel);
-        // Link previous head to new node. Consumer spins briefly
-        // if it reaches this node before the store is visible
-        // (~1 cycle window on x86, wider on ARM).
-        prev->next.store(n, std::memory_order_release);
-
-        // Notify consumer. Idempotent: only the first notify()
-        // after arm() actually posts a task.
-        _notifier->notify();
-    }
-
-    // Consumer: drain all available commands. Single-threaded.
-    int recv(command_t *cmd_, int timeout_) override
-    {
-        node_t *n = pop();
-        if (n) {
-            *cmd_ = n->cmd;
-            _pool.deallocate(n);
-            return 0;
-        }
-
-        // No commands available. Arm the notifier so the next
-        // send() will wake us.
-        _notifier->arm();
-
-        // Double-check after arming to close the race where
-        // send() happened between our pop() and arm().
-        n = pop();
-        if (n) {
-            *cmd_ = n->cmd;
-            _pool.deallocate(n);
-            return 0;
-        }
-
-        if (timeout_ == 0) {
-            errno = EAGAIN;
-            return -1;
-        }
-
-        // Blocking wait is handled by the executor: the notifier
-        // will post a task when commands arrive. Timeout is
-        // handled by the executor's timer facility.
-        errno = EAGAIN;
-        return -1;
-    }
-
-  private:
-    struct node_t {
-        std::atomic<node_t *> next;
-        command_t cmd;
+```zig
+pub const Msg = struct {
+    pub const max_vsm_size = 48;  // inline data capacity
+    pub const Flag = packed struct(u8) {
+        more: bool = false,       // multi-part continuation
+        command: bool = false,    // protocol command frame
+        shared: bool = false,     // data is refcounted
+        _pad: u5 = 0,
     };
 
-    // Vyukov MPSC: head is producer-side (atomic exchange),
-    // tail is consumer-side (plain pointer).
-    alignas(64) std::atomic<node_t *> _head;
-    alignas(64) node_t *_tail;
-    node_t _stub;
+    const Data = union(enum) {
+        // Value Small Message: data stored inline, no allocation
+        vsm: struct {
+            bytes: [max_vsm_size]u8,
+            len: u8,
+        },
+        // Large Message: heap-allocated, reference-counted
+        lmsg: struct {
+            content: *Content,
+        },
+        // Constant Message: pointer to external data, not owned
+        cmsg: struct {
+            ptr: [*]const u8,
+            len: usize,
+        },
+        // Empty / delimiter / control
+        empty: void,
+    };
 
-    i_notifier_t *_notifier;
-    pool_t<node_t> _pool;   // Per-thread freelist, see §2.1
+    data: Data = .{ .empty = {} },
+    flags: Flag = .{},
+    routing_id: u32 = 0,
 
-    node_t *pop(); // Standard Vyukov MPSC pop, see below
-};
-```
+    // Shared content block for large messages
+    const Content = struct {
+        data: [*]u8,
+        len: usize,
+        refcount: std.atomic.Value(u32),
+        free_fn: ?*const fn ([*]u8, usize, ?*anyopaque) void,
+        hint: ?*anyopaque,
 
-#### 2.1 Node Pool Design
-
-The MPSC queue requires per-node allocation. Under high load this would
-be a malloc/free per command — unacceptable. We use a thread-local
-freelist with bounded overflow to the global allocator:
-
-```cpp
-template <typename T>
-class pool_t
-{
-  public:
-    // Each thread keeps up to 64 nodes in its local freelist.
-    // Overflow goes to a shared lock-free stack (Treiber stack)
-    // which itself overflows to malloc/free.
-    static constexpr int local_capacity = 64;
-    static constexpr int shared_capacity = 1024;
-
-    T *allocate()
-    {
-        // Fast path: thread-local freelist (~2ns)
-        if (_local_count > 0)
-            return _local[--_local_count];
-
-        // Medium path: shared Treiber stack (~10-15ns)
-        T *n = _shared.pop();
-        if (n) return n;
-
-        // Slow path: malloc (~50-200ns, amortized with batching)
-        return static_cast<T *>(
-            aligned_alloc(64, sizeof(T)));
-    }
-
-    void deallocate(T *n)
-    {
-        // Fast path: return to local freelist
-        if (_local_count < local_capacity) {
-            _local[_local_count++] = n;
-            return;
+        fn acquire(self: *Content) void {
+            _ = self.refcount.fetchAdd(1, .monotonic);
         }
 
-        // Overflow: return to shared stack
-        if (!_shared.push(n))
-            free(n);  // Shared stack full, release to OS
+        fn release(self: *Content) void {
+            if (self.refcount.fetchSub(1, .release) == 1) {
+                @fence(.acquire);
+                if (self.free_fn) |ffn| {
+                    ffn(self.data, self.len, self.hint);
+                }
+                // deallocate Content struct itself
+            }
+        }
+    };
+
+    pub fn initSize(allocator: Allocator, size: usize) !Msg {
+        if (size <= max_vsm_size) {
+            return .{ .data = .{ .vsm = .{
+                .bytes = undefined, .len = @intCast(size),
+            } } };
+        }
+        // Allocate Content + data in single allocation
+        const content = try allocator.create(Content);
+        content.* = .{
+            .data = (try allocator.alloc(u8, size)).ptr,
+            .len = size,
+            .refcount = .init(1),
+            .free_fn = null,
+            .hint = null,
+        };
+        return .{ .data = .{ .lmsg = .{ .content = content } } };
     }
 
-  private:
-    static thread_local T *_local[local_capacity];
-    static thread_local int _local_count;
-    static treiber_stack_t<T> _shared;
+    pub fn dataSlice(self: *const Msg) []const u8 {
+        return switch (self.data) {
+            .vsm => |*v| v.bytes[0..v.len],
+            .lmsg => |l| l.content.data[0..l.content.len],
+            .cmsg => |c| c.ptr[0..c.len],
+            .empty => &.{},
+        };
+    }
+
+    // Move semantics: source becomes empty, no refcount change
+    pub fn move(self: *Msg) Msg {
+        const result = self.*;
+        self.* = .{};
+        return result;
+    }
+
+    // Copy: for lmsg, increments refcount (zero-copy sharing)
+    pub fn copy(self: *const Msg) Msg {
+        var result = self.*;
+        switch (result.data) {
+            .lmsg => |l| l.content.acquire(),
+            else => {},
+        }
+        result.flags.shared = (result.data == .lmsg);
+        return result;
+    }
+
+    pub fn deinit(self: *Msg, allocator: Allocator) void {
+        switch (self.data) {
+            .lmsg => |l| l.content.release(),
+            else => {},
+        }
+        self.* = .{};
+    }
 };
 ```
 
-**Cost model**: Under steady state, nodes cycle through the thread-local
-freelist. Allocation cost is ~2ns (array index decrement + pointer load).
-The Treiber stack handles thread-to-thread migration of nodes without
-malloc. Only sustained imbalance hits malloc.
+**Size**: `@sizeOf(Msg)` = 64 bytes (one cache line), matching libzmq's msg_t.
+The `Data` union is 49 bytes (48 inline + 1 len for vsm), flags + routing_id
++ tag + padding fill the rest.
 
-### 3. Cache-Line Partitioned Data Structures
+**Why this matches libzmq semantics**:
+- VSM (value small message): messages <= 48 bytes stored inline, zero allocation
+- LMSG: large messages heap-allocated with refcount, zero-copy on pipe transfer
+- CMSG: external constant data, zero-copy reference
+- Multi-part: `flags.more` links frames into logical messages
+- Move semantics: `msg.move()` transfers ownership without copy or refcount bump
 
-**Goal**: Eliminate false sharing between reader and writer fields across
-all data structures. This is critical when coroutines migrate between
-cores via work-stealing.
+### Layer 2: Queue (`YQueue`)
 
-#### 3.1 yqueue_t layout
+Chunk-based ring queue. Direct adaptation of libzmq's yqueue_t with
+cache-line alignment for cross-thread operation.
 
-Current (yqueue.hpp:172-182):
-```
-_begin_chunk    8B  ← reader
-_begin_pos      4B  ← reader
-_back_chunk     8B  ← writer    ← likely same cache line as _begin_*
-_back_pos       4B  ← writer
-_end_chunk      8B  ← writer
-_end_pos        4B  ← writer
-// padding (compiler-dependent)
-_spare_chunk    8B  ← shared (atomic)
-```
+```zig
+pub fn YQueue(comptime T: type, comptime N: comptime_int) type {
+    return struct {
+        const Self = @This();
 
-Proposed:
-```cpp
-template <typename T, int N>
-class yqueue_t
-{
-    // Reader fields: only touched by pop()/front()
-    alignas(64) chunk_t *_begin_chunk;
-    int _begin_pos;
-    // 52 bytes padding to fill cache line
+        const Chunk = struct {
+            values: [N]T align(64),
+            prev: ?*Chunk,
+            next: ?*Chunk,
+        };
 
-    // Writer fields: only touched by push()/back()/unpush()
-    alignas(64) chunk_t *_back_chunk;
-    int _back_pos;
-    chunk_t *_end_chunk;
-    int _end_pos;
-    // 32 bytes padding to fill cache line
+        // Reader fields: only touched by front()/pop()
+        // Own cache line to prevent false sharing with writer
+        reader: align(64) struct {
+            begin_chunk: *Chunk,
+            begin_pos: u32,
+        },
 
-    // Shared: atomic exchange between reader (pop) and writer (push)
-    alignas(64) atomic_ptr_t<chunk_t> _spare_chunk;
-};
-```
+        // Writer fields: only touched by back()/push()/unpush()
+        // Own cache line to prevent false sharing with reader
+        writer: align(64) struct {
+            back_chunk: ?*Chunk,
+            back_pos: u32,
+            end_chunk: *Chunk,
+            end_pos: u32,
+        },
 
-**Cost**: 192 bytes per yqueue instead of ~52 bytes. One per pipe
-(negligible vs. chunk allocations).
+        // Shared between reader and writer via atomic exchange
+        // Own cache line to prevent bouncing reader/writer lines
+        spare_chunk: align(64) std.atomic.Value(?*Chunk),
 
-**Benefit**: Reader pop() and writer push() never invalidate each
-other's cache lines. The spare_chunk atomic exchange is the only
-cross-core traffic, and it happens once per N operations (N=256 for
-message pipes).
+        allocator: Allocator,
 
-#### 3.2 ypipe_t layout
+        pub fn init(allocator: Allocator) !Self {
+            const chunk = try allocateChunk(allocator);
+            return .{
+                .reader = .{ .begin_chunk = chunk, .begin_pos = 0 },
+                .writer = .{
+                    .back_chunk = null, .back_pos = 0,
+                    .end_chunk = chunk, .end_pos = 0,
+                },
+                .spare_chunk = .init(null),
+                .allocator = allocator,
+            };
+        }
 
-Current (ypipe.hpp:150-172):
-```
-yqueue_t _queue  [variable]
-T *_w            8B  ← writer
-T *_r            8B  ← reader    ← same cache line as _w
-T *_f            8B  ← writer
-atomic_ptr_t _c  8B  ← shared   ← same cache line as _r
-```
+        fn allocateChunk(allocator: Allocator) !*Chunk {
+            const chunk = try allocator.create(Chunk);
+            chunk.prev = null;
+            chunk.next = null;
+            return chunk;
+        }
 
-Proposed:
-```cpp
-template <typename T, int N>
-class ypipe_t : public ypipe_base_t<T>
-{
-  protected:
-    yqueue_t<T, N> _queue;
+        pub fn front(self: *Self) *T {
+            return &self.reader.begin_chunk.values[self.reader.begin_pos];
+        }
 
-    // Writer-only: touched on every write() and flush()
-    alignas(64) T *_w;
-    T *_f;
+        pub fn back(self: *Self) *T {
+            return &self.writer.back_chunk.?.values[self.writer.back_pos];
+        }
 
-    // Reader-only: touched on every check_read()
-    alignas(64) T *_r;
+        pub fn push(self: *Self) !void {
+            self.writer.back_chunk = self.writer.end_chunk;
+            self.writer.back_pos = self.writer.end_pos;
 
-    // Shared: the single point of contention. Own cache line
-    // ensures CAS doesn't invalidate reader or writer state.
-    alignas(64) atomic_ptr_t<T> _c;
-};
-```
+            self.writer.end_pos += 1;
+            if (self.writer.end_pos != N) return;
 
-**Benefit**: The CAS on `_c` in `flush()` and `check_read()` no longer
-bounces the cache lines containing `_w`/`_f` or `_r`. Under cross-core
-execution this eliminates ~40-80ns of coherency latency per flush/read
-cycle.
+            // Chunk full — try spare, else allocate
+            const spare = self.spare_chunk.swap(null, .acquire);
+            const next = spare orelse try allocateChunk(self.allocator);
+            next.prev = self.writer.end_chunk;
+            self.writer.end_chunk.next = next;
+            self.writer.end_chunk = next;
+            self.writer.end_pos = 0;
+        }
 
-#### 3.3 command_t alignment
+        pub fn pop(self: *Self) void {
+            self.reader.begin_pos += 1;
+            if (self.reader.begin_pos != N) return;
 
-`command_t` (command.hpp:186-193) is already aligned to cache line size
-on POSIX systems via `__attribute__((aligned(ZMQ_CACHELINE_SIZE)))`.
-This is correct and should be retained.
+            const old = self.reader.begin_chunk;
+            self.reader.begin_chunk = old.next.?;
+            self.reader.begin_chunk.prev = null;
+            self.reader.begin_pos = 0;
 
-### 4. Threshold-Based Backpressure
-
-**Goal**: Replace per-message integer division with a branch-predicted
-comparison.
-
-Current (pipe.cpp:201):
-```cpp
-if (_lwm > 0 && _msgs_read % _lwm == 0)
-    send_activate_write(_peer, _msgs_read);
-```
-
-Proposed:
-```cpp
-// In pipe_t constructor, and after each HWM reconfiguration:
-_next_activate_threshold = _lwm;
-
-// In pipe_t::read():
-if (unlikely(_msgs_read >= _next_activate_threshold)) {
-    _next_activate_threshold += _lwm;
-    send_activate_write(_peer, _msgs_read);
+            // Recycle: old chunk becomes new spare (better cache locality)
+            const prev_spare = self.spare_chunk.swap(old, .release);
+            if (prev_spare) |s| self.allocator.destroy(s);
+        }
+    };
 }
 ```
 
-**Why this matters**: Integer division/modulo by a non-power-of-2 value
-compiles to a `mul` + shift sequence on x86 (~20-40 cycles). A comparison
-is 1 cycle. The branch predictor correctly predicts "not taken" with
->99% accuracy (taken once per LWM messages). At 10M msgs/sec, this
-saves ~200-400 million cycles/sec.
+**Cache-line separation**: `reader`, `writer`, and `spare_chunk` each
+get `align(64)`. This ensures that when producer and consumer coroutines
+run on different executor threads (the common case under work-stealing),
+push() and pop() never bounce each other's cache lines. The only
+cross-core traffic is the spare_chunk atomic exchange, which happens once
+per N items (N=256 for messages).
 
-**No behavioral change**: The activation fires at exactly the same
-message counts. The only difference is the computation method.
+### Layer 3: Pipe (`YPipe`)
 
-### 5. Integrated Notification: Pipe Flush Without Mailbox
+Lock-free SPSC pipe. Same protocol as libzmq's ypipe_t — the CAS on `c`
+is the single synchronization point — but with the notification integrated
+into zio's executor model instead of going through a signaler.
 
-**Goal**: For the highest-frequency commands (`activate_read`,
-`activate_write`), bypass the mailbox entirely and use the notifier
-directly.
+```zig
+pub fn YPipe(comptime T: type, comptime N: comptime_int) type {
+    return struct {
+        const Self = @This();
 
-Currently, every pipe flush that finds the reader asleep triggers:
-1. `pipe_t::flush()` calls `send_activate_read(_peer)` (pipe.cpp:256)
-2. `object_t::send_command(cmd)` (object.cpp:520-522)
-3. `ctx_t::send_command(tid, cmd)` (ctx.cpp:642-644)
-4. `_slots[tid]->send(cmd)` → mailbox mutex + ypipe + signaler
+        queue: YQueue(T, N),
 
-This is 4 layers of indirection for a 1-bit signal ("you have data").
-The ypipe's `_c` pointer already carries this information atomically.
-What's missing is the notification to the consumer's executor.
+        // Writer-only: own cache line
+        writer: align(64) struct {
+            w: *T,  // first un-flushed item
+            f: *T,  // first item to flush in future
+        },
 
-Proposed: attach the notifier directly to the pipe, not to the mailbox:
+        // Reader-only: own cache line
+        reader_state: align(64) struct {
+            r: ?*T,  // first un-prefetched item
+        },
 
-```cpp
-class pipe_t
-{
-    // ...existing members...
+        // Shared: the single point of contention. Own cache line.
+        c: align(64) std.atomic.Value(?*T),
 
-    // Notifier for the read side. When flush() returns false
-    // (reader sleeping), notify directly instead of routing
-    // through mailbox.
-    i_notifier_t *_read_notifier;   // set by consumer side
-    i_notifier_t *_write_notifier;  // set by producer side
+        pub fn init(allocator: Allocator) !Self {
+            var queue = try YQueue(T, N).init(allocator);
+            try queue.push();  // terminator element
+            const back = queue.back();
+            return .{
+                .queue = queue,
+                .writer = .{ .w = back, .f = back },
+                .reader_state = .{ .r = back },
+                .c = .init(back),
+            };
+        }
 
-    void flush()
-    {
-        if (_state == term_ack_sent)
-            return;
+        // --- Writer thread ---
 
-        if (_out_pipe && !_out_pipe->flush()) {
-            // Reader is sleeping. Notify directly.
-            if (_read_notifier) {
-                _read_notifier->notify();
+        pub fn write(self: *Self, value: T, incomplete: bool) !void {
+            self.queue.back().* = value;
+            try self.queue.push();
+            if (!incomplete) {
+                self.writer.f = self.queue.back();
+            }
+        }
+
+        /// Flush completed items. Returns true if reader was awake,
+        /// false if reader was sleeping (caller must notify).
+        pub fn flush(self: *Self) bool {
+            if (self.writer.w == self.writer.f)
+                return true;
+
+            // CAS: try to update c from w to f
+            const old = self.c.cmpxchgStrong(
+                self.writer.w, self.writer.f, .acq_rel, .acquire,
+            );
+
+            if (old != null) {
+                // CAS failed: c was NULL (reader sleeping).
+                // Non-atomic store is safe — reader won't look at c
+                // until we notify it, and notification provides the
+                // acquire barrier.
+                self.c.store(self.writer.f, .release);
+                self.writer.w = self.writer.f;
+                return false;  // caller must wake reader
+            }
+
+            self.writer.w = self.writer.f;
+            return true;  // reader was awake
+        }
+
+        // --- Reader thread ---
+
+        pub fn checkRead(self: *Self) bool {
+            const front_ptr = self.queue.front();
+            if (front_ptr != self.reader_state.r and self.reader_state.r != null)
+                return true;  // prefetched data available
+
+            // Try to prefetch: CAS c from &front to NULL.
+            // Zig cmpxchgStrong returns null on success, else the actual old value.
+            // We want r = the old value of c in both cases:
+            //   Success → old c was front_ptr, so r = front_ptr
+            //   Failure → old c was something else, r = that value
+            const old_c = self.c.cmpxchgStrong(
+                front_ptr, null, .acq_rel, .acquire,
+            );
+            if (old_c) |actual| {
+                self.reader_state.r = actual;
             } else {
-                // Fallback: legacy path through mailbox
-                send_activate_read(_peer);
+                self.reader_state.r = front_ptr;
             }
+
+            // If front == r or r is null, nothing to read — reader sleeps.
+            // During pipe lifetime r should never be null, but it can
+            // happen during shutdown when items are being deallocated.
+            if (self.queue.front() == self.reader_state.r or self.reader_state.r == null)
+                return false;
+
+            return true;
         }
-    }
-};
-```
 
-**Benefit**: Eliminates the mailbox entirely for the hottest path.
-The flush returns false (reader sleeping) → one atomic exchange on
-the notifier's `_armed` flag → conditional task post to executor.
-No mutex, no command serialization, no ypipe write for a command that
-carries zero data.
-
-**For activate_write** (backpressure signal, pipe.cpp:202): same
-pattern, but through `_write_notifier`:
-
-```cpp
-bool pipe_t::read(msg_t *msg_)
-{
-    // ...existing read logic...
-
-    if (unlikely(_msgs_read >= _next_activate_threshold)) {
-        _next_activate_threshold += _lwm;
-        if (_write_notifier) {
-            _peers_msgs_read_cache = _msgs_read;
-            _write_notifier->notify();
-        } else {
-            send_activate_write(_peer, _msgs_read);
+        pub fn read(self: *Self) ?T {
+            if (!self.checkRead()) return null;
+            const value = self.queue.front().*;
+            self.queue.pop();
+            return value;
         }
-    }
-    return true;
+    };
 }
 ```
 
-**The mailbox remains** for infrequent commands (bind, term, hiccup,
-pipe_hwm, etc.) which don't need this optimization. Only
-`activate_read` and `activate_write` — which account for >95% of
-command traffic under load — bypass it.
+**Identical protocol to libzmq**: The CAS on `c` provides the
+acquire-release barrier that makes the queue contents visible to the
+reader. The `c = NULL` state means "reader is sleeping" — this is the
+one bit of information the notification layer needs.
 
-### 6. Batch-Aware Consumer Drain Loop
+**No signaler, no mailbox**: When `flush()` returns false, the caller
+doesn't write to an eventfd or push a command through a mailbox. Instead,
+it uses zio's native cross-thread wakeup (see Layer 4).
 
-**Goal**: When the consumer is notified, drain all available work across
-all pipes before re-arming the notifier. This amortizes the notification
-cost across many messages.
+### Layer 4: Bidirectional Pipe with zio Integration (`Pipe`)
 
-```cpp
-// Consumer-side drain loop (replaces io_thread_t::in_event
-// and socket_base_t::process_commands for executor mode)
+This is where the ZMQ pipe semantics (HWM, LWM, backpressure, multi-part
+messages) integrate with zio's coroutine scheduling.
 
-class executor_consumer_t
-{
-    i_notifier_t *_notifier;
-    std::vector<pipe_t *> _active_pipes;
-    mailbox_mpsc_t *_mailbox;
+```zig
+pub const Pipe = struct {
+    // Underlying unidirectional SPSC pipes
+    in_pipe: *YPipe(Msg, 256),   // incoming messages (we read)
+    out_pipe: *YPipe(Msg, 256),  // outgoing messages (we write)
 
-    // Called by executor when notifier fires.
-    void on_notify()
-    {
-        // Phase 1: Process all pending mailbox commands.
-        // These are infrequent (bind, term, etc.).
-        command_t cmd;
-        while (_mailbox->recv(&cmd, 0) == 0) {
-            cmd.destination->process_command(cmd);
+    // Backpressure state
+    hwm: u32,
+    lwm: u32,
+    msgs_read: u64 = 0,
+    msgs_written: u64 = 0,
+    peers_msgs_read: u64 = 0,
+    next_activate_threshold: u64 = 0,
+
+    // Activity flags
+    in_active: bool = true,
+    out_active: bool = true,
+
+    // Peer reference (the other end of the pipe pair)
+    peer: *Pipe = undefined,
+
+    // --- zio integration ---
+
+    // The executor that owns this pipe endpoint. Set when the pipe
+    // is attached to a socket/session on a specific executor.
+    executor: *zio.Runtime.Executor = undefined,
+
+    // Waiter for the read side: parked task waiting for data.
+    // When flush() returns false, we wake this instead of going
+    // through a mailbox.
+    read_waiter: ?*Waiter = null,
+
+    // Waiter for the write side: parked task waiting for HWM space.
+    write_waiter: ?*Waiter = null,
+
+    // -------------------------------------------------------
+    // Write path (called from producer coroutine)
+    // -------------------------------------------------------
+
+    pub fn send(self: *Pipe, msg: *Msg) !bool {
+        if (!self.out_active) return false;
+
+        if (!self.checkHwm()) {
+            self.out_active = false;
+            return false;
         }
 
-        // Phase 2: Drain all readable pipes.
-        // Each pipe's ypipe may have many messages batched.
-        for (auto *pipe : _active_pipes) {
-            msg_t msg;
-            while (pipe->read(&msg)) {
-                process_message(pipe, &msg);
+        const more = msg.flags.more;
+        try self.out_pipe.write(msg.move(), more);
+
+        if (!more) self.msgs_written += 1;
+        return true;
+    }
+
+    pub fn flushPipe(self: *Pipe) void {
+        if (!self.out_pipe.flush()) {
+            // Reader is sleeping. Wake it directly through zio.
+            self.wakeReader();
+        }
+    }
+
+    fn wakeReader(self: *Pipe) void {
+        const peer = self.peer;
+        if (peer.read_waiter) |waiter| {
+            // Wake the parked reader task.
+            // If same executor: scheduleTaskLocal (~5ns, no syscall)
+            // If different executor: push to Treiber stack + loop.wake()
+            //   (~50-200ns, one coalesced syscall)
+            waiter.signal();
+        }
+        // If no waiter, reader isn't blocked — it will see data on
+        // next checkRead(). No notification needed.
+    }
+
+    fn wakeWriter(self: *Pipe) void {
+        const peer = self.peer;
+        if (peer.write_waiter) |waiter| {
+            waiter.signal();
+        }
+    }
+
+    fn checkHwm(self: *const Pipe) bool {
+        if (self.hwm == 0) return true;  // infinite
+        return (self.msgs_written - self.peers_msgs_read) < self.hwm;
+    }
+
+    // -------------------------------------------------------
+    // Read path (called from consumer coroutine)
+    // -------------------------------------------------------
+
+    pub fn recv(self: *Pipe) ?Msg {
+        if (!self.in_active) return null;
+
+        var msg = self.in_pipe.read() orelse {
+            self.in_active = false;
+            return null;
+        };
+
+        if (!msg.flags.more) {
+            self.msgs_read += 1;
+
+            // Threshold-based backpressure: comparison, not modulo
+            if (self.msgs_read >= self.next_activate_threshold) {
+                self.next_activate_threshold += self.lwm;
+                self.peer.peers_msgs_read = self.msgs_read;
+                if (!self.peer.out_active) {
+                    self.peer.out_active = true;
+                    self.wakeWriter();
+                }
             }
         }
 
-        // Phase 3: Re-arm for next notification.
-        _notifier->arm();
+        return msg;
+    }
 
-        // Phase 4: Double-check after arming.
-        // Handles the race where a writer notified between
-        // our last read attempt and arm().
-        bool more_work = false;
-        if (_mailbox->recv(&cmd, 0) == 0) {
-            cmd.destination->process_command(cmd);
-            more_work = true;
-        }
-        for (auto *pipe : _active_pipes) {
-            if (pipe->check_read()) {
-                more_work = true;
-                break;
+    // -------------------------------------------------------
+    // Blocking variants (coroutine-aware)
+    // -------------------------------------------------------
+
+    /// Blocking send: parks coroutine if HWM reached, resumes when space available.
+    pub fn sendBlocking(self: *Pipe, msg: *Msg) !void {
+        while (true) {
+            if (try self.send(msg)) {
+                self.flushPipe();
+                return;
             }
+            // Park until writer is activated
+            var waiter = Waiter.init();
+            self.write_waiter = &waiter;
+            defer self.write_waiter = null;
+            try waiter.wait(1, .allow_cancel);
         }
-        if (more_work) {
-            // Re-enter drain loop without waiting for notification.
-            // Post to executor to avoid stack growth.
-            _notifier->notify();
+    }
+
+    /// Blocking recv: parks coroutine if no data, resumes when data flushed.
+    pub fn recvBlocking(self: *Pipe) !Msg {
+        while (true) {
+            if (self.recv()) |msg| return msg;
+            // Park until reader is activated
+            var waiter = Waiter.init();
+            self.read_waiter = &waiter;
+            defer self.read_waiter = null;
+            try waiter.wait(1, .allow_cancel);
         }
     }
 };
+
+/// Create a pipe pair for bidirectional communication.
+pub fn pipePair(allocator: Allocator, hwm0: u32, hwm1: u32) !struct { Pipe, Pipe } {
+    const pipe_a = try allocator.create(YPipe(Msg, 256));
+    pipe_a.* = try YPipe(Msg, 256).init(allocator);
+    const pipe_b = try allocator.create(YPipe(Msg, 256));
+    pipe_b.* = try YPipe(Msg, 256).init(allocator);
+
+    var p0 = Pipe{
+        .in_pipe = pipe_a, .out_pipe = pipe_b,
+        .hwm = hwm1, .lwm = computeLwm(hwm0),
+    };
+    var p1 = Pipe{
+        .in_pipe = pipe_b, .out_pipe = pipe_a,
+        .hwm = hwm0, .lwm = computeLwm(hwm1),
+    };
+    p0.peer = &p1;
+    p1.peer = &p0;
+    p0.next_activate_threshold = p0.lwm;
+    p1.next_activate_threshold = p1.lwm;
+    return .{ p0, p1 };
+}
+
+fn computeLwm(hwm: u32) u32 {
+    return (hwm + 1) / 2;
+}
 ```
 
-**Key property — self-tuning batch size:**
+### How Notification Works (The Critical Path)
 
-Under low load: one message arrives → notify → drain 1 message → arm.
-Latency-optimal: message is processed as soon as it arrives.
+The most important thing to understand is how a `send` on one executor
+thread wakes a `recvBlocking` on another:
 
-Under high load: thousands of messages arrive while consumer processes →
-all are drained in one pass → arm → next batch. Throughput-optimal:
-one notification per drain cycle, regardless of arrival rate.
-
-This replaces the hardcoded constants `inbound_poll_rate = 100` and
-`max_command_delay = 3,000,000` ticks (config.hpp:26,43) with adaptive
-behavior that emerges from the arm/notify protocol.
-
-### 7. Executor Integration Interface
-
-**Goal**: Provide a minimal, stable interface that executor libraries
-implement to integrate with libzmq's pipe and command infrastructure.
-
-```cpp
-// src/i_executor.hpp
-//
-// Minimal interface an executor must provide. Implementations
-// exist for each supported runtime (Asio, Tokio FFI, raw epoll,
-// io_uring, etc.).
-
-class i_executor_t
-{
-  public:
-    virtual ~i_executor_t() = default;
-
-    // Post a callable to be executed on this executor.
-    // Thread-safe. The callable will run on one of the executor's
-    // worker threads. If the executor is single-threaded, it runs
-    // on that thread.
-    //
-    // This is the ONLY cross-thread operation. Everything else
-    // (arm, drain, process) happens within the executor's context.
-    virtual void post(void (*fn)(void *), void *arg) = 0;
-
-    // Create a notifier bound to this executor. When notify()
-    // is called, the executor will eventually invoke the given
-    // callback. The notifier handles dedup internally.
-    virtual i_notifier_t *create_notifier(void (*fn)(void *),
-                                          void *arg) = 0;
-};
+```
+Executor Thread A (producer coroutine):          Executor Thread B (consumer coroutine):
+                                                  |
+pipe.sendBlocking(&msg)                          pipe.recvBlocking()
+  |                                                |
+  pipe.send(&msg)                                  pipe.recv() → null (no data)
+    ypipe.write(msg, more=false)                    ypipe.checkRead() → false, c set to NULL
+    ypipe.push()                                    |
+    f = &queue.back()                              in_active = false
+  |                                                |
+  pipe.flushPipe()                                 waiter = Waiter.init()
+    ypipe.flush()                                  self.read_waiter = &waiter
+      CAS(c, w, f) → fails, c was NULL            waiter.wait(1, .allow_cancel)
+      c.store(f, .release)                           → task state = preparing_to_wait
+      return false                                   → context switch to executor loop
+    |                                                → cleanup: CAS preparing→waiting
+    self.wakeReader()                                → task is now parked
+      peer.read_waiter → waiter                      |
+      waiter.signal()                                |
+        → task.state = .ready                        |
+        → if same executor: scheduleTaskLocal()      |
+          if diff executor: push to Treiber stack    |
+                           + loop.wake()             |
+                             → fetchOr (coalesced)   |
+                             → one backend syscall   |
+                                                     |
+                                                  [executor B loop tick]
+                                                  drain remote ready queue
+                                                  task.coro.step() → resume
+                                                    |
+                                                  waiter.wait returns
+                                                  self.read_waiter = null
+                                                  pipe.recv() → msg (data available!)
+                                                  return msg
 ```
 
-**Integration with existing poller:**
+**Total cost breakdown (cross-thread)**:
+- ypipe.write + push: ~5-10ns (store to array)
+- ypipe.flush CAS: ~15-25ns (one CAS, acquire-release)
+- waiter.signal(): ~5ns (atomic swap on task state)
+- Treiber stack push: ~8-15ns (one CAS)
+- loop.wake(): ~0ns if already woken (fetchOr fast path) or ~200-500ns (one backend syscall)
+- **Total: ~35-55ns (reader already woken) or ~235-555ns (reader sleeping, amortized)**
 
-The existing `worker_poller_base_t` (poller_base.hpp:135-166) owns a
-dedicated OS thread running `loop()`. This is itself an executor — a
-single-threaded run loop. The `signaler_notifier_t` maps naturally
-onto it: `notify()` writes to eventfd, `loop()` wakes from
-`epoll_wait()`, drains, `arm()` reads from eventfd.
+Compare to libzmq cross-thread: ~3000-5000ns (mutex + ypipe command + eventfd write + eventfd read).
 
-New executor backends plug in at the same level without changing the
-pipe, ypipe, or yqueue code.
+**Same-executor fast path**: When producer and consumer are on the same
+executor thread (after task migration or by affinity), `waiter.signal()`
+calls `scheduleTaskLocal()` which is a plain queue push — no atomic
+operations on the remote stack, no syscall. Cost: ~10-15ns total for
+the notification path.
+
+**Wakeup coalescing under load**: If producer sends 1000 messages in a
+burst, the first flush that finds the reader sleeping does the wakeup.
+All subsequent flushes see `c != NULL` (reader not sleeping because
+it hasn't drained yet) and `flush()` returns true — no notification
+at all. The reader drains all 1000 messages in one pass. This is the
+same self-batching behavior as libzmq's ypipe protocol, but without
+the signaler syscall overhead.
+
+### Layer 5: Multi-Part Message Framing
+
+ZMQ's multi-part message semantics are critical for protocol compatibility.
+Frames within a logical message are linked by the `more` flag:
+
+```zig
+/// Send a complete multi-part message atomically.
+/// Either all frames are written or none are (rollback on HWM).
+pub fn sendMultipart(pipe: *Pipe, frames: []Msg) !void {
+    for (frames, 0..) |*frame, i| {
+        const is_last = (i == frames.len - 1);
+        if (!is_last) frame.flags.more = true;
+
+        if (!try pipe.send(frame)) {
+            // HWM hit mid-message — rollback incomplete frames
+            pipe.rollback();
+            return error.HighWaterMarkReached;
+        }
+    }
+    pipe.flushPipe();
+}
+
+/// Receive a complete multi-part message.
+/// Collects frames until one without the `more` flag.
+pub fn recvMultipart(pipe: *Pipe, allocator: Allocator) ![]Msg {
+    var frames = std.ArrayList(Msg).init(allocator);
+    errdefer {
+        for (frames.items) |*f| f.deinit(allocator);
+        frames.deinit();
+    }
+
+    while (true) {
+        const msg = try pipe.recvBlocking();
+        const more = msg.flags.more;
+        try frames.append(msg);
+        if (!more) break;
+    }
+    return frames.toOwnedSlice();
+}
+```
+
+**Rollback** uses ypipe's `unwrite()` to remove incomplete frames from the
+pipe, matching libzmq's `pipe_t::rollback()` behavior.
+
+### Memory Lifecycle Through the Pipe
+
+This is where correctness matters most. A message traverses:
+
+```
+Producer coroutine                          Consumer coroutine
+    |                                           |
+msg = Msg.initSize(alloc, 1024)                 |
+  → allocates Content + data (refcount=1)       |
+msg.dataSlice()[0..] = payload                  |
+    |                                           |
+pipe.send(&msg)                                 |
+  → msg.move() into ypipe slot                  |
+  → producer's msg is now .empty                |
+  → ypipe slot owns the Content (refcount=1)    |
+    |                                           |
+pipe.flushPipe()                                |
+  → CAS makes data visible to consumer          |
+    |                                           |
+                                            msg = pipe.recv()
+                                              → reads from ypipe slot
+                                              → consumer owns Content (refcount=1)
+                                              → ypipe slot is popped
+                                                |
+                                            process(msg.dataSlice())
+                                                |
+                                            msg.deinit(alloc)
+                                              → Content.release()
+                                              → refcount 1→0, free data+Content
+```
+
+**Zero-copy path**: The Content pointer moves through the pipe without
+any memcpy or refcount bump. The `msg.move()` operation is a register-width
+struct copy (the Msg is 64 bytes = 8 registers on x86_64) followed by
+zeroing the source. The actual message data is never touched.
+
+**Shared path** (pub/sub fan-out): `msg.copy()` bumps the refcount
+atomically. Multiple pipe slots hold the same Content. Last consumer
+to `deinit()` frees the data.
+
+**VSM path** (small messages <= 48 bytes): No allocation at all. The
+data is inline in the Msg struct, which is copied by value into the
+ypipe queue slot. This is a 64-byte memcpy, which is one cache line
+write — optimal on all architectures.
 
 ---
 
-## Cost Model: Current vs Proposed
+## Comparison: libzmq vs This Design
 
-### Per-message costs (steady-state, cross-thread, inproc)
+### Hot Path Operations
 
-| Operation | Current | Proposed | Savings |
-|---|---|---|---|
-| ypipe::write + push | 5-10ns | 5-10ns | (unchanged) |
-| ypipe::flush CAS | 15-25ns | 15-25ns | (unchanged, required for cross-thread) |
-| Notification (reader sleeping) | ~1000ns (eventfd write) | ~8ns (atomic exchange, no-op if already notified) | 99.2% |
-| Notification (reader awake) | 0ns (CAS succeeds) | 0ns (CAS succeeds) | (unchanged) |
-| Mailbox for activate_read | ~1500ns (mutex+ypipe+signaler) | 0ns (direct notifier, bypassed) | 100% |
-| ypipe::check_read CAS | 15-25ns | 15-25ns | (unchanged) |
-| ypipe::read + pop | 5-10ns | 5-10ns | (unchanged) |
-| Backpressure check | 20-40ns (modulo) | 1ns (comparison) | 97% |
-| Mailbox for activate_write | ~1500ns (mutex+ypipe+signaler) | ~8ns (direct notifier) | 99.5% |
-| False sharing penalty | ~40-80ns (per cross-core access) | 0ns (cache-line separated) | 100% |
-| process_commands overhead | 100-500ns (RDTSC/counter) | ~2ns (pointer null check on mailbox) | 99% |
-
-### Aggregate per-message (amortized over batch)
-
-| Scenario | Current | Proposed |
+| Operation | libzmq | This design |
 |---|---|---|
-| Inproc, cross-thread, reader awake | ~100-200ns | ~30-50ns |
-| Inproc, cross-thread, reader sleeping | ~3000-5000ns | ~80-150ns |
-| Inproc, same-thread, reader sleeping | ~3000-5000ns | ~30-60ns |
-| Fan-out to 100 pipes, all sleeping | ~150,000ns | ~500ns (1 notify, batch drain) |
+| Write msg to pipe | ypipe::write + push (~10ns) | YPipe.write + push (~10ns) |
+| Flush (CAS) | ypipe::flush CAS (~20ns) | YPipe.flush CAS (~20ns) |
+| Notify sleeping reader | signaler.send() ~1000ns syscall | waiter.signal() ~8ns atomic |
+| | + mailbox mutex ~30ns | (no mailbox, no mutex) |
+| | + mailbox ypipe write ~10ns | |
+| | + mailbox ypipe flush ~20ns | |
+| Reader wakeup | signaler.recv() ~1000ns syscall | Treiber stack + loop.wake() |
+| | + epoll_wait return | ~200ns (coalesced, amortized) |
+| Read msg from pipe | ypipe::read CAS + pop (~25ns) | YPipe.read CAS + pop (~25ns) |
+| Backpressure check | msgs_read % lwm ~30ns (modulo) | msgs_read >= threshold ~1ns |
+| Backpressure notify | mailbox.send() ~1500ns | waiter.signal() ~8ns |
+| Command throttle | RDTSC ~100ns or tick count | Not needed (no command path) |
+| **Total (reader sleeping)** | **~3000-5000ns** | **~250-500ns** |
+| **Total (reader awake)** | **~100-200ns** | **~40-60ns** |
 
-### Notification count under load
+### What We Eliminate
 
-| Scenario | Current notifications/sec | Proposed notifications/sec |
-|---|---|---|
-| 1M msgs/sec, 1 pipe | ~1M signaler writes | ~10K-50K notifier posts (self-batching) |
-| 1M msgs/sec, 100 pipes | ~100M signaler writes | ~10K-50K notifier posts (coalesced) |
-| 10K msgs/sec, 1 pipe (light) | ~10K signaler writes | ~10K notifier posts (no batching) |
+1. **Signaler** (eventfd/pipe): Replaced by zio's `Waiter.signal()` which
+   uses the executor's existing notification path (Treiber stack +
+   `loop.wake()` with fetchOr coalescing).
 
-The key insight: under high load, the arm/notify protocol naturally
-collapses O(messages) notifications into O(drain_cycles) notifications.
-Under light load, it degrades to at most O(messages) — no worse than
-current.
+2. **Mailbox** (mutex + SPSC ypipe + signaler): Eliminated entirely.
+   `activate_read` and `activate_write` are direct `waiter.signal()` calls.
+   No command serialization, no command routing, no TID-based dispatch.
 
----
+3. **Command system** (`object_t::send_command` → `ctx_t::send_command` →
+   mailbox): Not needed. Pipe lifecycle commands (term, hiccup, hwm) can
+   use zio's `Channel` for the rare cases where they're needed.
 
-## Implementation Strategy
+4. **RDTSC throttling** (`process_commands` in socket_base.cpp): Not needed.
+   There's no command polling loop to throttle. Data flows directly through
+   the ypipe, and notifications flow through zio's executor.
 
-### Phase 1: Cache-Line Alignment (Low Risk, Immediate Benefit)
+5. **Tick counter** (`inbound_poll_rate = 100`): Not needed. zio's executor
+   already forces event loop ticks every 61 tasks (`EVENT_INTERVAL`).
 
-**Changes:**
-- Add `alignas(64)` to reader/writer field groups in `yqueue_t`
-- Add `alignas(64)` to `_w`/`_f`, `_r`, `_c` in `ypipe_t`
-- Replace modulo with threshold comparison in `pipe_t::read()`
-- Add `_next_activate_threshold` field to `pipe_t`
+### What We Retain
 
-**Impact**: Zero API change. Zero behavioral change. Measurable
-throughput improvement on multi-core systems (~10-30% for cross-thread
-inproc benchmarks based on false-sharing elimination alone).
+1. **YPipe CAS protocol**: Identical to libzmq. The lock-free SPSC queue
+   with the `c` pointer sleep/wake mechanism is near-optimal and proven.
 
-**Risk**: Increased struct sizes by ~128-192 bytes per pipe. Negligible
-compared to per-chunk allocations (16KB each).
+2. **YQueue chunk allocator**: Same design — N-element chunks with one
+   spare chunk recycled via atomic exchange. N=256 for messages.
 
-### Phase 2: Notifier Abstraction
+3. **Msg layout**: 64-byte cache-line-sized message with VSM/LMSG/CMSG
+   variants, matching libzmq's msg_t semantics.
 
-**Changes:**
-- Introduce `i_notifier_t` interface
-- Implement `signaler_notifier_t` wrapping existing `signaler_t`
-- Add `_read_notifier` / `_write_notifier` to `pipe_t`
-- Modify `pipe_t::flush()` to use notifier when available
-- Modify `pipe_t::read()` to use notifier for backpressure
+4. **HWM/LWM backpressure**: Same algorithm — writer blocks at HWM,
+   reader sends activate_write at LWM crossings.
 
-**Impact**: Existing code paths unchanged when notifiers are NULL
-(legacy mode). New code paths activated when an executor sets notifiers
-on its pipes.
-
-### Phase 3: MPSC Mailbox
-
-**Changes:**
-- Implement `mailbox_mpsc_t` with Vyukov MPSC queue
-- Implement `pool_t<node_t>` with thread-local freelist
-- Add as alternative `i_mailbox` implementation selectable at
-  context creation time
-
-**Impact**: Optional replacement for `mailbox_t`. Legacy path remains
-default. Executor-mode contexts use `mailbox_mpsc_t`.
-
-### Phase 4: Executor Integration
-
-**Changes:**
-- Introduce `i_executor_t` interface
-- Implement `executor_notifier_t`
-- Implement `executor_consumer_t` drain loop with arm/notify/drain cycle
-- Create `executor_io_thread_t` as alternative to `io_thread_t`
-  (no dedicated OS thread; uses executor's thread pool)
-
-**Impact**: New context option `ZMQ_EXECUTOR` to provide an executor
-implementation. When set, I/O "threads" are executor tasks rather than
-OS threads.
-
-### Phase 5: Benchmarking and Tuning
-
-**Benchmarks:**
-- Inproc latency: 1-to-1, 1-to-N, N-to-1 pipe configurations
-- Inproc throughput: messages/sec at various batch sizes
-- Command dispatch latency: mailbox_t vs mailbox_mpsc_t
-- Notification overhead: signaler vs executor_notifier under load
-- Cache miss rates: before/after alignment changes (perf stat)
-- Work-stealing interaction: latency under thread migration
-
-**Tuning parameters to evaluate:**
-- `message_pipe_granularity`: 256 is good for throughput (16KB chunks,
-  99.6% allocation amortization). Consider 128 for workloads with
-  many pipes (8KB, better L1 residency). Expose as pipe option rather
-  than compile-time constant.
-- `pool_t::local_capacity`: 64 nodes per thread. May need tuning based
-  on command fan-in degree.
-- Drain batch limit: Should the consumer drain ALL available messages
-  per notification, or cap at some limit for fairness? Default: drain
-  all. Make configurable for latency-sensitive workloads.
+5. **Multi-part message atomicity**: Same rollback-on-failure semantics.
 
 ---
 
-## Correctness Arguments
+## Implementation Plan
 
-### 1. ypipe CAS protocol is unchanged
+### Phase 1: Core Data Structures
 
-The lock-free protocol (ypipe.hpp:76-122) is retained exactly. All
-atomics, memory orderings, and the `_c` pointer lifecycle are preserved.
-The only change is what happens AFTER `flush()` returns false — instead
-of writing to an eventfd, we call `_notifier->notify()`.
+- `Msg` type with VSM/LMSG/CMSG variants, move/copy/deinit
+- `YQueue(T, N)` with cache-line-aligned reader/writer/spare fields
+- `YPipe(T, N)` with cache-line-aligned w/f, r, c fields
+- Unit tests for each in isolation (single-threaded correctness)
 
-This is a pure substitution of the notification transport. The data
-consistency guarantee comes from the CAS (acquire-release ordering),
-not from the signaler.
+### Phase 2: Pipe Integration
 
-### 2. Notifier idempotency prevents lost wakeups
+- `Pipe` struct with HWM/LWM backpressure
+- `pipePair()` factory
+- Threshold-based backpressure (comparison, not modulo)
+- Blocking send/recv using zio `Waiter`
+- Multi-part send/recv with rollback
+- Cross-thread tests (two executors, producer/consumer on different threads)
 
-The arm/notify protocol has a potential race:
+### Phase 3: Socket Layer
 
-```
-Consumer:                    Producer:
-  drain (reads everything)
-                             write + flush → _c was NULL → need notify
-  arm()                      notify() → _armed was true → post task
-```
+- Socket types (PUSH/PULL, PUB/SUB, REQ/REP, PAIR)
+- Pipe management (attach, detach, terminate)
+- Fair queuing (round-robin recv across multiple pipes)
+- Load balancing (round-robin send across multiple pipes)
+- inproc transport
 
-This is correct: producer's notify() fires because _armed was true.
+### Phase 4: Network Transport
 
-The dangerous race is:
-```
-Consumer:                    Producer:
-  drain (reads everything)
-                             write + flush → _c was NULL → need notify
-                             notify() → _armed was true → post task
-  arm()
-  double-check → finds data → re-enters drain
-```
+- TCP transport using zio's `net.IpAddress.listen/connect`
+- ZMTP wire protocol (greeting, handshake, framing)
+- Session management
+- Reconnection logic
 
-Also correct: the double-check after arm() catches data that arrived
-between the last drain and arm(). The re-entry via self-notify()
-ensures the consumer processes it.
+### Phase 5: Benchmarks
 
-The truly subtle case:
-```
-Consumer:                    Producer:
-  drain (reads everything)
-  arm() → _armed = true
-                             write + flush → notify() → _armed was true → post
-  double-check → finds data → processes it
-                             [task from notify arrives]
-  on_notify() → drain → nothing to read → arm()
-```
-
-Correct but wasteful: one spurious wakeup. This is acceptable — the
-cost is one empty drain cycle (~50ns), not a lost message.
-
-### 3. MPSC queue linearizability
-
-The Vyukov MPSC queue has a well-known proof of linearizability. The
-linearization point for push is the `_head.exchange()`. The consumer's
-pop observes all pushes that completed their `prev->next.store()` before
-the consumer's `tail->next.load()`.
-
-The brief window where `prev->next` is not yet set (between exchange and
-store) is handled by the consumer returning nullptr — it will retry on
-the next drain cycle. Under the arm/notify protocol, the producer's
-notify() ensures the consumer will retry.
-
-### 4. Thread safety of pool_t
-
-Thread-local freelists are inherently thread-safe (no sharing). The
-shared Treiber stack uses a standard lock-free push/pop with CAS. Nodes
-that migrate between threads (allocated on thread A, freed on thread B)
-go to thread B's local freelist, which is correct because the freelist
-holds raw memory, not thread-affine state.
+- Inproc latency: single-message round-trip between two coroutines
+- Inproc throughput: messages/sec at various sizes (VSM, 1KB, 64KB)
+- Fan-out: PUB to N SUBs
+- Fan-in: N PUSHers to 1 PULLer
+- Comparison with libzmq's `inproc_lat` and `inproc_thr` benchmarks
+- Cross-executor vs same-executor performance delta
 
 ---
 
-## What This Design Does NOT Do
-
-1. **Does not assume same-thread execution.** Every optimization works
-   correctly when producer and consumer are on different cores. Same-
-   thread is faster (cache hits) but not required.
-
-2. **Does not replace the ypipe protocol.** The CAS-based SPSC
-   protocol is retained. It is already near-optimal for the cross-
-   thread case.
-
-3. **Does not require a specific executor.** The `i_executor_t` /
-   `i_notifier_t` interfaces are minimal and map naturally onto Asio's
-   `post()`, Tokio's `spawn()`, Go's goroutine scheduling, raw
-   `io_uring`, or a custom event loop.
-
-4. **Does not break existing users.** All changes are additive. The
-   existing signaler/mailbox/poller path is the default. Executor
-   integration is opt-in via new context options.
-
-5. **Does not add per-message overhead.** The optimizations reduce or
-   eliminate per-message costs. No new per-message work is introduced.
-   The only new per-message cost is a comparison (`_msgs_read >=
-   threshold`) which replaces a more expensive modulo.
-
----
-
-## Appendix: Key Source Files and Line References
+## Appendix: zio Internals Referenced
 
 | Component | File | Key Lines | Role |
 |---|---|---|---|
-| yqueue_t fields | src/yqueue.hpp | 172-182 | False-sharing layout problem |
-| yqueue_t push | src/yqueue.hpp | 78-97 | Writer hot path |
-| yqueue_t pop | src/yqueue.hpp | 131-145 | Reader hot path |
-| yqueue_t spare | src/yqueue.hpp | 86, 142 | Atomic exchange (only cross-thread op) |
-| ypipe_t fields | src/ypipe.hpp | 150-172 | False-sharing layout problem |
-| ypipe_t flush | src/ypipe.hpp | 76-98 | CAS protocol, writer side |
-| ypipe_t check_read | src/ypipe.hpp | 101-122 | CAS protocol, reader side |
-| pipe_t read | src/pipe.cpp | 170-205 | Modulo backpressure, activate_write |
-| pipe_t flush | src/pipe.cpp | 249-257 | activate_read trigger |
-| pipe_t write | src/pipe.cpp | 222-234 | HWM check |
-| mailbox_t send | src/mailbox.cpp | 32-40 | Mutex + SPSC + signaler |
-| mailbox_t recv | src/mailbox.cpp | 42-74 | Signaler wait + SPSC read |
-| signaler_t send | src/signaler.cpp | 146-201 | eventfd write (~1000ns) |
-| signaler_t recv | src/signaler.cpp | 275-309 | eventfd read (~1000ns) |
-| signaler_t wait | src/signaler.cpp | 203-273 | poll() on signaler fd |
-| io_thread_t in_event | src/io_thread.cpp | 54-69 | Command drain loop |
-| object_t send_command | src/object.cpp | 520-522 | TID-based routing |
-| ctx_t send_command | src/ctx.cpp | 642-644 | Mailbox dispatch |
-| socket_base_t send | src/socket_base.cpp | 1205-1291 | RDTSC throttle + xsend |
-| socket_base_t recv | src/socket_base.cpp | 1293-1387 | Tick counter + xrecv |
-| socket_base_t process_commands | src/socket_base.cpp | 1452-1500 | Throttled command processing |
-| config.hpp constants | src/config.hpp | 15-58 | Granularity, poll rate, cmd delay |
-| command_t | src/command.hpp | 22-194 | Command types and layout |
-| i_mailbox | src/i_mailbox.hpp | 13-28 | Mailbox interface |
-| ypipe_base_t | src/ypipe_base.hpp | 15-26 | Pipe virtual interface |
-| mailbox_safe_t | src/mailbox_safe.cpp | 50-67 | Multi-signaler broadcast pattern |
-| epoll_t::loop | src/epoll.cpp | 140-193 | Poller event loop |
-| worker_poller_base_t | src/poller_base.hpp | 135-166 | Thread-per-poller model |
+| Executor.scheduleTask | src/runtime.zig | 477-517 | Task dispatch with migration |
+| Executor.scheduleTaskRemote | src/runtime.zig | 461-472 | Treiber stack + loop.wake() |
+| Executor.run | src/runtime.zig | 367-410 | Main loop: tasks → drain remote → poll |
+| Executor.getNextTask | src/runtime.zig | 416-443 | Fairness: EVENT_INTERVAL=61, tick guard |
+| Executor.processCleanup | src/runtime.zig | 531-548 | Deferred park with CAS |
+| loop.wake | src/ev/loop.zig | 295-301 | fetchOr coalescing, one syscall |
+| LoopState.markCompleted | src/ev/loop.zig | 135-159 | Atomic cancel coordination |
+| AtomicStack (Treiber) | src/ev/loop.zig | 63-88 | Lock-free MPSC for cross-thread |
+| Waiter | src/common.zig | (various) | Task parking / futex signaling |
+| Channel | src/sync/channel.zig | 24-100 | MPMC reference (mutex-based) |
+| Completion lifecycle | src/ev/completion.zig | 55-100 | new→running→completed→dead |
+| Context switch | src/coro/coroutines.zig | (asm) | ~100ns register save/restore |
