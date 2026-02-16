@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v3)
+## Status: DESIGN PROPOSAL (v4)
 
 ## Context
 
@@ -1532,6 +1532,1583 @@ fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
 
 ---
 
+
+## Layer 7: Socket Semantics (Pipe Lifecycle, Routing, Readiness)
+
+This is the layer that gives ZMQ its programming model: socket types with
+different routing patterns, connection/disconnection handling, readiness
+polling, and multi-part message atomicity. In libzmq, these semantics are
+spread across `socket_base_t`, `pipe_t`, `fq_t`, `lb_t`, and the
+command/mailbox system. We consolidate them into a single coherent layer
+that runs entirely on coroutines and our existing Pipe infrastructure.
+
+### What libzmq Does (and What We Replace)
+
+libzmq's socket layer has six interacting subsystems:
+
+1. **Command system** (`mailbox_t` + `object_t::send_command`): Delivers
+   pipe lifecycle events (`activate_read`, `activate_write`, `pipe_term`,
+   `pipe_term_ack`, `hiccup`) as serialized commands through a mutex-guarded
+   ypipe + signaler. **We eliminate this entirely** — our Pipe already
+   handles data-flow signals through Waiters, and lifecycle events use
+   atomic state + sentinel messages (see below).
+
+2. **Pipe state machine** (6 states in `pipe_t`): Manages two-phase
+   termination, flow control activation, and hiccup recovery. **We replace
+   this** with a 4-state atomic state machine + delimiter messages through
+   the existing ypipe.
+
+3. **Fair queuing / load balancing** (`fq_t` / `lb_t`): Round-robin
+   routing across active pipes with swap-to-back deactivation. **We keep
+   the same algorithm**, adapted to Zig with direct method calls instead
+   of command dispatch.
+
+4. **Socket type dispatch** (virtual `xsend`/`xrecv`/`xhas_in`/`xhas_out`):
+   Each socket type overrides these to implement its routing pattern.
+   **We replace C++ virtual dispatch** with a Zig tagged union for
+   zero-indirection dispatch.
+
+5. **Readiness + poll** (`ZMQ_FD` + `ZMQ_EVENTS` + `zmq_poll`): FD-based
+   readiness that integrates with OS poll/epoll. **We replace this** with
+   coroutine-native multi-wait using a shared Waiter.
+
+6. **Monitor events** (`zmq_socket_monitor`): Sends socket lifecycle events
+   to a monitor socket via inproc. **We replace this** with a typed event
+   channel.
+
+### Pipe Lifecycle State Machine
+
+In libzmq, pipe lifecycle transitions flow through the command system:
+`terminate()` sends `PIPE_TERM` through the mailbox, the peer processes it
+in `process_commands()`, and replies with `PIPE_TERM_ACK`. This requires
+the full mailbox + signaler machinery.
+
+We replace this with **in-band sentinel messages** (delimiters written into
+the ypipe itself) plus an **atomic state field** on each pipe endpoint.
+The ypipe is already a reliable ordered channel — we just send lifecycle
+signals through it as special messages instead of through a separate
+command channel.
+
+```
+State machine per pipe endpoint:
+
+    ┌──────────┐
+    │  active   │─── terminate() called ──→ write delimiter, flush
+    └──────────┘                            set state = term_sent
+         │                                       │
+    read delimiter                               │
+    from peer                                    ▼
+         │                                ┌─────────────┐
+         ▼                                │  term_sent   │
+    ┌──────────────────┐                  └─────────────┘
+    │ term_received     │                       │
+    │ (drain remaining, │                  read delimiter
+    │  write delimiter, │                  from peer (ack)
+    │  flush)           │                       │
+    └──────────────────┘                       ▼
+         │                                ┌─────────────┐
+         ▼                                │ terminated   │
+    ┌─────────────┐                       └─────────────┘
+    │ terminated   │
+    └─────────────┘
+```
+
+The four states:
+
+| State | Meaning | Entered when |
+|-------|---------|--------------|
+| `active` | Normal operation | Pipe created |
+| `term_sent` | We initiated shutdown, waiting for peer ack | Local `terminate()` called |
+| `term_received` | Peer initiated shutdown, we're draining | Read delimiter from inpipe |
+| `terminated` | Both sides agreed, pipe is dead | Read delimiter after `term_sent`, or wrote delimiter after `term_received` |
+
+```zig
+pub const PipeState = enum(u8) {
+    active,
+    term_sent,
+    term_received,
+    terminated,
+};
+
+// Added to Pipe struct from Layer 4:
+state: std.atomic.Value(PipeState) = .init(.active),
+delay: bool = true,  // if true, drain pending messages before terminating
+
+// Routing identity (set by ROUTER during identification)
+routing_id: u32 = 0,
+
+// Callback to socket layer on termination
+on_terminated: ?*const fn (*Pipe) void = null,
+
+// Sentinel message detection — uses a reserved bit in Msg.flags
+// that never appears in user messages (ZMTP never sets bit 7)
+const delimiter_flag: u8 = 0x80;
+
+fn isDelimiter(msg: *const Msg) bool {
+    return @as(u8, @bitCast(msg.flags)) & delimiter_flag != 0;
+}
+
+fn makeDelimiter() Msg {
+    var msg = Msg{};
+    msg.flags = @bitCast(delimiter_flag);
+    return msg;
+}
+```
+
+#### `terminate()` — Initiate Pipe Shutdown
+
+Called by the socket layer when closing a connection or the entire socket.
+The `delay` parameter controls whether the peer should drain pending
+messages before completing termination (matches libzmq's `pipe_t::terminate`
+behavior).
+
+```zig
+pub fn terminate(self: *Pipe, delay: bool) void {
+    self.delay = delay;
+    const current = self.state.load(.acquire);
+
+    switch (current) {
+        .active, .term_received => {
+            // Stop writing — no more user messages after this
+            self.out_active = false;
+
+            // Rollback any incomplete multi-part message
+            self.rollback();
+
+            // Write delimiter sentinel to outpipe and flush.
+            // The peer will read this and know we're terminating.
+            self.out_pipe.write(makeDelimiter(), false) catch {};
+            _ = self.out_pipe.flush();
+
+            if (current == .active) {
+                self.state.store(.term_sent, .release);
+            } else {
+                // Was term_received → now both sides done
+                self.state.store(.terminated, .release);
+                self.notifyTerminated();
+            }
+        },
+        .term_sent, .terminated => {},  // already terminating/terminated
+    }
+}
+
+fn notifyTerminated(self: *Pipe) void {
+    if (self.on_terminated) |cb| cb(self);
+}
+```
+
+#### Reading Delimiters — Peer Termination Detection
+
+The read path in `recv()` checks for delimiter sentinels. When one is
+found, it means the peer called `terminate()`:
+
+```zig
+pub fn recv(self: *Pipe) ?Msg {
+    if (!self.in_active) return null;
+
+    const msg = self.in_pipe.read() orelse {
+        self.in_active = false;
+        return null;
+    };
+
+    // Check for delimiter sentinel
+    if (isDelimiter(&msg)) {
+        self.processDelimiter();
+        return null;  // No user-visible message
+    }
+
+    // Normal message — update backpressure counters (unchanged from Layer 4)
+    if (!msg.flags.more) {
+        self.msgs_read += 1;
+        if (self.msgs_read >= self.next_activate_threshold) {
+            self.next_activate_threshold += self.lwm;
+            self.peer.peers_msgs_read = self.msgs_read;
+            if (!self.peer.out_active) {
+                self.peer.out_active = true;
+                self.wakeWriter();
+            }
+        }
+    }
+    return msg;
+}
+
+fn processDelimiter(self: *Pipe) void {
+    const current = self.state.load(.acquire);
+    switch (current) {
+        .active => {
+            // Peer terminated first. If delay=true, keep reading
+            // remaining messages until inpipe is empty, THEN ack.
+            // If delay=false, ack immediately.
+            self.state.store(.term_received, .release);
+            if (!self.delay) {
+                self.terminate(false);  // Immediate ack
+            }
+            // If delay=true, socket layer continues draining.
+            // When it calls terminate(), we'll transition to terminated.
+        },
+        .term_sent => {
+            // We sent term, now peer acked — fully terminated
+            self.state.store(.terminated, .release);
+            self.notifyTerminated();
+        },
+        else => {},  // Already terminated
+    }
+}
+```
+
+#### Why Delimiters Through the YPipe (Not a Separate Channel)
+
+It's tempting to use a separate atomic flag or channel for termination.
+But sending the delimiter through the ypipe has critical ordering properties:
+
+1. **Ordering guarantee**: The delimiter appears after all data messages
+   the peer wrote before calling `terminate()`. A separate channel could
+   race — the termination signal could arrive before the last data messages.
+
+2. **Wake integration**: The delimiter flows through the same flush/CAS/Waiter
+   path as data. If the reader is parked waiting for data, the delimiter's
+   flush wakes it. No separate wake mechanism needed.
+
+3. **No extra allocation**: The delimiter is a regular `Msg` (64 bytes)
+   written into the existing ypipe slot. No channel, no extra memory.
+
+This exactly mirrors libzmq's approach where the delimiter is written into
+the pipe's ypipe (pipe.cpp:430-439), not sent as a command.
+
+#### Hiccup (Reconnection)
+
+In libzmq, `hiccup()` replaces the inpipe on the peer side to handle
+reconnection without losing the pipe object. This is complex because it
+must splice a new ypipe into an existing pipe.
+
+We handle reconnection differently: **the session terminates the old pipe
+pair entirely, and the reconnect loop creates a new pipe pair** (as shown
+in Layer 6's `reconnectLoop`). The socket sees `pipeTerminated()` followed
+by `attachPipe()`. This is simpler because:
+
+1. The reconnect loop already creates fresh pipe pairs
+2. Each Session is a separate coroutine with its own pipe endpoint
+3. No need to splice ypipes — just attach/detach at the socket level
+4. ROUTER tracks identity → pipe mappings, so the new pipe inherits
+   the old identity if the same peer reconnects
+
+### Socket Base
+
+The socket base manages a set of pipes and delegates routing to the
+socket type implementation. In libzmq, this is `socket_base_t` with
+C++ virtual dispatch. In Zig, we use a tagged union.
+
+```zig
+pub const Socket = struct {
+    // All attached pipes
+    pipes: std.ArrayList(*Pipe),
+
+    // Socket type implementation (tagged union, zero-indirection dispatch)
+    pattern: Pattern,
+
+    // Socket options
+    options: Options,
+
+    // For coroutine-native poll/select: signaled when readiness changes
+    readiness_waiter: ?*Waiter = null,
+
+    // Monitor event channel (null if no monitor attached)
+    monitor: ?*MonitorChannel = null,
+
+    // Lifecycle
+    active: bool = true,
+    allocator: Allocator,
+
+    pub const Options = struct {
+        hwm_send: u32 = 1000,
+        hwm_recv: u32 = 1000,
+        linger_ms: i64 = -1,       // -1 = infinite, 0 = discard, >0 = timeout
+        connect_timeout_ms: u32 = 0,
+        routing_id: ?[]const u8 = null,  // ROUTER identity
+    };
+
+    // ----------------------------------------------------------
+    // Pipe management (called by transport layer)
+    // ----------------------------------------------------------
+
+    /// Attach a new pipe from a connection or bind.
+    /// Called by transport layer when a connection is established.
+    pub fn attachPipe(self: *Socket, pipe: *Pipe, locally_initiated: bool) void {
+        pipe.on_terminated = Socket.pipeTerminatedCb;
+        self.pipes.append(pipe) catch return;
+
+        // Delegate to socket type for pattern-specific setup
+        self.pattern.attachPipe(pipe, locally_initiated);
+
+        // Monitor event
+        if (self.monitor) |m| m.send(.{ .pipe_attached = .{} });
+
+        // If socket is terminating, immediately terminate the new pipe
+        if (!self.active) {
+            pipe.terminate(false);
+        }
+    }
+
+    /// Called when a pipe reaches the `terminated` state.
+    fn pipeTerminatedCb(pipe: *Pipe) void {
+        // The socket reference is recovered from the pipe's parent
+        const self = pipe.socket orelse return;
+        self.pipeTerminated(pipe);
+    }
+
+    fn pipeTerminated(self: *Socket, pipe: *Pipe) void {
+        // Delegate to socket type first (removes from FQ/LB)
+        self.pattern.pipeTerminated(pipe);
+
+        // Remove from master pipe list
+        for (self.pipes.items, 0..) |p, i| {
+            if (p == pipe) {
+                _ = self.pipes.swapRemove(i);
+                break;
+            }
+        }
+
+        // Monitor event
+        if (self.monitor) |m| m.send(.{ .disconnected = .{} });
+
+        // Signal readiness change (pipe removal may affect has_in/has_out)
+        self.signalReadiness();
+    }
+
+    // ----------------------------------------------------------
+    // Readiness callbacks (called by Pipe on state changes)
+    // ----------------------------------------------------------
+
+    /// Called when a pipe that was empty now has data to read.
+    pub fn readActivated(self: *Socket, pipe: *Pipe) void {
+        self.pattern.readActivated(pipe);
+        self.signalReadiness();
+    }
+
+    /// Called when a pipe that was at HWM now has space to write.
+    pub fn writeActivated(self: *Socket, pipe: *Pipe) void {
+        self.pattern.writeActivated(pipe);
+        self.signalReadiness();
+    }
+
+    fn signalReadiness(self: *Socket) void {
+        if (self.readiness_waiter) |w| w.signal();
+    }
+
+    // ----------------------------------------------------------
+    // User-facing send/recv
+    // ----------------------------------------------------------
+
+    pub fn send(self: *Socket, msg: *Msg) !void {
+        return self.pattern.send(msg);
+    }
+
+    pub fn recv(self: *Socket) !Msg {
+        return self.pattern.recv();
+    }
+
+    /// Non-blocking readiness checks (equivalent to ZMQ_EVENTS)
+    pub fn hasIn(self: *Socket) bool {
+        return self.pattern.hasIn();
+    }
+
+    pub fn hasOut(self: *Socket) bool {
+        return self.pattern.hasOut();
+    }
+
+    /// Blocking send: parks coroutine until the socket can accept a message.
+    pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
+        while (true) {
+            if (self.hasOut()) return try self.send(msg);
+            var waiter = Waiter.init();
+            self.readiness_waiter = &waiter;
+            defer self.readiness_waiter = null;
+            try waiter.wait(1, .allow_cancel);
+        }
+    }
+
+    /// Blocking recv: parks coroutine until a message is available.
+    pub fn recvBlocking(self: *Socket) !Msg {
+        while (true) {
+            if (self.hasIn()) return try self.recv();
+            var waiter = Waiter.init();
+            self.readiness_waiter = &waiter;
+            defer self.readiness_waiter = null;
+            try waiter.wait(1, .allow_cancel);
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Graceful shutdown
+    // ----------------------------------------------------------
+
+    /// Close the socket. Terminates all pipes, optionally waiting
+    /// for outbound messages to drain (linger).
+    pub fn close(self: *Socket) void {
+        self.active = false;
+
+        // Terminate all pipes. delay=true gives them time to flush.
+        const delay = self.options.linger_ms != 0;
+        for (self.pipes.items) |pipe| {
+            pipe.terminate(delay);
+        }
+
+        // If linger > 0, wait up to linger_ms for pipes to drain.
+        // If linger = 0, pipes were terminated with delay=false (immediate).
+        // If linger = -1, wait indefinitely for all pipes to finish.
+    }
+};
+```
+
+**Key difference from libzmq**: There is no `process_commands()` loop.
+In libzmq, `socket_base_t::process_commands()` drains the mailbox on
+every `getsockopt(ZMQ_EVENTS)`, every `send()`, and every `recv()` — it's
+the mechanism that turns async pipe events into socket state changes. We
+don't need this because pipe events (readActivated, writeActivated,
+pipeTerminated) are delivered directly via callbacks or Waiter signals.
+The socket's state is always current.
+
+### Fair Queuing (`FairQueue`)
+
+Round-robin receive across multiple pipes. Same algorithm as libzmq's
+`fq_t`: active pipes are kept at the front of the array, the `current`
+index advances after each complete message, and pipes that become empty
+are swapped to the back (deactivated).
+
+```zig
+pub const FairQueue = struct {
+    pipes: std.ArrayList(*Pipe),
+    active: usize = 0,       // pipes[0..active] are readable
+    current: usize = 0,      // next pipe to read from (round-robin)
+    more: bool = false,       // in the middle of a multi-part message?
+
+    pub fn init(allocator: Allocator) FairQueue {
+        return .{ .pipes = std.ArrayList(*Pipe).init(allocator) };
+    }
+
+    /// Add a pipe to the active set.
+    pub fn attach(self: *FairQueue, pipe: *Pipe) void {
+        self.pipes.append(pipe) catch return;
+        // Move new pipe into active region by swapping with first inactive
+        self.swap(self.active, self.pipes.items.len - 1);
+        self.active += 1;
+    }
+
+    /// Remove a terminated pipe.
+    pub fn pipeTerminated(self: *FairQueue, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+
+        if (index == self.current and self.more) {
+            self.more = false;  // Protocol error: mid-multipart on dead pipe
+        }
+
+        if (index < self.active) {
+            self.active -= 1;
+            self.swap(index, self.active);
+            if (self.current == self.active) self.current = 0;
+        }
+        self.removePipe(pipe);
+    }
+
+    /// Re-activate a pipe that has new data.
+    pub fn activated(self: *FairQueue, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+        self.swap(index, self.active);
+        self.active += 1;
+    }
+
+    /// Round-robin receive. Returns the message and the source pipe.
+    pub fn recv(self: *FairQueue) ?struct { msg: Msg, pipe: *Pipe } {
+        while (self.active > 0) {
+            const pipe = self.pipes.items[self.current];
+            if (pipe.recv()) |msg| {
+                self.more = msg.flags.more;
+                if (!self.more) {
+                    // Complete message — advance round-robin
+                    self.current = (self.current + 1) % self.active;
+                }
+                return .{ .msg = msg, .pipe = pipe };
+            }
+
+            // Pipe empty — deactivate (must not happen mid-multipart)
+            self.active -= 1;
+            self.swap(self.current, self.active);
+            if (self.current == self.active) self.current = 0;
+        }
+        return null;
+    }
+
+    /// Check if any active pipe has data.
+    pub fn hasIn(self: *FairQueue) bool {
+        if (self.more) return true;  // Continuation guaranteed
+
+        while (self.active > 0) {
+            if (self.pipes.items[self.current].in_pipe.checkRead())
+                return true;
+
+            self.active -= 1;
+            self.swap(self.current, self.active);
+            if (self.current == self.active) self.current = 0;
+        }
+        return false;
+    }
+
+    fn swap(self: *FairQueue, a: usize, b: usize) void {
+        const tmp = self.pipes.items[a];
+        self.pipes.items[a] = self.pipes.items[b];
+        self.pipes.items[b] = tmp;
+    }
+
+    fn indexOf(self: *FairQueue, pipe: *Pipe) ?usize {
+        for (self.pipes.items, 0..) |p, i| {
+            if (p == pipe) return i;
+        }
+        return null;
+    }
+
+    fn removePipe(self: *FairQueue, pipe: *Pipe) void {
+        if (self.indexOf(pipe)) |i| _ = self.pipes.swapRemove(i);
+    }
+};
+```
+
+**Fairness guarantee**: The round-robin pointer advances after each
+complete logical message (all frames including multi-part). A peer
+sending large multi-part messages doesn't starve others.
+
+### Load Balancer (`LoadBalancer`)
+
+Round-robin send across multiple pipes. Same algorithm as libzmq's `lb_t`:
+active pipes at front, current index advances after each complete message,
+pipes at HWM are swapped to back.
+
+```zig
+pub const LoadBalancer = struct {
+    pipes: std.ArrayList(*Pipe),
+    active: usize = 0,
+    current: usize = 0,
+    more: bool = false,       // in the middle of a multi-part send?
+    dropping: bool = false,   // dropping remainder of failed multipart?
+
+    pub fn init(allocator: Allocator) LoadBalancer {
+        return .{ .pipes = std.ArrayList(*Pipe).init(allocator) };
+    }
+
+    pub fn attach(self: *LoadBalancer, pipe: *Pipe) void {
+        self.pipes.append(pipe) catch return;
+        self.swap(self.active, self.pipes.items.len - 1);
+        self.active += 1;
+    }
+
+    pub fn pipeTerminated(self: *LoadBalancer, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+
+        // If mid-multipart to this pipe, drop the rest
+        if (index == self.current and self.more) {
+            self.dropping = true;
+        }
+
+        if (index < self.active) {
+            self.active -= 1;
+            self.swap(index, self.active);
+            if (self.current == self.active) self.current = 0;
+        }
+        self.removePipe(pipe);
+    }
+
+    pub fn activated(self: *LoadBalancer, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+        self.swap(index, self.active);
+        self.active += 1;
+    }
+
+    /// Load-balanced send. Returns the pipe used, or null if dropping.
+    ///
+    /// Multi-part atomicity: all frames go to the same pipe. If the
+    /// pipe hits HWM mid-message, rollback and drop the remainder.
+    pub fn send(self: *LoadBalancer, msg: *Msg) !?*Pipe {
+        // Phase 1: Drop remainder of failed multipart
+        if (self.dropping) {
+            self.more = msg.flags.more;
+            self.dropping = self.more;
+            _ = msg.move();  // Discard
+            return null;
+        }
+
+        // Phase 2: Find writable pipe and write
+        while (self.active > 0) {
+            const pipe = self.pipes.items[self.current];
+
+            if (pipe.send(msg) catch false) {
+                self.more = msg.flags.more;
+                if (!self.more) {
+                    // Complete message — flush and advance
+                    pipe.flush();
+                    self.current = (self.current + 1) % self.active;
+                }
+                return pipe;
+            }
+
+            // Write failed (HWM). If mid-multipart, rollback.
+            if (self.more) {
+                pipe.rollback();
+                self.dropping = msg.flags.more;
+                self.more = false;
+                return error.Eagain;
+            }
+
+            // Try next pipe
+            self.active -= 1;
+            if (self.current < self.active)
+                self.swap(self.current, self.active)
+            else
+                self.current = 0;
+        }
+
+        return error.Eagain;
+    }
+
+    pub fn hasOut(self: *LoadBalancer) bool {
+        if (self.more) return true;
+
+        while (self.active > 0) {
+            if (self.pipes.items[self.current].checkHwm()) return true;
+
+            self.active -= 1;
+            self.swap(self.current, self.active);
+            if (self.current == self.active) self.current = 0;
+        }
+        return false;
+    }
+
+    fn swap(self: *LoadBalancer, a: usize, b: usize) void {
+        const tmp = self.pipes.items[a];
+        self.pipes.items[a] = self.pipes.items[b];
+        self.pipes.items[b] = tmp;
+    }
+
+    fn indexOf(self: *LoadBalancer, pipe: *Pipe) ?usize {
+        for (self.pipes.items, 0..) |p, i| {
+            if (p == pipe) return i;
+        }
+        return null;
+    }
+
+    fn removePipe(self: *LoadBalancer, pipe: *Pipe) void {
+        if (self.indexOf(pipe)) |i| _ = self.pipes.swapRemove(i);
+    }
+};
+```
+
+### Distribution (`Dist`) — Fan-Out for PUB
+
+PUB sockets need to send to ALL matching pipes, not round-robin to one:
+
+```zig
+pub const Dist = struct {
+    pipes: std.ArrayList(*Pipe),
+    active: usize = 0,       // writable pipes at front
+    more: bool = false,
+    eligible: usize = 0,     // pipes eligible for current message
+
+    pub fn init(allocator: Allocator) Dist {
+        return .{ .pipes = std.ArrayList(*Pipe).init(allocator) };
+    }
+
+    pub fn attach(self: *Dist, pipe: *Pipe) void {
+        self.pipes.append(pipe) catch return;
+        self.swap(self.active, self.pipes.items.len - 1);
+        self.active += 1;
+    }
+
+    pub fn activated(self: *Dist, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+        self.swap(index, self.active);
+        self.active += 1;
+    }
+
+    pub fn pipeTerminated(self: *Dist, pipe: *Pipe) void {
+        const index = self.indexOf(pipe) orelse return;
+        if (index < self.active) {
+            self.active -= 1;
+            self.swap(index, self.active);
+        }
+        if (index < self.eligible) self.eligible -= 1;
+        self.removePipe(pipe);
+    }
+
+    /// Send to all eligible pipes. For the first frame, all active
+    /// pipes are eligible. Each pipe gets a copy (refcount bump for LMSG).
+    pub fn send(self: *Dist, msg: *Msg) void {
+        if (!self.more) {
+            self.eligible = self.active;
+        }
+
+        var i: usize = 0;
+        while (i < self.eligible) {
+            const pipe = self.pipes.items[i];
+            var copy = msg.copy();
+            if (pipe.send(&copy) catch false) {
+                i += 1;
+            } else {
+                // HWM — drop this pipe for this message
+                copy.deinit(pipe.allocator);
+                self.eligible -= 1;
+                self.swap(i, self.eligible);
+            }
+        }
+
+        self.more = msg.flags.more;
+        if (!self.more) {
+            for (self.pipes.items[0..self.eligible]) |pipe| {
+                pipe.flush();
+            }
+        }
+    }
+
+    pub fn hasOut(_: *Dist) bool {
+        return true;  // PUB always accepts (drops if all at HWM)
+    }
+
+    fn swap(self: *Dist, a: usize, b: usize) void {
+        const tmp = self.pipes.items[a];
+        self.pipes.items[a] = self.pipes.items[b];
+        self.pipes.items[b] = tmp;
+    }
+    fn indexOf(self: *Dist, pipe: *Pipe) ?usize {
+        for (self.pipes.items, 0..) |p, i| {
+            if (p == pipe) return i;
+        }
+        return null;
+    }
+    fn removePipe(self: *Dist, pipe: *Pipe) void {
+        if (self.indexOf(pipe)) |i| _ = self.pipes.swapRemove(i);
+    }
+};
+```
+
+### Socket Type Implementations (`Pattern`)
+
+Each socket type is a variant in a tagged union. The `Pattern` provides
+routing logic; the `Socket` provides pipe management and blocking.
+
+```zig
+pub const Pattern = union(enum) {
+    pair: PairPattern,
+    push: PushPattern,
+    pull: PullPattern,
+    pub_: PubPattern,
+    sub: SubPattern,
+    dealer: DealerPattern,
+    router: RouterPattern,
+    req: ReqPattern,
+    rep: RepPattern,
+
+    // Dispatch methods — inline switch, zero pointer indirection,
+    // branch-predicted after first call (always same variant).
+    pub fn attachPipe(self: *Pattern, pipe: *Pipe, locally_initiated: bool) void {
+        switch (self.*) {
+            inline else => |*p| p.attachPipe(pipe, locally_initiated),
+        }
+    }
+    pub fn pipeTerminated(self: *Pattern, pipe: *Pipe) void {
+        switch (self.*) {
+            inline else => |*p| p.pipeTerminated(pipe),
+        }
+    }
+    pub fn readActivated(self: *Pattern, pipe: *Pipe) void {
+        switch (self.*) {
+            inline else => |*p| p.readActivated(pipe),
+        }
+    }
+    pub fn writeActivated(self: *Pattern, pipe: *Pipe) void {
+        switch (self.*) {
+            inline else => |*p| p.writeActivated(pipe),
+        }
+    }
+    pub fn send(self: *Pattern, msg: *Msg) !void {
+        switch (self.*) {
+            inline else => |*p| try p.send(msg),
+        }
+    }
+    pub fn recv(self: *Pattern) !Msg {
+        switch (self.*) {
+            inline else => |*p| return try p.recv(),
+        }
+    }
+    pub fn hasIn(self: *Pattern) bool {
+        switch (self.*) {
+            inline else => |*p| return p.hasIn(),
+        }
+    }
+    pub fn hasOut(self: *Pattern) bool {
+        switch (self.*) {
+            inline else => |*p| return p.hasOut(),
+        }
+    }
+};
+```
+
+#### PAIR — One-to-One Bidirectional
+
+Exactly one pipe. Additional connections rejected.
+
+```zig
+pub const PairPattern = struct {
+    pipe: ?*Pipe = null,
+
+    pub fn attachPipe(self: *PairPattern, pipe: *Pipe, _: bool) void {
+        if (self.pipe != null) {
+            pipe.terminate(false);  // PAIR allows only one peer
+            return;
+        }
+        self.pipe = pipe;
+    }
+
+    pub fn pipeTerminated(self: *PairPattern, pipe: *Pipe) void {
+        if (self.pipe == pipe) self.pipe = null;
+    }
+
+    pub fn readActivated(_: *PairPattern, _: *Pipe) void {}
+    pub fn writeActivated(_: *PairPattern, _: *Pipe) void {}
+
+    pub fn send(self: *PairPattern, msg: *Msg) !void {
+        const pipe = self.pipe orelse return error.Eagain;
+        if (!(pipe.send(msg) catch false)) return error.Eagain;
+        if (!msg.flags.more) pipe.flush();
+    }
+
+    pub fn recv(self: *PairPattern) !Msg {
+        const pipe = self.pipe orelse return error.Eagain;
+        return pipe.recv() orelse error.Eagain;
+    }
+
+    pub fn hasIn(self: *PairPattern) bool {
+        const pipe = self.pipe orelse return false;
+        return pipe.in_pipe.checkRead();
+    }
+
+    pub fn hasOut(self: *PairPattern) bool {
+        const pipe = self.pipe orelse return false;
+        return pipe.checkHwm();
+    }
+};
+```
+
+#### PUSH / PULL — Load-Balanced Send / Fair-Queued Receive
+
+```zig
+pub const PushPattern = struct {
+    lb: LoadBalancer,
+
+    pub fn init(allocator: Allocator) PushPattern {
+        return .{ .lb = LoadBalancer.init(allocator) };
+    }
+
+    pub fn attachPipe(self: *PushPattern, pipe: *Pipe, _: bool) void {
+        self.lb.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *PushPattern, pipe: *Pipe) void {
+        self.lb.pipeTerminated(pipe);
+    }
+    pub fn readActivated(_: *PushPattern, _: *Pipe) void {}
+    pub fn writeActivated(self: *PushPattern, pipe: *Pipe) void {
+        self.lb.activated(pipe);
+    }
+    pub fn send(self: *PushPattern, msg: *Msg) !void {
+        _ = try self.lb.send(msg);
+    }
+    pub fn recv(_: *PushPattern) !Msg { return error.NotSupported; }
+    pub fn hasIn(_: *PushPattern) bool { return false; }
+    pub fn hasOut(self: *PushPattern) bool { return self.lb.hasOut(); }
+};
+
+pub const PullPattern = struct {
+    fq: FairQueue,
+
+    pub fn init(allocator: Allocator) PullPattern {
+        return .{ .fq = FairQueue.init(allocator) };
+    }
+
+    pub fn attachPipe(self: *PullPattern, pipe: *Pipe, _: bool) void {
+        self.fq.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *PullPattern, pipe: *Pipe) void {
+        self.fq.pipeTerminated(pipe);
+    }
+    pub fn readActivated(self: *PullPattern, pipe: *Pipe) void {
+        self.fq.activated(pipe);
+    }
+    pub fn writeActivated(_: *PullPattern, _: *Pipe) void {}
+    pub fn send(_: *PullPattern, _: *Msg) !void { return error.NotSupported; }
+    pub fn recv(self: *PullPattern) !Msg {
+        const result = self.fq.recv() orelse return error.Eagain;
+        return result.msg;
+    }
+    pub fn hasIn(self: *PullPattern) bool { return self.fq.hasIn(); }
+    pub fn hasOut(_: *PullPattern) bool { return false; }
+};
+```
+
+#### PUB / SUB — Fan-Out with Subscription Filtering
+
+```zig
+pub const PubPattern = struct {
+    dist: Dist,
+
+    pub fn init(allocator: Allocator) PubPattern {
+        return .{ .dist = Dist.init(allocator) };
+    }
+
+    pub fn attachPipe(self: *PubPattern, pipe: *Pipe, _: bool) void {
+        self.dist.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *PubPattern, pipe: *Pipe) void {
+        self.dist.pipeTerminated(pipe);
+    }
+    pub fn readActivated(_: *PubPattern, _: *Pipe) void {}
+    pub fn writeActivated(self: *PubPattern, pipe: *Pipe) void {
+        self.dist.activated(pipe);
+    }
+    pub fn send(self: *PubPattern, msg: *Msg) !void {
+        self.dist.send(msg);
+    }
+    pub fn recv(_: *PubPattern) !Msg { return error.NotSupported; }
+    pub fn hasIn(_: *PubPattern) bool { return false; }
+    pub fn hasOut(self: *PubPattern) bool { return self.dist.hasOut(); }
+};
+
+pub const SubPattern = struct {
+    fq: FairQueue,
+    subscriptions: std.ArrayList([]const u8),
+
+    pub fn init(allocator: Allocator) SubPattern {
+        return .{
+            .fq = FairQueue.init(allocator),
+            .subscriptions = std.ArrayList([]const u8).init(allocator),
+        };
+    }
+
+    pub fn attachPipe(self: *SubPattern, pipe: *Pipe, _: bool) void {
+        self.fq.attach(pipe);
+        // Send existing subscriptions to the new publisher
+        for (self.subscriptions.items) |prefix| {
+            sendSubscriptionCmd(pipe, prefix, true);
+        }
+    }
+    pub fn pipeTerminated(self: *SubPattern, pipe: *Pipe) void {
+        self.fq.pipeTerminated(pipe);
+    }
+    pub fn readActivated(self: *SubPattern, pipe: *Pipe) void {
+        self.fq.activated(pipe);
+    }
+    pub fn writeActivated(_: *SubPattern, _: *Pipe) void {}
+
+    pub fn subscribe(self: *SubPattern, prefix: []const u8) !void {
+        try self.subscriptions.append(prefix);
+        for (self.fq.pipes.items) |pipe| {
+            sendSubscriptionCmd(pipe, prefix, true);
+        }
+    }
+
+    pub fn unsubscribe(self: *SubPattern, prefix: []const u8) void {
+        for (self.subscriptions.items, 0..) |sub, i| {
+            if (std.mem.eql(u8, sub, prefix)) {
+                _ = self.subscriptions.swapRemove(i);
+                break;
+            }
+        }
+        for (self.fq.pipes.items) |pipe| {
+            sendSubscriptionCmd(pipe, prefix, false);
+        }
+    }
+
+    pub fn send(_: *SubPattern, _: *Msg) !void { return error.NotSupported; }
+
+    /// Recv with subscription filtering — discard non-matching messages
+    pub fn recv(self: *SubPattern) !Msg {
+        while (true) {
+            const result = self.fq.recv() orelse return error.Eagain;
+            if (self.matchesAny(result.msg.dataSlice())) return result.msg;
+            // Doesn't match — discard (drain remaining multipart frames)
+            var m = result.msg;
+            while (m.flags.more) {
+                const next = self.fq.recv() orelse break;
+                m = next.msg;
+            }
+        }
+    }
+
+    pub fn hasIn(self: *SubPattern) bool { return self.fq.hasIn(); }
+    pub fn hasOut(_: *SubPattern) bool { return false; }
+
+    fn matchesAny(self: *SubPattern, data: []const u8) bool {
+        for (self.subscriptions.items) |prefix| {
+            if (data.len >= prefix.len and
+                std.mem.eql(u8, data[0..prefix.len], prefix))
+                return true;
+        }
+        return self.subscriptions.items.len == 0;
+    }
+
+    fn sendSubscriptionCmd(pipe: *Pipe, prefix: []const u8, is_sub: bool) void {
+        // ZMTP subscription: byte 0 = 0x01 (sub) or 0x00 (unsub), then prefix
+        var cmd = Msg.initSize(pipe.allocator, 1 + prefix.len) catch return;
+        const data = cmd.dataMut();
+        data[0] = if (is_sub) 0x01 else 0x00;
+        @memcpy(data[1..], prefix);
+        cmd.flags.command = true;
+        _ = pipe.send(&cmd) catch {};
+        pipe.flush();
+    }
+};
+```
+
+#### REQ / REP — Strict Request-Reply
+
+REQ enforces send→recv→send→recv alternation and prepends an empty
+delimiter frame. REP enforces recv→send→recv→send and strips/restores it.
+
+```zig
+pub const ReqPattern = struct {
+    lb: LoadBalancer,
+    fq: FairQueue,
+    receiving_reply: bool = false,
+    message_begins: bool = true,
+    reply_pipe: ?*Pipe = null,
+
+    pub fn init(allocator: Allocator) ReqPattern {
+        return .{
+            .lb = LoadBalancer.init(allocator),
+            .fq = FairQueue.init(allocator),
+        };
+    }
+
+    pub fn attachPipe(self: *ReqPattern, pipe: *Pipe, _: bool) void {
+        self.lb.attach(pipe);
+        self.fq.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *ReqPattern, pipe: *Pipe) void {
+        if (self.reply_pipe == pipe) {
+            self.reply_pipe = null;
+            self.receiving_reply = false;
+            self.message_begins = true;
+        }
+        self.lb.pipeTerminated(pipe);
+        self.fq.pipeTerminated(pipe);
+    }
+    pub fn readActivated(self: *ReqPattern, pipe: *Pipe) void {
+        self.fq.activated(pipe);
+    }
+    pub fn writeActivated(self: *ReqPattern, pipe: *Pipe) void {
+        self.lb.activated(pipe);
+    }
+
+    pub fn send(self: *ReqPattern, msg: *Msg) !void {
+        if (self.receiving_reply) return error.WrongState;  // EFSM
+
+        if (self.message_begins) {
+            // Prepend empty delimiter frame (REQ envelope)
+            var delim = Msg{};
+            delim.flags.more = true;
+            self.reply_pipe = try self.lb.send(&delim);
+            self.message_begins = false;
+        }
+
+        const more = msg.flags.more;
+        _ = try self.lb.send(msg);
+        if (!more) {
+            self.receiving_reply = true;
+            self.message_begins = true;
+        }
+    }
+
+    pub fn recv(self: *ReqPattern) !Msg {
+        if (!self.receiving_reply) return error.WrongState;
+
+        while (true) {
+            const result = self.fq.recv() orelse return error.Eagain;
+
+            // Discard stale replies from previous requests
+            if (self.reply_pipe != null and result.pipe != self.reply_pipe.?) {
+                var m = result.msg;
+                while (m.flags.more) {
+                    const next = self.fq.recv() orelse break;
+                    m = next.msg;
+                }
+                continue;
+            }
+
+            // First frame is empty delimiter — skip it
+            if (result.msg.dataSlice().len == 0 and result.msg.flags.more) {
+                const reply = self.fq.recv() orelse return error.Eagain;
+                if (!reply.msg.flags.more) self.receiving_reply = false;
+                return reply.msg;
+            }
+        }
+    }
+
+    pub fn hasIn(self: *ReqPattern) bool {
+        return self.receiving_reply and self.fq.hasIn();
+    }
+    pub fn hasOut(self: *ReqPattern) bool {
+        return !self.receiving_reply and self.lb.hasOut();
+    }
+};
+
+pub const RepPattern = struct {
+    fq: FairQueue,
+    sending_reply: bool = false,
+    request_begins: bool = true,
+    reply_pipe: ?*Pipe = null,
+
+    pub fn init(allocator: Allocator) RepPattern {
+        return .{ .fq = FairQueue.init(allocator) };
+    }
+
+    pub fn attachPipe(self: *RepPattern, pipe: *Pipe, _: bool) void {
+        self.fq.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *RepPattern, pipe: *Pipe) void {
+        if (self.reply_pipe == pipe) {
+            self.reply_pipe = null;
+            self.sending_reply = false;
+            self.request_begins = true;
+        }
+        self.fq.pipeTerminated(pipe);
+    }
+    pub fn readActivated(self: *RepPattern, pipe: *Pipe) void {
+        self.fq.activated(pipe);
+    }
+    pub fn writeActivated(_: *RepPattern, _: *Pipe) void {}
+
+    pub fn recv(self: *RepPattern) !Msg {
+        if (self.sending_reply) return error.WrongState;
+
+        if (self.request_begins) {
+            // Strip routing envelope up to empty delimiter
+            while (true) {
+                const result = self.fq.recv() orelse return error.Eagain;
+                if (result.msg.dataSlice().len == 0 and result.msg.flags.more) {
+                    self.reply_pipe = result.pipe;
+                    break;  // Found delimiter
+                }
+                if (!result.msg.flags.more) return error.Eagain;  // Malformed
+            }
+            self.request_begins = false;
+        }
+
+        const result = self.fq.recv() orelse return error.Eagain;
+        if (!result.msg.flags.more) self.sending_reply = true;
+        return result.msg;
+    }
+
+    pub fn send(self: *RepPattern, msg: *Msg) !void {
+        if (!self.sending_reply) return error.WrongState;
+        const pipe = self.reply_pipe orelse return error.Eagain;
+
+        // Prepend empty delimiter for reply routing
+        if (self.request_begins) {
+            var delim = Msg{};
+            delim.flags.more = true;
+            _ = pipe.send(&delim) catch return error.Eagain;
+        }
+
+        const more = msg.flags.more;
+        if (!(pipe.send(msg) catch false)) return error.Eagain;
+        if (!more) {
+            pipe.flush();
+            self.sending_reply = false;
+            self.request_begins = true;
+        }
+    }
+
+    pub fn hasIn(self: *RepPattern) bool {
+        return !self.sending_reply and self.fq.hasIn();
+    }
+    pub fn hasOut(self: *RepPattern) bool {
+        return self.sending_reply and self.reply_pipe != null;
+    }
+};
+```
+
+#### DEALER / ROUTER — Async Routing
+
+DEALER: load-balanced send + fair-queued recv, no enforced alternation.
+
+```zig
+pub const DealerPattern = struct {
+    fq: FairQueue,
+    lb: LoadBalancer,
+
+    pub fn init(allocator: Allocator) DealerPattern {
+        return .{
+            .fq = FairQueue.init(allocator),
+            .lb = LoadBalancer.init(allocator),
+        };
+    }
+
+    pub fn attachPipe(self: *DealerPattern, pipe: *Pipe, _: bool) void {
+        self.fq.attach(pipe);
+        self.lb.attach(pipe);
+    }
+    pub fn pipeTerminated(self: *DealerPattern, pipe: *Pipe) void {
+        self.fq.pipeTerminated(pipe);
+        self.lb.pipeTerminated(pipe);
+    }
+    pub fn readActivated(self: *DealerPattern, pipe: *Pipe) void {
+        self.fq.activated(pipe);
+    }
+    pub fn writeActivated(self: *DealerPattern, pipe: *Pipe) void {
+        self.lb.activated(pipe);
+    }
+    pub fn send(self: *DealerPattern, msg: *Msg) !void {
+        _ = try self.lb.send(msg);
+    }
+    pub fn recv(self: *DealerPattern) !Msg {
+        const result = self.fq.recv() orelse return error.Eagain;
+        return result.msg;
+    }
+    pub fn hasIn(self: *DealerPattern) bool { return self.fq.hasIn(); }
+    pub fn hasOut(self: *DealerPattern) bool { return self.lb.hasOut(); }
+};
+```
+
+ROUTER: identity-aware routing. Prepends routing ID frame on recv,
+uses routing ID to select outbound pipe on send.
+
+```zig
+pub const RouterPattern = struct {
+    fq: FairQueue,
+    // Identity → outbound pipe map
+    out_pipes: std.AutoHashMap(u32, *Pipe),
+    // Pipes waiting for identification
+    anonymous_pipes: std.AutoHashMap(*Pipe, void),
+    // Currently selected pipe for multi-part sends
+    current_out: ?*Pipe = null,
+    more_out: bool = false,
+    // Auto-generated routing ID counter
+    next_routing_id: u32 = 1,
+    // Prefetch buffer for identity frame prepending
+    prefetch: ?Msg = null,
+    prefetch_pipe: ?*Pipe = null,
+
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) RouterPattern {
+        return .{
+            .fq = FairQueue.init(allocator),
+            .out_pipes = std.AutoHashMap(u32, *Pipe).init(allocator),
+            .anonymous_pipes = std.AutoHashMap(*Pipe, void).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn attachPipe(self: *RouterPattern, pipe: *Pipe, locally_initiated: bool) void {
+        if (self.identifyPeer(pipe, locally_initiated)) {
+            self.fq.attach(pipe);
+        } else {
+            self.anonymous_pipes.put(pipe, {}) catch {};
+        }
+    }
+
+    pub fn pipeTerminated(self: *RouterPattern, pipe: *Pipe) void {
+        if (self.anonymous_pipes.remove(pipe) != null) return;
+
+        _ = self.out_pipes.remove(pipe.routing_id);
+        self.fq.pipeTerminated(pipe);
+
+        if (self.current_out == pipe) {
+            self.current_out = null;
+            self.more_out = false;
+        }
+    }
+
+    pub fn readActivated(self: *RouterPattern, pipe: *Pipe) void {
+        if (self.anonymous_pipes.contains(pipe)) {
+            if (self.identifyPeer(pipe, false)) {
+                _ = self.anonymous_pipes.remove(pipe);
+                self.fq.attach(pipe);
+            }
+        } else {
+            self.fq.activated(pipe);
+        }
+    }
+
+    pub fn writeActivated(_: *RouterPattern, _: *Pipe) void {}
+
+    /// ROUTER recv: prepends routing ID frame to every message.
+    /// Returns [routing_id_frame][...payload frames...]
+    pub fn recv(self: *RouterPattern) !Msg {
+        // If we have a prefetched payload, return it
+        if (self.prefetch) |msg| {
+            self.prefetch = null;
+            return msg;
+        }
+
+        // Fair-queue a message, then prepend the source pipe's routing ID
+        const result = self.fq.recv() orelse return error.Eagain;
+
+        // Save the payload for the next recv() call
+        self.prefetch = result.msg;
+        self.prefetch_pipe = result.pipe;
+
+        // Return the routing ID frame first
+        var id_msg = Msg.initSize(self.allocator, 4) catch return error.Eagain;
+        std.mem.writeInt(u32, id_msg.dataMut()[0..4], result.pipe.routing_id, .little);
+        id_msg.flags.more = true;  // More frames follow (the actual payload)
+        return id_msg;
+    }
+
+    /// ROUTER send: first frame is routing ID (selects pipe),
+    /// subsequent frames are the payload.
+    pub fn send(self: *RouterPattern, msg: *Msg) !void {
+        if (!self.more_out) {
+            // First frame — extract routing ID
+            const data = msg.dataSlice();
+            if (data.len != 4) return error.InvalidRoutingId;
+            const routing_id = std.mem.readInt(u32, data[0..4], .little);
+
+            self.current_out = self.out_pipes.get(routing_id) orelse
+                return error.HostUnreachable;
+            self.more_out = true;
+            return;  // Consumed routing ID frame
+        }
+
+        const pipe = self.current_out orelse return error.HostUnreachable;
+        const more = msg.flags.more;
+        if (!(pipe.send(msg) catch false)) return error.Eagain;
+        if (!more) {
+            pipe.flush();
+            self.more_out = false;
+            self.current_out = null;
+        }
+    }
+
+    pub fn hasIn(self: *RouterPattern) bool {
+        return self.prefetch != null or self.fq.hasIn();
+    }
+
+    pub fn hasOut(_: *RouterPattern) bool {
+        return true;  // Can always attempt (fails at send time if ID unknown)
+    }
+
+    fn identifyPeer(self: *RouterPattern, pipe: *Pipe, _: bool) bool {
+        const id = self.next_routing_id;
+        self.next_routing_id += 1;
+        pipe.routing_id = id;
+        self.out_pipes.put(id, pipe) catch return false;
+        return true;
+    }
+};
+```
+
+### Coroutine-Native Poll/Select
+
+libzmq's `zmq_poll()` works by getting each socket's FD (`ZMQ_FD`),
+calling OS `poll()`, then checking `ZMQ_EVENTS`. This requires the entire
+signaler/mailbox infrastructure.
+
+We replace it with **coroutine-native multi-wait**: a single Waiter
+shared across sockets. No FDs, no OS poll, no signaler.
+
+```zig
+pub const Poller = struct {
+    pub const Item = struct {
+        socket: *Socket,
+        events: Events,      // What to watch for
+        revents: Events = .{}, // What fired
+    };
+
+    pub const Events = packed struct(u8) {
+        pollin: bool = false,
+        pollout: bool = false,
+        _pad: u6 = 0,
+    };
+
+    /// Wait for any socket to become ready. Returns count of ready sockets.
+    ///
+    /// 1. Non-blocking check all sockets
+    /// 2. If nothing ready, register shared Waiter on all sockets
+    /// 3. Park coroutine (with optional timeout)
+    /// 4. Any socket readiness change signals Waiter → wakes us
+    /// 5. Re-check all sockets, return results
+    pub fn poll(items: []Item, timeout_ms: i64) !u32 {
+        // Phase 1: non-blocking
+        var ready = checkAll(items);
+        if (ready > 0 or timeout_ms == 0) return ready;
+
+        // Phase 2: register shared waiter
+        var waiter = Waiter.init();
+        for (items) |*item| {
+            item.socket.readiness_waiter = &waiter;
+        }
+        defer {
+            for (items) |*item| {
+                item.socket.readiness_waiter = null;
+            }
+        }
+
+        // Phase 3: park
+        if (timeout_ms > 0) {
+            const ns: u64 = @intCast(timeout_ms * std.time.ns_per_ms);
+            waiter.waitTimeout(1, ns, .allow_cancel) catch {};
+        } else {
+            try waiter.wait(1, .allow_cancel);
+        }
+
+        // Phase 4: re-check
+        return checkAll(items);
+    }
+
+    fn checkAll(items: []Item) u32 {
+        var ready: u32 = 0;
+        for (items) |*item| {
+            item.revents = .{};
+            if (item.events.pollin and item.socket.hasIn())
+                item.revents.pollin = true;
+            if (item.events.pollout and item.socket.hasOut())
+                item.revents.pollout = true;
+            if (@as(u8, @bitCast(item.revents)) != 0) ready += 1;
+        }
+        return ready;
+    }
+};
+```
+
+**Why this beats FD-based poll:**
+
+| | libzmq `zmq_poll()` | Coroutine `Poller.poll()` |
+|---|---|---|
+| Readiness check | `getsockopt(ZMQ_EVENTS)` → `process_commands()` → drain mailbox → `xhas_in/xhas_out` | Direct `hasIn()`/`hasOut()` — no mailbox |
+| Blocking | OS `poll()` on signaler FDs (~1000ns wake each way) | Waiter park/signal (~8ns atomic) |
+| Multi-socket | One `poll()` syscall for N FDs | One Waiter shared across N sockets |
+
+### Monitor Events
+
+libzmq creates an entire inproc PAIR/PUB socket for monitoring. We use a
+typed event channel:
+
+```zig
+pub const MonitorEvent = union(enum) {
+    connected: struct { endpoint: []const u8 },
+    connect_delayed: struct { endpoint: []const u8 },
+    connect_retried: struct { endpoint: []const u8, interval_ms: u32 },
+    disconnected: struct { endpoint: []const u8 },
+    listening: struct { endpoint: []const u8 },
+    bind_failed: struct { endpoint: []const u8, err: anyerror },
+    accepted: struct { endpoint: []const u8 },
+    accept_failed: struct { endpoint: []const u8, err: anyerror },
+    pipe_attached: struct {},
+    pipe_terminated: struct {},
+    handshake_succeeded: struct { endpoint: []const u8 },
+    handshake_failed: struct { endpoint: []const u8, err: anyerror },
+};
+
+pub const MonitorChannel = struct {
+    // Bounded ring buffer. Non-blocking send — drops on full
+    // to never block the socket hot path.
+    events: BoundedRing(MonitorEvent, 256),
+    waiter: ?*Waiter = null,
+
+    pub fn send(self: *MonitorChannel, event: MonitorEvent) void {
+        _ = self.events.tryPush(event);
+        if (self.waiter) |w| w.signal();
+    }
+
+    pub fn recv(self: *MonitorChannel) !MonitorEvent {
+        while (true) {
+            if (self.events.tryPop()) |event| return event;
+            var waiter = Waiter.init();
+            self.waiter = &waiter;
+            defer self.waiter = null;
+            try waiter.wait(1, .allow_cancel);
+        }
+    }
+
+    pub fn tryRecv(self: *MonitorChannel) ?MonitorEvent {
+        return self.events.tryPop();
+    }
+};
+```
+
+### Connection Lifecycle: Full Picture
+
+Here is the complete flow of a TCP connection through all layers:
+
+```
+1. CONNECT
+   ─────────
+   socket.connect("tcp://host:port")
+     → spawn connector coroutine
+
+   connector:
+     TCP connect → success
+     ZMTP handshake → success
+     pipes = pipePair(alloc, hwm, hwm)
+     socket.attachPipe(&pipes[0], locally_initiated=true)
+       → pattern.attachPipe(pipe)    // PUSH → lb.attach(pipe)
+       → monitor.send(.connected)
+       → signalReadiness()           // wake blocked send/recv
+     session = Session{ pipe: &pipes[1], stream: tcp_stream }
+     session.run()                   // blocks until disconnect
+
+2. STEADY STATE
+   ─────────────
+   app:                              session:
+     socket.sendBlocking(&msg)
+       → pattern.send(&msg)          sendLoop:
+         → lb.send(&msg)               pipe.recvBlocking()
+           → pipe.send + flush            → spin/wait → msg
+                                         writeBatch → writev
+
+                                      recvLoop:
+                                        stream.read → decode
+                                        pipe.send + flush
+                                          → socket.readActivated
+   socket.recvBlocking()
+     → pattern.recv() → msg
+
+3. DISCONNECT
+   ──────────
+   session recvLoop: stream.read → EndOfStream
+   session.run() returns
+
+   connector:
+     pipe.terminate(true)            // delimiter → outpipe
+       → peer reads delimiter → processDelimiter → term_received
+       → peer writes delimiter back → ack
+     pipe reads ack → terminated
+       → socket.pipeTerminated(pipe)
+         → pattern.pipeTerminated    // PUSH → lb.pipeTerminated
+         → monitor.send(.disconnected)
+
+4. RECONNECT
+   ─────────
+   connector: backoff sleep → TCP connect → new pipePair
+     socket.attachPipe(new_pipe)
+       → PUSH: lb gets new pipe
+       → ROUTER: new pipe inherits identity
+     new session.run()
+```
+
+### Layer Summary
+
+| Component | libzmq | This design | Change |
+|-----------|--------|-------------|--------|
+| Pipe lifecycle | 6-state FSM + PIPE_TERM/PIPE_TERM_ACK commands through mailbox | 4-state FSM + delimiter sentinels through ypipe | Eliminates command system |
+| Flow control | activate_read/activate_write commands through mailbox | Direct Waiter.signal() (already in Layer 4) | ~1000ns → ~8ns |
+| Readiness | ZMQ_FD + ZMQ_EVENTS + process_commands() | Direct hasIn()/hasOut() on pattern | No mailbox drain |
+| Poll | OS poll() on signaler FDs | Coroutine Waiter multi-wait | No FDs, no syscall |
+| Socket dispatch | C++ virtual methods (vtable indirection) | Zig tagged union (inline switch) | Zero indirection |
+| Fair queue | fq_t with command-driven activation | FairQueue with direct activation | Same algorithm, no commands |
+| Load balance | lb_t with command-driven activation | LoadBalancer with direct activation | Same algorithm, no commands |
+| Fan-out | dist_t | Dist | Same algorithm |
+| Monitor | inproc PAIR socket + binary event encoding | Typed MonitorChannel + Waiter | No socket overhead |
+| Reconnection | hiccup() splices new ypipe into existing pipe | New pipe pair, attach/detach at socket level | Simpler |
+
+---
+
 ## Comparison: libzmq vs This Design
 
 ### Hot Path Operations (per-message costs)
@@ -1580,8 +3157,8 @@ is the regime where most real-world applications live.
    No command serialization, no command routing, no TID-based dispatch.
 
 3. **Command system** (`object_t::send_command` → `ctx_t::send_command` →
-   mailbox): Not needed. Pipe lifecycle commands (term, hiccup, hwm) can
-   use zio's `Channel` for the rare cases where they're needed.
+   mailbox): Not needed. Pipe lifecycle commands (term, hiccup) are replaced
+   by in-band delimiter sentinels through the ypipe itself (see Layer 7).
 
 4. **RDTSC throttling** (`process_commands` in socket_base.cpp): Not needed.
    There's no command polling loop to throttle. Data flows directly through
@@ -1647,13 +3224,23 @@ is the regime where most real-world applications live.
 - Reconnection with exponential backoff
 - Graceful shutdown (linger, drain pipe before close)
 
-### Phase 5: Socket Layer
+### Phase 5: Socket Layer (Layer 7)
 
-- Socket types (PUSH/PULL, PUB/SUB, REQ/REP, PAIR)
-- Pipe management (attach, detach, terminate)
-- Fair queuing (round-robin recv across multiple pipes)
-- Load balancing (round-robin send across multiple pipes)
-- Socket options (HWM, linger, connect timeout)
+- Pipe lifecycle state machine (4-state + delimiter sentinels)
+- `FairQueue` round-robin recv with active/inactive swap
+- `LoadBalancer` round-robin send with HWM deactivation and multipart atomicity
+- `Dist` fan-out for PUB (send to all, refcount-based copy)
+- Socket types via `Pattern` tagged union:
+  - `PairPattern` (one pipe, reject extras)
+  - `PushPattern` / `PullPattern` (LB send / FQ recv)
+  - `PubPattern` / `SubPattern` (Dist fan-out / FQ recv with subscription filtering)
+  - `ReqPattern` / `RepPattern` (strict alternation, delimiter envelope)
+  - `DealerPattern` (async LB+FQ)
+  - `RouterPattern` (identity-based routing, routing ID frame prepend)
+- `Socket` base with pipe management, readiness callbacks, blocking send/recv
+- `Poller` coroutine-native multi-socket wait (replaces zmq_poll)
+- `MonitorChannel` typed event channel (replaces inproc monitor socket)
+- Socket options (HWM, linger, connect timeout, routing_id)
 - Transport-agnostic bind/connect API
 
 ### Phase 6: Benchmarks
