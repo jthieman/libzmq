@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v6)
+## Status: DESIGN PROPOSAL (v7)
 
 ## Context
 
@@ -99,11 +99,15 @@ pub const Msg = struct {
     flags: Flag = .{},
     routing_id: u32 = 0,
 
-    // Shared content block for large messages
+    // Shared content block for large messages.
+    // Content header + data buffer are allocated contiguously in a single
+    // allocation for cache locality and to avoid double-alloc/double-free.
+    // Layout: [Content header | data bytes...]
     const Content = struct {
         data: [*]u8,
         len: usize,
         refcount: std.atomic.Value(u32),
+        allocator: Allocator,  // stored so release() can free without caller
         free_fn: ?*const fn ([*]u8, usize, ?*anyopaque) void,
         hint: ?*anyopaque,
 
@@ -117,7 +121,10 @@ pub const Msg = struct {
                 if (self.free_fn) |ffn| {
                     ffn(self.data, self.len, self.hint);
                 }
-                // deallocate Content struct itself
+                // Free the Content struct (and contiguous data buffer).
+                // This works for both single-alloc and custom-alloc paths.
+                const alloc = self.allocator;
+                alloc.destroy(self);
             }
         }
     };
@@ -128,12 +135,18 @@ pub const Msg = struct {
                 .bytes = undefined, .len = @intCast(size),
             } } };
         }
-        // Allocate Content + data in single allocation
-        const content = try allocator.create(Content);
+        // Single contiguous allocation: Content header + data buffer.
+        // This avoids a second allocation and improves cache locality.
+        const header_size = std.mem.alignForward(usize, @sizeOf(Content), @alignOf(Content));
+        const total = header_size + size;
+        const raw = try allocator.alignedAlloc(u8, @alignOf(Content), total);
+        errdefer allocator.free(raw);  // free on any subsequent error
+        const content: *Content = @ptrCast(@alignCast(raw.ptr));
         content.* = .{
-            .data = (try allocator.alloc(u8, size)).ptr,
+            .data = raw.ptr + header_size,
             .len = size,
             .refcount = .init(1),
+            .allocator = allocator,
             .free_fn = null,
             .hint = null,
         };
@@ -177,9 +190,17 @@ pub const Msg = struct {
 };
 ```
 
-**Size**: `@sizeOf(Msg)` = 64 bytes (one cache line), matching libzmq's msg_t.
+**Size**: Target is 64 bytes (one cache line), matching libzmq's msg_t.
 The `Data` union is 49 bytes (48 inline + 1 len for vsm), flags + routing_id
-+ tag + padding fill the rest.
++ tag + padding fill the rest. Enforced at compile time:
+
+```zig
+comptime {
+    // Msg must fit in one cache line for optimal queue throughput.
+    // If this fails, adjust max_vsm_size or field layout.
+    std.debug.assert(@sizeOf(Msg) <= 64);
+}
+```
 
 **Why this matches libzmq semantics**:
 - VSM (value small message): messages <= 48 bytes stored inline, zero allocation
@@ -282,6 +303,38 @@ pub fn YQueue(comptime T: type, comptime N: comptime_int) type {
             // Recycle: old chunk becomes new spare (better cache locality)
             const prev_spare = self.spare_chunk.swap(old, .release);
             if (prev_spare) |s| self.allocator.destroy(s);
+        }
+
+        /// Free all chunks and any messages remaining in the queue.
+        /// Called during pipe teardown. The caller must ensure no
+        /// concurrent access (both reader and writer are done).
+        pub fn deinit(self: *Self) void {
+            // Walk the chunk linked list from begin_chunk to end_chunk,
+            // deinit any Msg values still in the queue, then free chunks.
+            var chunk: ?*Chunk = self.reader.begin_chunk;
+            var pos: u32 = self.reader.begin_pos;
+            while (chunk) |c| {
+                // If this chunk contains unconsumed values, deinit them.
+                // (Only matters if T has a deinit — for Msg, this releases
+                // Content refcounts.)
+                const end_pos = if (c == self.writer.end_chunk)
+                    self.writer.end_pos
+                else
+                    N;
+                while (pos < end_pos) : (pos += 1) {
+                    if (comptime @hasDecl(T, "deinit")) {
+                        c.values[pos].deinit(self.allocator);
+                    }
+                }
+                const next = c.next;
+                self.allocator.destroy(c);
+                chunk = next;
+                pos = 0;
+            }
+            // Free spare chunk if any
+            if (self.spare_chunk.load(.acquire)) |s| {
+                self.allocator.destroy(s);
+            }
         }
     };
 }
@@ -404,6 +457,13 @@ pub fn YPipe(comptime T: type, comptime N: comptime_int) type {
             self.queue.pop();
             return value;
         }
+
+        /// Free all resources. Drains remaining messages and frees all
+        /// chunks. Must only be called after both writer and reader are
+        /// done (pipe is fully terminated).
+        pub fn deinit(self: *Self) void {
+            self.queue.deinit();
+        }
     };
 }
 ```
@@ -508,9 +568,12 @@ pub const Pipe = struct {
     peers_msgs_read: std.atomic.Value(u64) = .init(0),  // atomic: cross-thread
     next_activate_threshold: u64 = 0,
 
-    // Activity flags
+    // Activity flags.
+    // in_active: only touched by the reader — plain bool is safe.
+    // out_active: written by the reader (activate after LWM) and read by
+    //   the writer (send path). Cross-thread access requires atomic.
     in_active: bool = true,
-    out_active: bool = true,
+    out_active: std.atomic.Value(bool) = .init(true),
 
     // Peer reference (the other end of the pipe pair)
     peer: *Pipe = undefined,
@@ -545,15 +608,25 @@ pub const Pipe = struct {
     /// notification. The message is not visible to the reader until
     /// flush() is called. This is a plain array write (~5ns).
     pub fn send(self: *Pipe, msg: *Msg) !bool {
-        if (!self.out_active) return false;
+        if (!self.out_active.load(.acquire)) return false;
 
         if (!self.checkHwm()) {
-            self.out_active = false;
+            self.out_active.store(false, .release);
             return false;
         }
 
         const more = msg.flags.more;
-        try self.out_pipe.write(msg.move(), more);
+
+        // Write the value into the ypipe slot, THEN push.
+        // We must NOT move() before push() succeeds, because push()
+        // can fail (chunk allocation) and move() zeroes the source.
+        // If we moved first and push fails, the message is lost.
+        self.out_pipe.queue.back().* = msg.*;
+        try self.out_pipe.queue.push();
+        if (!more) {
+            self.out_pipe.writer.f = self.out_pipe.queue.back();
+        }
+        msg.* = .{};  // zero source only after push succeeds (move semantics)
 
         if (!more) self.msgs_written += 1;
         return true;
@@ -632,8 +705,8 @@ pub const Pipe = struct {
             if (self.msgs_read >= self.next_activate_threshold) {
                 self.next_activate_threshold += self.lwm;
                 self.peer.peers_msgs_read.store(self.msgs_read, .release);
-                if (!self.peer.out_active) {
-                    self.peer.out_active = true;
+                if (!self.peer.out_active.load(.acquire)) {
+                    self.peer.out_active.store(true, .release);
                     self.wakeWriter();
                 }
             }
@@ -721,25 +794,47 @@ pub const Pipe = struct {
             if (self.in_pipe.checkRead()) return self.recv().?;
         }
     }
+
+    /// Free all pipe resources. Called after pipe reaches `terminated`
+    /// state and both endpoints are done. Frees underlying ypipes
+    /// (which drain and free remaining messages and chunks).
+    pub fn deinit(self: *Pipe, allocator: Allocator) void {
+        self.in_pipe.deinit();
+        allocator.destroy(self.in_pipe);
+        // out_pipe is the peer's in_pipe — freed by the peer's deinit.
+        // Only free ourselves.
+        allocator.destroy(self);
+    }
 };
 
 /// Create a pipe pair for bidirectional communication.
-pub fn pipePair(allocator: Allocator, hwm0: u32, hwm1: u32) !struct { Pipe, Pipe } {
+/// Returns heap-allocated pointers. Pipes contain self-referential `peer`
+/// pointers, so they MUST be heap-allocated — returning by value would
+/// leave `peer` dangling after the move.
+pub fn pipePair(allocator: Allocator, hwm0: u32, hwm1: u32) !struct { *Pipe, *Pipe } {
     const pipe_a = try allocator.create(YPipe(Msg, 256));
+    errdefer allocator.destroy(pipe_a);
     pipe_a.* = try YPipe(Msg, 256).init(allocator);
+
     const pipe_b = try allocator.create(YPipe(Msg, 256));
+    errdefer allocator.destroy(pipe_b);
     pipe_b.* = try YPipe(Msg, 256).init(allocator);
 
-    var p0 = Pipe{
+    const p0 = try allocator.create(Pipe);
+    errdefer allocator.destroy(p0);
+    const p1 = try allocator.create(Pipe);
+    errdefer allocator.destroy(p1);
+
+    p0.* = Pipe{
         .in_pipe = pipe_a, .out_pipe = pipe_b,
         .hwm = hwm1, .lwm = computeLwm(hwm0),
     };
-    var p1 = Pipe{
+    p1.* = Pipe{
         .in_pipe = pipe_b, .out_pipe = pipe_a,
         .hwm = hwm0, .lwm = computeLwm(hwm1),
     };
-    p0.peer = &p1;
-    p1.peer = &p0;
+    p0.peer = p1;
+    p1.peer = p0;
     p0.next_activate_threshold = p0.lwm;
     p1.next_activate_threshold = p1.lwm;
     return .{ p0, p1 };
@@ -1149,7 +1244,14 @@ pub const Session = struct {
                     read_buf[buf_pos..buf_len],
                 ) orelse break;  // incomplete frame, need more data
 
-                // Create Msg from decoded frame
+                // Create Msg from decoded frame.
+                // VSM path (<=48 bytes): inline copy, zero alloc.
+                // LMSG path (>48 bytes): single contiguous allocation
+                // (Content header + data). We must copy from the network
+                // read buffer because the buffer is reused for the next
+                // read() call. True zero-copy of large frames would
+                // require refcounted read buffers with per-frame
+                // sub-slicing (a future optimization — see note below).
                 var msg = try Msg.initSize(self.allocator, frame.body_len);
                 @memcpy(msg.dataMut()[0..frame.body_len], frame.body);
                 msg.flags.more = frame.more;
@@ -1182,6 +1284,16 @@ pub const Session = struct {
     }
 };
 ```
+
+**Future optimization — zero-copy large frame receive**: The current
+recvLoop copies every frame body into a new Msg allocation. For large
+messages, this could be avoided by using a refcounted read buffer:
+allocate a large buffer for `stream.read()`, wrap it in a refcounted
+object, and create CMSG-style Msgs that point into sub-slices of the
+buffer. The buffer is freed when all Msgs referencing it are deinit'd.
+This trades simplicity for throughput on large-message workloads.
+The current copy path is correct and simple; the optimization can be
+added later without API changes.
 
 ### ZMTP Codec
 
@@ -1494,12 +1606,12 @@ fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
     const max_backoff: u64 = 30_000;  // 30s max
 
     while (socket.active) {
-        // Create pipe pair for the new connection
-        var pipes = try pipePair(socket.allocator, socket.hwm, socket.hwm);
+        // Create pipe pair for the new connection (heap-allocated)
+        const pipes = try pipePair(socket.allocator, socket.hwm, socket.hwm);
 
         // Connect
         const session = Transport.tcpConnect(
-            socket.allocator, addr, &pipes[1],
+            socket.allocator, addr, pipes[1],
         ) catch {
             // Connection failed — exponential backoff
             zio.time.sleep(backoff * std.time.ns_per_ms);
@@ -1510,13 +1622,13 @@ fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
         backoff = 100;  // reset on success
 
         // Attach pipe to socket
-        socket.attachPipe(&pipes[0]);
+        socket.attachPipe(pipes[0]);
 
         // Run session (blocks until disconnect)
         session.run() catch {};
 
         // Detach pipe, clean up
-        socket.detachPipe(&pipes[0]);
+        socket.detachPipe(pipes[0]);
         session.stream.close();
     }
 }
@@ -1662,7 +1774,7 @@ pub fn terminate(self: *Pipe, delay: bool) void {
     switch (current) {
         .active, .term_received => {
             // Stop writing — no more user messages after this
-            self.out_active = false;
+            self.out_active.store(false, .release);
 
             // Rollback any incomplete multi-part message
             self.rollback();
@@ -1718,8 +1830,8 @@ pub fn recv(self: *Pipe) ?Msg {
         if (self.msgs_read >= self.next_activate_threshold) {
             self.next_activate_threshold += self.lwm;
             self.peer.peers_msgs_read.store(self.msgs_read, .release);
-            if (!self.peer.out_active) {
-                self.peer.out_active = true;
+            if (!self.peer.out_active.load(.acquire)) {
+                self.peer.out_active.store(true, .release);
                 self.wakeWriter();
             }
         }
@@ -1804,8 +1916,11 @@ pub const Socket = struct {
     // Socket options
     options: Options,
 
-    // For coroutine-native poll/select: signaled when readiness changes
-    readiness_waiter: ?*Waiter = null,
+    // Readiness signal: persistent, socket-owned. Pointer so Poller can
+    // temporarily redirect it to a shared signal (see Updated Poller
+    // Integration in Concurrency Model section).
+    readiness_signal: *ReadySignal = undefined,  // set in init()
+    own_readiness_signal: ReadySignal = .{},
 
     // Monitor event channel (null if no monitor attached)
     monitor: ?*MonitorChannel = null,
@@ -1821,6 +1936,16 @@ pub const Socket = struct {
         connect_timeout_ms: u32 = 0,
         routing_id: ?[]const u8 = null,  // ROUTER identity
     };
+
+    pub fn init(self: *Socket, allocator: Allocator, pattern: Pattern) void {
+        self.* = .{
+            .pipes = std.ArrayList(*Pipe).init(allocator),
+            .pattern = pattern,
+            .options = .{},
+            .allocator = allocator,
+        };
+        self.readiness_signal = &self.own_readiness_signal;
+    }
 
     // ----------------------------------------------------------
     // Pipe management (called by transport layer)
@@ -1887,7 +2012,7 @@ pub const Socket = struct {
     }
 
     fn signalReadiness(self: *Socket) void {
-        if (self.readiness_waiter) |w| w.signal();
+        self.readiness_signal.notify();
     }
 
     // ----------------------------------------------------------
@@ -1912,24 +2037,22 @@ pub const Socket = struct {
     }
 
     /// Blocking send: parks coroutine until the socket can accept a message.
+    /// Uses the persistent ReadySignal (not stack-allocated Waiters) to
+    /// avoid the lifetime/UAF issues described in the Concurrency Model.
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
+        var gen = self.readiness_signal.currentGen();
         while (true) {
             if (self.hasOut()) return try self.send(msg);
-            var waiter = Waiter.init();
-            self.readiness_waiter = &waiter;
-            defer self.readiness_waiter = null;
-            try waiter.wait(1, .allow_cancel);
+            gen = try self.readiness_signal.park(gen);
         }
     }
 
     /// Blocking recv: parks coroutine until a message is available.
     pub fn recvBlocking(self: *Socket) !Msg {
+        var gen = self.readiness_signal.currentGen();
         while (true) {
             if (self.hasIn()) return try self.recv();
-            var waiter = Waiter.init();
-            self.readiness_waiter = &waiter;
-            defer self.readiness_waiter = null;
-            try waiter.wait(1, .allow_cancel);
+            gen = try self.readiness_signal.park(gen);
         }
     }
 
@@ -1939,7 +2062,12 @@ pub const Socket = struct {
 
     /// Close the socket. Terminates all pipes, optionally waiting
     /// for outbound messages to drain (linger).
-    pub fn close(self: *Socket) void {
+    ///
+    /// Linger semantics (matches libzmq):
+    ///   linger = 0:  Discard unsent messages immediately.
+    ///   linger > 0:  Wait up to linger_ms for pipes to drain, then discard.
+    ///   linger = -1: Wait indefinitely for all pipes to finish.
+    pub fn close(self: *Socket) !void {
         self.active = false;
 
         // Terminate all pipes. delay=true gives them time to flush.
@@ -1948,9 +2076,35 @@ pub const Socket = struct {
             pipe.terminate(delay);
         }
 
-        // If linger > 0, wait up to linger_ms for pipes to drain.
-        // If linger = 0, pipes were terminated with delay=false (immediate).
-        // If linger = -1, wait indefinitely for all pipes to finish.
+        if (self.options.linger_ms == 0) {
+            // Immediate: pipes already terminated with delay=false.
+            // No waiting — unsent messages are discarded.
+            return;
+        }
+
+        // Wait for all pipes to reach terminated state.
+        // Use the socket's ReadySignal — pipeTerminated() calls
+        // signalReadiness(), which bumps the generation.
+        var gen = self.readiness_signal.currentGen();
+        if (self.options.linger_ms > 0) {
+            // Timed linger: wait up to linger_ms, then force-terminate
+            // any remaining pipes without delay.
+            const timeout = Timeout.fromMilliseconds(
+                @intCast(self.options.linger_ms),
+            );
+            while (self.pipes.items.len > 0) {
+                gen = self.readiness_signal.parkTimeout(gen, timeout) catch break;
+            }
+            // Force-terminate any pipes that didn't finish in time
+            for (self.pipes.items) |pipe| {
+                pipe.terminate(false);
+            }
+        } else {
+            // Infinite linger (linger_ms == -1): wait until all done
+            while (self.pipes.items.len > 0) {
+                gen = try self.readiness_signal.park(gen);
+            }
+        }
     }
 };
 ```
@@ -1960,8 +2114,8 @@ In libzmq, `socket_base_t::process_commands()` drains the mailbox on
 every `getsockopt(ZMQ_EVENTS)`, every `send()`, and every `recv()` — it's
 the mechanism that turns async pipe events into socket state changes. We
 don't need this because pipe events (readActivated, writeActivated,
-pipeTerminated) are delivered directly via callbacks or Waiter signals.
-The socket's state is always current.
+pipeTerminated) are delivered directly via callbacks or ReadySignal
+notifications. The socket's state is always current.
 
 ### Fair Queuing (`FairQueue`)
 
@@ -2475,11 +2629,17 @@ pub const PubPattern = struct {
 
 pub const SubPattern = struct {
     fq: FairQueue,
+    // Trie for O(prefix_len) subscription matching (matches libzmq's
+    // mtrie_t). Linear scan is O(subscriptions * prefix_len) per
+    // message, which degrades badly with many subscriptions.
+    trie: PrefixTrie,
+    // Keep a list for re-sending subscriptions on new pipe attach.
     subscriptions: std.ArrayList([]const u8),
 
     pub fn init(allocator: Allocator) SubPattern {
         return .{
             .fq = FairQueue.init(allocator),
+            .trie = PrefixTrie.init(allocator),
             .subscriptions = std.ArrayList([]const u8).init(allocator),
         };
     }
@@ -2501,6 +2661,7 @@ pub const SubPattern = struct {
 
     pub fn subscribe(self: *SubPattern, prefix: []const u8) !void {
         try self.subscriptions.append(prefix);
+        try self.trie.insert(prefix);
         for (self.fq.pipes.items) |pipe| {
             sendSubscriptionCmd(pipe, prefix, true);
         }
@@ -2513,6 +2674,7 @@ pub const SubPattern = struct {
                 break;
             }
         }
+        self.trie.remove(prefix);
         for (self.fq.pipes.items) |pipe| {
             sendSubscriptionCmd(pipe, prefix, false);
         }
@@ -2524,7 +2686,7 @@ pub const SubPattern = struct {
     pub fn recv(self: *SubPattern) !Msg {
         while (true) {
             const result = self.fq.recv() orelse return error.Eagain;
-            if (self.matchesAny(result.msg.dataSlice())) return result.msg;
+            if (self.trie.matches(result.msg.dataSlice())) return result.msg;
             // Doesn't match — discard (drain remaining multipart frames)
             var m = result.msg;
             while (m.flags.more) {
@@ -2537,15 +2699,6 @@ pub const SubPattern = struct {
     pub fn hasIn(self: *SubPattern) bool { return self.fq.hasIn(); }
     pub fn hasOut(_: *SubPattern) bool { return false; }
 
-    fn matchesAny(self: *SubPattern, data: []const u8) bool {
-        for (self.subscriptions.items) |prefix| {
-            if (data.len >= prefix.len and
-                std.mem.eql(u8, data[0..prefix.len], prefix))
-                return true;
-        }
-        return self.subscriptions.items.len == 0;
-    }
-
     fn sendSubscriptionCmd(pipe: *Pipe, prefix: []const u8, is_sub: bool) void {
         // ZMTP subscription: byte 0 = 0x01 (sub) or 0x00 (unsub), then prefix
         var cmd = Msg.initSize(pipe.allocator, 1 + prefix.len) catch return;
@@ -2555,6 +2708,73 @@ pub const SubPattern = struct {
         cmd.flags.command = true;
         _ = pipe.send(&cmd) catch {};
         pipe.flush();
+    }
+};
+
+/// Prefix trie for subscription matching (replaces linear scan).
+/// Matches libzmq's mtrie_t: each node has 256 children (one per byte).
+/// A node is "terminal" if a subscription ends there. Matching walks
+/// the trie byte-by-byte; any terminal node on the path means "match".
+///
+/// Complexity:
+///   insert/remove: O(prefix_len)
+///   match: O(min(data_len, max_prefix_len))
+///
+/// This is critical for PUB/SUB workloads with many subscriptions.
+/// Linear scan is O(N * prefix_len) per message; the trie is O(prefix_len).
+pub const PrefixTrie = struct {
+    const Node = struct {
+        children: [256]?*Node = .{null} ** 256,
+        terminal_count: u32 = 0,  // >0 means a subscription ends here
+    };
+
+    root: Node = .{},
+    empty_sub: bool = false,  // empty-string subscription (matches all)
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) PrefixTrie {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn insert(self: *PrefixTrie, prefix: []const u8) !void {
+        if (prefix.len == 0) {
+            self.empty_sub = true;
+            return;
+        }
+        var node = &self.root;
+        for (prefix) |byte| {
+            if (node.children[byte] == null) {
+                node.children[byte] = try self.allocator.create(Node);
+                node.children[byte].?.* = .{};
+            }
+            node = node.children[byte].?;
+        }
+        node.terminal_count += 1;
+    }
+
+    pub fn remove(self: *PrefixTrie, prefix: []const u8) void {
+        if (prefix.len == 0) {
+            self.empty_sub = false;
+            return;
+        }
+        var node = &self.root;
+        for (prefix) |byte| {
+            node = node.children[byte] orelse return;
+        }
+        if (node.terminal_count > 0) node.terminal_count -= 1;
+    }
+
+    /// Returns true if any subscription prefix matches the data.
+    /// Walks the trie byte-by-byte; returns true at the first
+    /// terminal node encountered (shortest matching prefix).
+    pub fn matches(self: *PrefixTrie, data: []const u8) bool {
+        if (self.empty_sub) return true;
+        var node = &self.root;
+        for (data) |byte| {
+            node = node.children[byte] orelse return false;
+            if (node.terminal_count > 0) return true;
+        }
+        return false;
     }
 };
 ```
@@ -2904,8 +3124,13 @@ libzmq's `zmq_poll()` works by getting each socket's FD (`ZMQ_FD`),
 calling OS `poll()`, then checking `ZMQ_EVENTS`. This requires the entire
 signaler/mailbox infrastructure.
 
-We replace it with **coroutine-native multi-wait**: a single Waiter
-shared across sockets. No FDs, no OS poll, no signaler.
+We replace it with **coroutine-native multi-wait**. No FDs, no OS poll,
+no signaler.
+
+**Original design (shown here to illustrate the UAF problem — see fix
+below in "Updated Poller Integration")**. This version uses a stack-
+allocated Waiter, which is vulnerable to use-after-free if the signal
+arrives after the poller returns:
 
 ```zig
 pub const Poller = struct {
@@ -3872,6 +4097,9 @@ Every atomic operation in the system and its required ordering:
 | `YQueue.spare_chunk` | swap (push/pop) | `acquire`/`release` | Chunk recycling between reader/writer |
 | `Msg.Content.refcount` | fetchAdd (copy) | `monotonic` | Refcount increment (no ordering needed) |
 | `Msg.Content.refcount` | fetchSub (release) | `release` + fence | Last decrement sees all prior uses |
+| `Pipe.out_active` | store (send/terminate) | `release` | Writer publishes deactivation |
+| `Pipe.out_active` | load (recv backpressure) | `acquire` | Reader sees writer's deactivation |
+| `Pipe.out_active` | store (recv backpressure) | `release` | Reader publishes reactivation |
 | `Pipe.state` | store (terminate) | `release` | Makes state transition visible |
 | `Pipe.state` | load (processDelimiter) | `acquire` | Sees peer's state transition |
 
