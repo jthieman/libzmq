@@ -137,10 +137,17 @@ pub const Msg = struct {
                 if (self.free_fn) |ffn| {
                     ffn(self.data, self.len, self.hint);
                 }
-                // Free the Content struct (and contiguous data buffer).
-                // This works for both single-alloc and custom-alloc paths.
+                // Free the contiguous allocation (Content header + data buffer).
+                // Must match the alignedAlloc(u8, @alignOf(Content), total) in initSize().
+                // We reconstruct the original slice from the Content pointer and the
+                // known total size (header_size + data len).
                 const alloc = self.allocator;
-                alloc.destroy(self);
+                const header_size = std.mem.alignForward(
+                    usize, @sizeOf(Content), @alignOf(Content),
+                );
+                const total = header_size + self.len;
+                const ptr: [*]align(@alignOf(Content)) u8 = @ptrCast(self);
+                alloc.free(ptr[0..total]);
             }
         }
     };
@@ -624,12 +631,35 @@ pub const Pipe = struct {
     /// Enqueue a message to the pipe. Does NOT flush — no CAS, no
     /// notification. The message is not visible to the reader until
     /// flush() is called. This is a plain array write (~5ns).
+    ///
+    /// Deactivation protocol (Dekker-style):
+    ///   Writer: store(out_active, false) → fence(seq_cst) → load(peers_msgs_read)
+    ///   Reader: store(peers_msgs_read)   → fence(seq_cst) → load(out_active)
+    ///
+    /// The seq_cst fences on both sides create a total order, ensuring
+    /// at least one side sees the other's store. This prevents the race
+    /// where the writer deactivates after the reader reactivates — if
+    /// the re-check shows HWM space, the writer re-activates itself.
     pub fn send(self: *Pipe, msg: *Msg) !bool {
         if (!self.out_active.load(.acquire)) return false;
 
         if (!self.checkHwm()) {
             self.out_active.store(false, .release);
-            return false;
+
+            // Dekker fence: pairs with the seq_cst fence in recv()'s
+            // LWM path. Ensures we see the reader's peers_msgs_read
+            // update if the reader hasn't yet seen our out_active=false.
+            @fence(.seq_cst);
+
+            // Re-check: reader may have drained messages between our
+            // checkHwm() and the deactivation. If space opened up,
+            // re-activate — the reader might not reactivate us because
+            // it could have loaded out_active=true before our store.
+            if (self.checkHwm()) {
+                self.out_active.store(true, .release);
+            } else {
+                return false;
+            }
         }
 
         const more = msg.flags.more;
@@ -722,6 +752,14 @@ pub const Pipe = struct {
             if (self.msgs_read >= self.next_activate_threshold) {
                 self.next_activate_threshold += self.lwm;
                 self.peer.peers_msgs_read.store(self.msgs_read, .release);
+
+                // Dekker fence: pairs with the seq_cst fence in send()'s
+                // deactivation path. Ensures we see out_active=false if
+                // the writer hasn't yet seen our peers_msgs_read update.
+                // Without this, both sides can miss each other's stores
+                // on weakly-ordered architectures (ARM, RISC-V).
+                @fence(.seq_cst);
+
                 if (!self.peer.out_active.load(.acquire)) {
                     self.peer.out_active.store(true, .release);
                     self.wakeWriter();
@@ -1976,11 +2014,14 @@ pub const Socket = struct {
     // Socket options
     options: Options,
 
-    // Readiness signal: persistent, socket-owned. Pointer so Poller can
-    // temporarily redirect it to a shared signal (see Updated Poller
-    // Integration in Concurrency Model section).
-    readiness_signal: *ReadySignal = undefined,  // set in init()
+    // Readiness signal: persistent, socket-owned. Atomic pointer so
+    // Poller can temporarily redirect it to a shared signal (see
+    // Updated Poller Integration in Concurrency Model section).
+    // Atomic because signalReadiness() reads it concurrently with
+    // poll()'s swap. See Concurrency Model for the Dekker drain protocol.
+    readiness_signal: std.atomic.Value(*ReadySignal) = .init(undefined),
     own_readiness_signal: ReadySignal = .{},
+    in_flight_notifies: std.atomic.Value(u32) = .init(0),
 
     // Monitor event channel (null if no monitor attached)
     monitor: ?*MonitorChannel = null,
@@ -2127,7 +2168,7 @@ pub const Socket = struct {
             .executor = executor,
             .ctx = ctx,
         };
-        self.readiness_signal = &self.own_readiness_signal;
+        self.readiness_signal.store(&self.own_readiness_signal, .release);
     }
 
     // ----------------------------------------------------------
@@ -2382,7 +2423,12 @@ pub const Socket = struct {
     }
 
     fn signalReadiness(self: *Socket) void {
-        self.readiness_signal.notify();
+        // Dekker protocol: increment in_flight_notifies BEFORE loading
+        // the signal pointer (pairs with drain in Poller.poll).
+        _ = self.in_flight_notifies.fetchAdd(1, .monotonic);
+        @fence(.seq_cst);
+        self.readiness_signal.load(.acquire).notify();
+        _ = self.in_flight_notifies.fetchSub(1, .release);
     }
 
     // ----------------------------------------------------------
@@ -2422,23 +2468,36 @@ pub const Socket = struct {
     /// Uses the persistent ReadySignal (not stack-allocated Waiters) to
     /// avoid the lifetime/UAF issues described in the Concurrency Model.
     /// Respects options.send_timeout_ms: -1 = block forever, 0 = try once.
+    ///
+    /// Uses an absolute deadline so spurious wakeups and re-checks
+    /// don't extend the total wait beyond the requested timeout.
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
         if (self.hasOut()) return try self.send(msg);
         if (self.options.send_timeout_ms == 0) return error.Eagain;
 
-        var gen = self.readiness_signal.currentGen();
+        // Load signal once: during sendBlocking, we're not in poll(),
+        // so the pointer won't change. (poll() is the only mutator,
+        // and it's single-threaded with respect to the owning coroutine.)
+        const signal = self.readiness_signal.load(.acquire);
+        var gen = signal.currentGen();
         if (self.options.send_timeout_ms > 0) {
-            const timeout = Timeout.fromMilliseconds(
+            // Compute absolute deadline once, then pass remaining time
+            // to each parkTimeout call. This matches libzmq's behavior:
+            // zmq_send(ZMQ_SNDTIMEO=1000) blocks for at most 1000ms total,
+            // not 1000ms per wakeup iteration.
+            const deadline = Deadline.init(
                 @intCast(self.options.send_timeout_ms),
             );
             while (true) {
-                gen = self.readiness_signal.parkTimeout(gen, timeout) catch
+                const remaining = deadline.remaining() orelse
+                    return error.Eagain;
+                gen = signal.parkTimeout(gen, remaining) catch
                     return error.Eagain;
                 if (self.hasOut()) return try self.send(msg);
             }
         } else {
             while (true) {
-                gen = try self.readiness_signal.park(gen);
+                gen = try signal.park(gen);
                 if (self.hasOut()) return try self.send(msg);
             }
         }
@@ -2446,23 +2505,27 @@ pub const Socket = struct {
 
     /// Blocking recv: parks coroutine until a message is available.
     /// Respects options.recv_timeout_ms: -1 = block forever, 0 = try once.
+    /// Uses an absolute deadline (see sendBlocking for rationale).
     pub fn recvBlocking(self: *Socket) !Msg {
         if (self.hasIn()) return try self.recv();
         if (self.options.recv_timeout_ms == 0) return error.Eagain;
 
-        var gen = self.readiness_signal.currentGen();
+        const signal = self.readiness_signal.load(.acquire);
+        var gen = signal.currentGen();
         if (self.options.recv_timeout_ms > 0) {
-            const timeout = Timeout.fromMilliseconds(
+            const deadline = Deadline.init(
                 @intCast(self.options.recv_timeout_ms),
             );
             while (true) {
-                gen = self.readiness_signal.parkTimeout(gen, timeout) catch
+                const remaining = deadline.remaining() orelse
+                    return error.Eagain;
+                gen = signal.parkTimeout(gen, remaining) catch
                     return error.Eagain;
                 if (self.hasIn()) return try self.recv();
             }
         } else {
             while (true) {
-                gen = try self.readiness_signal.park(gen);
+                gen = try signal.park(gen);
                 if (self.hasIn()) return try self.recv();
             }
         }
@@ -2497,15 +2560,18 @@ pub const Socket = struct {
         // Wait for all pipes to reach terminated state.
         // Use the socket's ReadySignal — pipeTerminated() calls
         // signalReadiness(), which bumps the generation.
-        var gen = self.readiness_signal.currentGen();
+        const signal = self.readiness_signal.load(.acquire);
+        var gen = signal.currentGen();
         if (self.options.linger_ms > 0) {
             // Timed linger: wait up to linger_ms, then force-terminate
-            // any remaining pipes without delay.
-            const timeout = Timeout.fromMilliseconds(
+            // any remaining pipes without delay. Uses an absolute deadline
+            // so spurious wakeups don't extend the total linger period.
+            const deadline = Deadline.init(
                 @intCast(self.options.linger_ms),
             );
             while (self.pipes.items.len > 0) {
-                gen = self.readiness_signal.parkTimeout(gen, timeout) catch break;
+                const remaining = deadline.remaining() orelse break;
+                gen = signal.parkTimeout(gen, remaining) catch break;
             }
             // Force-terminate any pipes that didn't finish in time
             for (self.pipes.items) |pipe| {
@@ -2514,7 +2580,7 @@ pub const Socket = struct {
         } else {
             // Infinite linger (linger_ms == -1): wait until all done
             while (self.pipes.items.len > 0) {
-                gen = try self.readiness_signal.park(gen);
+                gen = try signal.park(gen);
             }
         }
     }
@@ -3923,24 +3989,54 @@ pub const ReadySignal = struct {
     /// null = nobody is parked. Non-null = a coroutine is waiting.
     parked_task: std.atomic.Value(?*AnyTask) = .init(null),
 
+    /// In-flight wake counter. Tracks how many notify() calls are
+    /// currently between loading parked_task and completing task.wake().
+    ///
+    /// Prevents use-after-free: park() drains this counter before
+    /// returning, ensuring no concurrent notify() is still holding
+    /// a stale task pointer. This is the "drain-before-destroy"
+    /// pattern from zio's Waiter (common.zig:119-127).
+    in_flight_wakes: std.atomic.Value(u32) = .init(0),
+
     // -------------------------------------------------------
     // Writer side (called from producer coroutine/thread)
     // -------------------------------------------------------
 
     /// Notify the reader that new data is available.
     /// Safe to call from any thread at any time.
+    ///
+    /// Drain protocol (Dekker-style, prevents UAF on task pointer):
+    ///   notify:  fetchAdd(in_flight_wakes) → fence(seq_cst) → load(parked_task)
+    ///   park:    store(parked_task, null)   → fence(seq_cst) → drain(in_flight_wakes)
+    ///
+    /// The seq_cst fences create a total order, guaranteeing at least one
+    /// side sees the other's store. If notify loaded a non-null task,
+    /// in_flight_wakes > 0. If the drain sees 0, notify either loaded null
+    /// (safe) or has already completed its wake() call (safe).
     pub fn notify(self: *ReadySignal) void {
         // 1. Increment generation (release: makes prior writes visible)
         _ = self.generation.fetchAdd(1, .release);
 
-        // 2. Load task pointer (acquire: sees reader's publication)
+        // 2. Enter in-flight region BEFORE loading the task pointer.
+        //    This is the first half of the Dekker handshake.
+        _ = self.in_flight_wakes.fetchAdd(1, .monotonic);
+        @fence(.seq_cst);
+
+        // 3. Load task pointer. If non-null, wake it.
         //    task.wake() is safe because:
+        //    - We're inside the in-flight region (park won't return
+        //      while in_flight_wakes > 0)
         //    - AnyTask is heap-allocated by zio runtime
-        //    - AnyTask lives until coroutine completes
-        //    - wake() does scheduleTask() which is thread-safe
+        //    - wake() on an already-running task (.ready) is a no-op
+        //      (scheduleTask swaps .ready → .ready, returns immediately)
         if (self.parked_task.load(.acquire)) |task| {
             task.wake();
         }
+
+        // 4. Exit in-flight region (release: makes wake() visible
+        //    to the draining park() call)
+        _ = self.in_flight_wakes.fetchSub(1, .release);
+
         // If null: reader isn't parked (either actively processing
         // or hasn't parked yet). Either way, the generation bump
         // ensures the reader sees data on its next check.
@@ -3964,7 +4060,13 @@ pub const ReadySignal = struct {
     ///    .preparing_to_wait → .waiting. If notify()'s task.wake() already
     ///    swapped state to .ready, the CAS fails and the executor
     ///    reschedules the task immediately (never truly parked — no lost wake).
-    /// 7. On resume: unpublish task pointer, return new generation.
+    /// 7. On resume: unpublish task pointer, drain in-flight wakes, return.
+    ///
+    /// Step 7's drain is critical: it ensures no concurrent notify() is still
+    /// holding our task pointer. Without it, the coroutine could proceed to
+    /// finish → AnyTask freed → notify() calls wake() on freed memory.
+    /// This mirrors zio's Waiter drain pattern (common.zig:119-127):
+    ///   "wait for in-flight wakes to complete before destroying the waiter."
     ///
     /// This is the same double-check pattern used by zio's common.zig
     /// waitTask(): the .preparing_to_wait state is a reservation that
@@ -3994,9 +4096,9 @@ pub const ReadySignal = struct {
         const current_gen = self.generation.load(.acquire);
         if (current_gen != last_seen_gen) {
             // Data arrived between caller's check and our publication.
-            // Abort park: restore state and unpublish.
+            // Abort park: restore state, unpublish, and drain.
             task.state.store(.ready, .release);
-            self.parked_task.store(null, .release);
+            self.unpublishAndDrain();
             return current_gen;
         }
 
@@ -4009,14 +4111,35 @@ pub const ReadySignal = struct {
         // .allow_cancel: if the task is cancelled while parked,
         // yield returns error.Canceled.
         task.yield(.park, .allow_cancel) catch |err| {
-            // Cancellation: unpublish before propagating
-            self.parked_task.store(null, .release);
+            // Cancellation: unpublish and drain before propagating.
+            self.unpublishAndDrain();
             return err;
         };
 
-        // Step 7: Woken (or immediately rescheduled). Unpublish.
-        self.parked_task.store(null, .release);
+        // Step 7: Woken (or immediately rescheduled). Unpublish and drain.
+        self.unpublishAndDrain();
         return self.generation.load(.acquire);
+    }
+
+    /// Unpublish the task pointer and drain in-flight wakes.
+    ///
+    /// Dekker-style handshake with notify():
+    ///   park:    store(parked_task, null) → fence(seq_cst) → drain(in_flight_wakes)
+    ///   notify:  fetchAdd(in_flight_wakes) → fence(seq_cst) → load(parked_task)
+    ///
+    /// The seq_cst fences create a total order. Either:
+    /// (a) notify sees null → doesn't call wake() → safe, OR
+    /// (b) notify loaded our task → in_flight_wakes > 0 → we spin until
+    ///     notify completes wake() and decrements → safe.
+    ///
+    /// The drain spin is bounded: notify() does at most one wake() call
+    /// (a few hundred nanoseconds), so the spin is extremely short.
+    fn unpublishAndDrain(self: *ReadySignal) void {
+        self.parked_task.store(null, .release);
+        @fence(.seq_cst);
+        while (self.in_flight_wakes.load(.acquire) != 0) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Park with a timeout. Same handshake as park(), but registers an
@@ -4061,17 +4184,17 @@ pub const ReadySignal = struct {
         const current_gen = self.generation.load(.acquire);
         if (current_gen != last_seen_gen) {
             task.state.store(.ready, .release);
-            self.parked_task.store(null, .release);
+            self.unpublishAndDrain();
             return current_gen;
         }
 
         // Yield — either notify() or the timer callback will wake us.
         task.yield(.park, .allow_cancel) catch |err| {
-            self.parked_task.store(null, .release);
+            self.unpublishAndDrain();
             return err;
         };
 
-        self.parked_task.store(null, .release);
+        self.unpublishAndDrain();
         return self.generation.load(.acquire);
     }
 
@@ -4088,28 +4211,71 @@ pub const ReadySignal = struct {
         return self.generation.load(.acquire);
     }
 };
+
+/// Absolute-deadline helper for timeout loops.
+///
+/// Captures a monotonic clock deadline at construction. Each call to
+/// remaining() returns the time left (as a Timeout suitable for
+/// parkTimeout), or null if the deadline has passed.
+///
+/// This prevents the "deadline-resetting" bug where a loop repeatedly
+/// passes the full original timeout to parkTimeout, allowing the total
+/// wait to exceed the requested duration on spurious wakeups.
+///
+/// Uses zio's monotonic clock (ev.Loop.now / std.time.Timer) to avoid
+/// wall-clock jumps from NTP/settimeofday.
+const Deadline = struct {
+    deadline_ns: u64,
+
+    pub fn init(timeout_ms: u64) Deadline {
+        const now = zio.time.monotonicNow();
+        return .{
+            .deadline_ns = now + timeout_ms * std.time.ns_per_ms,
+        };
+    }
+
+    /// Returns remaining time as a Timeout, or null if expired.
+    pub fn remaining(self: Deadline) ?Timeout {
+        const now = zio.time.monotonicNow();
+        if (now >= self.deadline_ns) return null;
+        return Timeout.fromNanoseconds(self.deadline_ns - now);
+    }
+};
 ```
 
 **Why this is safe:**
 
 1. **ReadySignal is a field of Pipe** (heap-allocated). Its lifetime equals
-   the Pipe's lifetime. `notify()` accesses `self.generation` and
-   `self.parked_task`, which are fields of this persistent struct — no stack
-   dependency.
+   the Pipe's lifetime. `notify()` accesses `self.generation`,
+   `self.parked_task`, and `self.in_flight_wakes`, which are all fields
+   of this persistent struct — no stack dependency.
 
-2. **`parked_task` points to `AnyTask`**, which is heap-allocated by zio's
-   runtime when the coroutine is spawned. It lives until the coroutine
-   completes and is freed by the runtime. `task.wake()` calls
-   `task.getExecutor().scheduleTask(task)`, which is safe from any thread
-   (Treiber stack push + `loop.wake()`).
+2. **`parked_task` is protected by the drain protocol.** `notify()` brackets
+   its access to the task pointer inside `in_flight_wakes` (increment before
+   load, decrement after wake). `park()` calls `unpublishAndDrain()` which
+   stores null then spins until `in_flight_wakes == 0`. The seq_cst fences
+   in both paths form a Dekker-style handshake: either notify() sees null
+   (no wake), or park() sees `in_flight_wakes > 0` (waits for wake to
+   complete). This mirrors zio's Waiter drain pattern (common.zig:119-127)
+   where `waiter.wait(1, .no_cancel)` drains in-flight signals before the
+   stack-allocated Waiter is destroyed.
 
-3. **Generation counter is persistent**. `notify()` always increments it,
+3. **AnyTask lifetime vs. wake() safety.** Even without the drain, calling
+   `task.wake()` on a *running* task (state `.ready`) is safe — zio's
+   `scheduleTask` atomically swaps state to `.ready` and returns immediately
+   if the old state was already `.ready` (no-op). The drain prevents the
+   more dangerous case: calling `wake()` on a *destroyed* task (after the
+   coroutine finishes and the AnyTask is freed by the runtime). The drain
+   ensures park() doesn't return until all in-flight wakes are done, so
+   the coroutine cannot proceed to finish while a notify() holds the pointer.
+
+4. **Generation counter is persistent**. `notify()` always increments it,
    regardless of whether anyone is parked. The counter never wraps in
    practice (2^64 increments at 1GHz = 584 years).
 
-4. **No signal-after-free**: The notifier never accesses stack memory.
-   It accesses Pipe fields (heap) and AnyTask (heap). Both outlive any
-   individual send/recv call.
+5. **No signal-after-free**: The notifier never accesses stack memory.
+   It accesses Pipe fields (heap) and AnyTask (heap, protected by drain).
+   Both outlive any individual send/recv call.
 
 ### Updated Pipe Integration
 
@@ -4198,46 +4364,70 @@ owns a persistent `ReadySignal` that the Poller taps into:
 
 ```zig
 pub const Socket = struct {
-    // Pointer to the active ReadySignal.
+    // Atomic pointer to the active ReadySignal.
     // Normally points to self.own_readiness_signal (embedded, heap-lifetime).
     // During Poller.poll(), temporarily redirected to a shared signal.
-    // Using a pointer (not inline value) ensures that Poller's swap
-    // actually shares one signal across all subscribed sockets.
-    readiness_signal: *ReadySignal = undefined,  // set in init()
+    //
+    // MUST be atomic: signalReadiness() reads this from the pipe's
+    // coroutine while poll() writes it from the polling coroutine.
+    // Without atomicity, torn pointer reads cause UB on weakly-ordered
+    // architectures and even x86 (compiler reordering).
+    readiness_signal: std.atomic.Value(*ReadySignal) = .init(undefined),
     own_readiness_signal: ReadySignal = .{},
+
+    // In-flight signalReadiness() counter. Used by Poller to drain
+    // concurrent notifiers before returning from poll() and destroying
+    // the stack-local shared signal.
+    //
+    // Dekker protocol (same pattern as ReadySignal.in_flight_wakes):
+    //   signalReadiness: fetchAdd(in_flight_notifies) → fence(seq_cst) → load(readiness_signal)
+    //   poll unsubscribe: store(readiness_signal, original) → fence(seq_cst) → drain(in_flight_notifies)
+    in_flight_notifies: std.atomic.Value(u32) = .init(0),
 
     pub fn init(self: *Socket) void {
         // ... other initialization ...
-        self.readiness_signal = &self.own_readiness_signal;
+        self.readiness_signal.store(&self.own_readiness_signal, .release);
     }
 
+    /// Signal readiness from pipe callbacks.
+    ///
+    /// Uses the Dekker drain protocol so Poller.poll() can safely
+    /// swap the signal pointer and know when all in-flight notifies
+    /// have completed (preventing UAF on the stack-local shared signal).
     fn signalReadiness(self: *Socket) void {
-        self.readiness_signal.notify();
+        _ = self.in_flight_notifies.fetchAdd(1, .monotonic);
+        @fence(.seq_cst);
+        self.readiness_signal.load(.acquire).notify();
+        _ = self.in_flight_notifies.fetchSub(1, .release);
     }
 
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
-        var gen = self.readiness_signal.currentGen();
+        var gen = self.readiness_signal.load(.acquire).currentGen();
         while (true) {
             if (self.hasOut()) return try self.send(msg);
-            gen = try self.readiness_signal.park(gen);
+            gen = try self.readiness_signal.load(.acquire).park(gen);
         }
     }
 
     pub fn recvBlocking(self: *Socket) !Msg {
-        var gen = self.readiness_signal.currentGen();
+        var gen = self.readiness_signal.load(.acquire).currentGen();
         while (true) {
             if (self.hasIn()) return try self.recv();
-            gen = try self.readiness_signal.park(gen);
+            gen = try self.readiness_signal.load(.acquire).park(gen);
         }
     }
 };
 ```
 
-For multi-socket polling, we use a pointer-based shared signal.
-Each Socket has a `readiness_signal: *ReadySignal` pointer (not an
-inline value). Normally this points to the socket's own embedded signal.
-During `poll()`, we temporarily redirect each socket's pointer to a
-shared signal, so any socket's `signalReadiness()` wakes the poller.
+For multi-socket polling, we use an atomic pointer-based shared signal.
+Each Socket has a `readiness_signal: std.atomic.Value(*ReadySignal)`
+(atomic pointer). Normally this points to the socket's own embedded
+signal. During `poll()`, we temporarily redirect each socket's pointer
+to a shared signal, so any socket's `signalReadiness()` wakes the poller.
+
+The shared signal is stack-local (owned by the poll() call frame).
+This is safe because poll() drains all in-flight `signalReadiness()`
+calls before returning, using the Dekker protocol on `in_flight_notifies`.
 
 ```zig
 pub const Poller = struct {
@@ -4255,15 +4445,12 @@ pub const Poller = struct {
 
     /// Multi-socket poll using generation-based wakeup.
     ///
-    /// Protocol — subscribe/unsubscribe via pointer swap:
+    /// Protocol — subscribe/unsubscribe via atomic pointer swap:
     ///
     /// 1. Create a stack-local ReadySignal ("shared").
-    ///    (Stack-local is safe here because the Poller owns the entire
-    ///    lifetime: we block until poll returns, and we unsubscribe
-    ///    every socket before returning. No dangling pointer is possible.)
     ///
-    /// 2. For each socket: swap its readiness_signal pointer to &shared.
-    ///    Save the original pointer for restoration.
+    /// 2. For each socket: atomically swap its readiness_signal pointer
+    ///    to &shared. Save the original pointer for restoration.
     ///
     /// 3. Re-check all sockets AFTER subscribing (prevents missed wakeup
     ///    between phase-1 check and subscription).
@@ -4272,34 +4459,47 @@ pub const Poller = struct {
     ///    socket.signalReadiness() → shared.notify() → poller wakes.
     ///
     /// 5. Restore every socket's original signal pointer (unsubscribe).
-    ///    This MUST happen before returning, even on error/cancellation.
+    ///    Then drain: wait for all in-flight signalReadiness() calls to
+    ///    complete. Only after drain is the stack-local shared signal
+    ///    guaranteed dead. This MUST happen before returning.
+    ///
+    /// Safety: the drain protocol (Dekker-style) ensures that no
+    /// concurrent signalReadiness() is still holding &shared after
+    /// poll() returns. See Socket.signalReadiness for the other half.
     pub fn poll(items: []Item, timeout_ms: i64) !u32 {
         // Phase 1: non-blocking check (no subscription needed)
         var ready = checkAll(items);
         if (ready > 0 or timeout_ms == 0) return ready;
 
         // Phase 2: create shared signal and subscribe all sockets.
-        // Dynamically allocate the originals array to support any
-        // number of sockets (no hard cap).
         var shared = ReadySignal{};
         const allocator = std.heap.page_allocator;  // or arena
         const originals = try allocator.alloc(*ReadySignal, items.len);
         defer allocator.free(originals);
 
         for (items, 0..) |*item, i| {
-            originals[i] = item.socket.readiness_signal;
-            // Pointer swap: socket now notifies our shared signal.
-            // This is safe because:
-            // - We hold the poller's coroutine (won't return until phase 5)
-            // - Socket.signalReadiness() just calls signal.notify()
-            // - notify() only accesses fields of the pointed-to ReadySignal
-            item.socket.readiness_signal = &shared;
+            // Atomic swap: signalReadiness() will see &shared.
+            originals[i] = item.socket.readiness_signal.swap(&shared, .acq_rel);
         }
         defer {
             // Phase 5: unsubscribe — restore original signal pointers.
             // This runs even if park() returns error (cancellation).
             for (items, 0..) |*item, i| {
-                item.socket.readiness_signal = originals[i];
+                item.socket.readiness_signal.store(originals[i], .release);
+            }
+
+            // Dekker fence: pairs with the seq_cst fence in
+            // Socket.signalReadiness(). After this fence + drain,
+            // any signalReadiness() that loaded &shared has finished.
+            @fence(.seq_cst);
+
+            // Drain: wait for all in-flight signalReadiness() calls.
+            // After this loop, no concurrent thread holds &shared —
+            // the stack-local signal can safely go out of scope.
+            for (items) |*item| {
+                while (item.socket.in_flight_notifies.load(.acquire) != 0) {
+                    std.atomic.spinLoopHint();
+                }
             }
         }
 
@@ -4317,7 +4517,7 @@ pub const Poller = struct {
             _ = try shared.park(gen);
         }
 
-        // Phase 5 (deferred): restore signal pointers
+        // Phase 5 (deferred): restore signal pointers + drain
         return checkAll(items);
     }
 
