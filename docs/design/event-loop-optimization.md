@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v7)
+## Status: DESIGN PROPOSAL (v8)
 
 ## Context
 
@@ -1244,6 +1244,14 @@ pub const Session = struct {
                     read_buf[buf_pos..buf_len],
                 ) orelse break;  // incomplete frame, need more data
 
+                // ZMQ_MAXMSGSIZE enforcement: reject oversized frames
+                // at the transport layer before allocating memory.
+                if (self.options.max_msg_size >= 0 and
+                    frame.body_len > @as(usize, @intCast(self.options.max_msg_size)))
+                {
+                    return error.MessageTooLarge;
+                }
+
                 // Create Msg from decoded frame.
                 // VSM path (<=48 bytes): inline copy, zero alloc.
                 // LMSG path (>48 bytes): single contiguous allocation
@@ -1464,12 +1472,16 @@ pub const Transport = struct {
         // delays small writes by up to 40ms waiting to coalesce.
         try stream.socket.setNoDelay(true);
 
+        // Apply socket options to the TCP connection
+        applyTcpOptions(stream.socket, options);
+
         const session = try allocator.create(Session);
         session.* = .{
             .pipe = pipe,
             .stream = stream,
             .codec = .{},
             .allocator = allocator,
+            .options = options,
         };
         return session;
     }
@@ -1484,6 +1496,7 @@ pub const Transport = struct {
         errdefer stream.close();
 
         try stream.socket.setNoDelay(true);
+        applyTcpOptions(stream.socket, options);
 
         const session = try allocator.create(Session);
         session.* = .{
@@ -1491,8 +1504,27 @@ pub const Transport = struct {
             .stream = stream,
             .codec = .{},
             .allocator = allocator,
+            .options = options,
         };
         return session;
+    }
+
+    /// Apply socket-level TCP options from Socket.Options.
+    fn applyTcpOptions(sock: anytype, opts: *const Socket.Options) void {
+        if (opts.sndbuf >= 0) sock.setSndBuf(@intCast(opts.sndbuf)) catch {};
+        if (opts.rcvbuf >= 0) sock.setRcvBuf(@intCast(opts.rcvbuf)) catch {};
+        if (opts.tos > 0) sock.setTos(opts.tos) catch {};
+        if (opts.tcp_keepalive >= 0) {
+            sock.setKeepAlive(opts.tcp_keepalive == 1) catch {};
+            if (opts.tcp_keepalive == 1) {
+                if (opts.tcp_keepalive_idle >= 0)
+                    sock.setKeepIdle(@intCast(opts.tcp_keepalive_idle)) catch {};
+                if (opts.tcp_keepalive_cnt >= 0)
+                    sock.setKeepCnt(@intCast(opts.tcp_keepalive_cnt)) catch {};
+                if (opts.tcp_keepalive_intvl >= 0)
+                    sock.setKeepIntvl(@intCast(opts.tcp_keepalive_intvl)) catch {};
+            }
+        }
     }
 
     /// IPC transport: connect via Unix domain socket
@@ -1602,12 +1634,23 @@ error) and exits. The socket layer handles reconnection:
 // Reconnection is a socket-layer concern, not a session concern.
 // The socket spawns a new session coroutine on reconnect.
 fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
-    var backoff: u64 = 100;  // ms, initial backoff
-    const max_backoff: u64 = 30_000;  // 30s max
+    const opts = socket.options;
+    // ZMQ_RECONNECT_IVL: -1 disables reconnect entirely.
+    if (opts.reconnect_ivl_ms < 0) return;
+
+    const base_ivl: u64 = @intCast(opts.reconnect_ivl_ms);
+    // ZMQ_RECONNECT_IVL_MAX: 0 = no backoff (always use base_ivl).
+    const max_ivl: u64 = if (opts.reconnect_ivl_max_ms > 0)
+        @intCast(opts.reconnect_ivl_max_ms)
+    else
+        base_ivl;
+    var backoff: u64 = base_ivl;
 
     while (socket.active) {
         // Create pipe pair for the new connection (heap-allocated)
-        const pipes = try pipePair(socket.allocator, socket.hwm, socket.hwm);
+        const pipes = try pipePair(
+            socket.allocator, opts.hwm_send, opts.hwm_recv,
+        );
 
         // Connect
         const session = Transport.tcpConnect(
@@ -1615,11 +1658,11 @@ fn reconnectLoop(socket: *Socket, addr: zio.net.IpAddress) !void {
         ) catch {
             // Connection failed — exponential backoff
             zio.time.sleep(backoff * std.time.ns_per_ms);
-            backoff = @min(backoff * 2, max_backoff);
+            backoff = @min(backoff * 2, max_ivl);
             continue;
         };
 
-        backoff = 100;  // reset on success
+        backoff = base_ivl;  // reset on success
 
         // Attach pipe to socket
         socket.attachPipe(pipes[0]);
@@ -1930,11 +1973,123 @@ pub const Socket = struct {
     allocator: Allocator,
 
     pub const Options = struct {
-        hwm_send: u32 = 1000,
-        hwm_recv: u32 = 1000,
-        linger_ms: i64 = -1,       // -1 = infinite, 0 = discard, >0 = timeout
-        connect_timeout_ms: u32 = 0,
-        routing_id: ?[]const u8 = null,  // ROUTER identity
+        // ---- Flow Control / HWM (ZMQ_SNDHWM, ZMQ_RCVHWM) ----
+        hwm_send: u32 = 1000,          // 0 = no limit
+        hwm_recv: u32 = 1000,          // 0 = no limit
+
+        // ---- Message Limits (ZMQ_MAXMSGSIZE) ----
+        // Maximum inbound message size. -1 = no limit.
+        // Frames larger than this are rejected during ZMTP decode,
+        // protecting against OOM from malicious/buggy peers.
+        // Enforced in Session.recvLoop at the codec layer.
+        max_msg_size: i64 = -1,
+
+        // ---- Send/Recv Timeouts (ZMQ_SNDTIMEO, ZMQ_RCVTIMEO) ----
+        // Timeout for blocking send/recv. -1 = infinite, 0 = non-blocking.
+        // Applied in sendBlocking/recvBlocking via ReadySignal.parkTimeout.
+        send_timeout_ms: i64 = -1,
+        recv_timeout_ms: i64 = -1,
+
+        // ---- Linger (ZMQ_LINGER) ----
+        linger_ms: i64 = -1,           // -1 = infinite, 0 = discard, >0 = timeout
+
+        // ---- Reconnection (ZMQ_RECONNECT_IVL, ZMQ_RECONNECT_IVL_MAX) ----
+        // -1 = disable reconnect entirely.
+        reconnect_ivl_ms: i32 = 100,
+        reconnect_ivl_max_ms: i32 = 0, // 0 = no exponential backoff
+
+        // ---- Connection (ZMQ_CONNECT_TIMEOUT, ZMQ_HANDSHAKE_IVL) ----
+        connect_timeout_ms: u32 = 0,   // 0 = OS default
+        handshake_timeout_ms: u32 = 30_000,
+
+        // ---- TCP Transport (ZMQ_TCP_KEEPALIVE, ZMQ_SNDBUF, ZMQ_RCVBUF, ZMQ_TOS) ----
+        tcp_keepalive: i32 = -1,       // -1 = OS default, 0 = off, 1 = on
+        tcp_keepalive_idle: i32 = -1,  // seconds, -1 = OS default
+        tcp_keepalive_cnt: i32 = -1,   // probe count, -1 = OS default
+        tcp_keepalive_intvl: i32 = -1, // seconds between probes, -1 = OS default
+        sndbuf: i32 = -1,              // SO_SNDBUF, -1 = OS default
+        rcvbuf: i32 = -1,              // SO_RCVBUF, -1 = OS default
+        tos: u8 = 0,                   // IP_TOS / DSCP
+
+        // ---- ZMTP Heartbeat (ZMQ_HEARTBEAT_IVL, _TTL, _TIMEOUT) ----
+        // Heartbeats detect dead connections faster than TCP keepalive.
+        // 0 = disabled. When enabled, PING/PONG are exchanged at the
+        // ZMTP level (session coroutine handles the timer).
+        heartbeat_ivl_ms: u32 = 0,
+        heartbeat_ttl_ms: u32 = 0,     // remote timeout, rounded to deciseconds
+        heartbeat_timeout_ms: i32 = -1, // local timeout, -1 = use handshake_timeout
+
+        // ---- Network (ZMQ_IPV6, ZMQ_BACKLOG, ZMQ_IMMEDIATE) ----
+        ipv6: bool = false,            // enable dual-stack IPv4+6
+        backlog: u32 = 100,            // listen(2) backlog
+        // If true, only queue messages to completed connections
+        // (connections that have finished the ZMTP handshake).
+        // Prevents message loss during connect when using DEALER/PUSH.
+        immediate: bool = false,
+
+        // ---- Identity / Routing (ZMQ_ROUTING_ID) ----
+        routing_id: ?[]const u8 = null, // ROUTER identity (1-255 bytes)
+
+        // ---- ROUTER Options ----
+        // ZMQ_ROUTER_MANDATORY: return error.HostUnreachable instead
+        // of silently dropping when sending to an unknown routing ID.
+        router_mandatory: bool = false,
+        // ZMQ_ROUTER_HANDOVER: when a new connection arrives with an
+        // existing routing ID, take over the old pipe (disconnect old peer).
+        router_handover: bool = false,
+        // ZMQ_PROBE_ROUTER: on connect, send an empty message to trigger
+        // routing ID exchange immediately.
+        probe_router: bool = false,
+
+        // ---- REQ Options ----
+        // ZMQ_REQ_RELAXED: allow sending a new request before receiving
+        // the reply to the previous one (auto-reset REQ state machine).
+        req_relaxed: bool = false,
+        // ZMQ_REQ_CORRELATE: match replies to requests by correlation ID.
+        // Enables safe pipelining by discarding mis-matched replies.
+        req_correlate: bool = false,
+
+        // ---- PUB/SUB Options ----
+        // ZMQ_CONFLATE: keep only the last message in the queue.
+        // Useful for telemetry/state where only latest value matters.
+        // Disables multi-part messages.
+        conflate: bool = false,
+        // ZMQ_INVERT_MATCHING: deliver to non-matching subscriptions.
+        invert_matching: bool = false,
+
+        // ---- XPUB Options ----
+        // ZMQ_XPUB_VERBOSE: pass all subscription messages upstream,
+        // including duplicates (not just unique new ones).
+        xpub_verbose: bool = false,
+        // ZMQ_XPUB_VERBOSER: like verbose, also for unsubscribes.
+        xpub_verboser: bool = false,
+
+        // ---- Security Mechanism ----
+        // Security is handled at the session/codec layer during ZMTP
+        // handshake. The socket stores the configuration; the session
+        // uses it when negotiating the connection.
+        mechanism: SecurityMechanism = .null_mechanism,
+        // PLAIN credentials (client side)
+        plain_username: ?[]const u8 = null,
+        plain_password: ?[]const u8 = null,
+        // CURVE keys (32 bytes each). Zeroed = not set.
+        curve_public_key: [32]u8 = .{0} ** 32,
+        curve_secret_key: [32]u8 = .{0} ** 32,
+        curve_server_key: [32]u8 = .{0} ** 32,
+        // ZAP domain for authentication
+        zap_domain: ?[]const u8 = null,
+
+        // ---- Application Messages (DRAFT) ----
+        // ZMQ_HELLO_MSG: auto-sent to each new peer on connect.
+        hello_msg: ?[]const u8 = null,
+        // ZMQ_DISCONNECT_MSG: received locally when a peer disconnects.
+        disconnect_msg: ?[]const u8 = null,
+    };
+
+    pub const SecurityMechanism = enum {
+        null_mechanism,  // ZMQ_NULL — no auth
+        plain,           // ZMQ_PLAIN — username/password
+        curve,           // ZMQ_CURVE — CurveZMQ (libsodium)
     };
 
     pub fn init(self: *Socket, allocator: Allocator, pattern: Pattern) void {
@@ -2027,7 +2182,10 @@ pub const Socket = struct {
         return self.pattern.recv();
     }
 
-    /// Non-blocking readiness checks (equivalent to ZMQ_EVENTS)
+    /// Non-blocking readiness checks (equivalent to ZMQ_EVENTS).
+    /// Unlike libzmq, these are simple field reads — no side effects,
+    /// no process_commands() drain. State is always current because
+    /// pipe events fire callbacks directly.
     pub fn hasIn(self: *Socket) bool {
         return self.pattern.hasIn();
     }
@@ -2036,23 +2194,62 @@ pub const Socket = struct {
         return self.pattern.hasOut();
     }
 
+    /// Read-only getters (ZMQ_TYPE, ZMQ_RCVMORE, ZMQ_LAST_ENDPOINT)
+    pub fn socketType(self: *Socket) SocketType {
+        return @as(SocketType, self.pattern);
+    }
+
+    pub fn lastEndpoint(self: *Socket) ?[]const u8 {
+        return self.last_endpoint;
+    }
+
     /// Blocking send: parks coroutine until the socket can accept a message.
     /// Uses the persistent ReadySignal (not stack-allocated Waiters) to
     /// avoid the lifetime/UAF issues described in the Concurrency Model.
+    /// Respects options.send_timeout_ms: -1 = block forever, 0 = try once.
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
+        if (self.hasOut()) return try self.send(msg);
+        if (self.options.send_timeout_ms == 0) return error.Eagain;
+
         var gen = self.readiness_signal.currentGen();
-        while (true) {
-            if (self.hasOut()) return try self.send(msg);
-            gen = try self.readiness_signal.park(gen);
+        if (self.options.send_timeout_ms > 0) {
+            const timeout = Timeout.fromMilliseconds(
+                @intCast(self.options.send_timeout_ms),
+            );
+            while (true) {
+                gen = self.readiness_signal.parkTimeout(gen, timeout) catch
+                    return error.Eagain;
+                if (self.hasOut()) return try self.send(msg);
+            }
+        } else {
+            while (true) {
+                gen = try self.readiness_signal.park(gen);
+                if (self.hasOut()) return try self.send(msg);
+            }
         }
     }
 
     /// Blocking recv: parks coroutine until a message is available.
+    /// Respects options.recv_timeout_ms: -1 = block forever, 0 = try once.
     pub fn recvBlocking(self: *Socket) !Msg {
+        if (self.hasIn()) return try self.recv();
+        if (self.options.recv_timeout_ms == 0) return error.Eagain;
+
         var gen = self.readiness_signal.currentGen();
-        while (true) {
-            if (self.hasIn()) return try self.recv();
-            gen = try self.readiness_signal.park(gen);
+        if (self.options.recv_timeout_ms > 0) {
+            const timeout = Timeout.fromMilliseconds(
+                @intCast(self.options.recv_timeout_ms),
+            );
+            while (true) {
+                gen = self.readiness_signal.parkTimeout(gen, timeout) catch
+                    return error.Eagain;
+                if (self.hasIn()) return try self.recv();
+            }
+        } else {
+            while (true) {
+                gen = try self.readiness_signal.park(gen);
+                if (self.hasIn()) return try self.recv();
+            }
         }
     }
 
@@ -2116,6 +2313,101 @@ the mechanism that turns async pipe events into socket state changes. We
 don't need this because pipe events (readActivated, writeActivated,
 pipeTerminated) are delivered directly via callbacks or ReadySignal
 notifications. The socket's state is always current.
+
+#### libzmq Socket Option Coverage
+
+The table below maps every libzmq socket option to our equivalent. Options
+are grouped into: **Supported** (in Options struct or API), **Not Applicable**
+(our architecture eliminates the need), and **Future** (deferred but designed
+for). GSSAPI and niche transport options (VMCI, NORM, PGM/EPGM, WSS) are
+omitted — they can be added as separate transport modules without core changes.
+
+| libzmq Option | Ours | Notes |
+|---|---|---|
+| **Flow Control** | | |
+| `ZMQ_SNDHWM` | `options.hwm_send` | Default 1000 |
+| `ZMQ_RCVHWM` | `options.hwm_recv` | Default 1000 |
+| `ZMQ_MAXMSGSIZE` | `options.max_msg_size` | Enforced in Session.recvLoop |
+| `ZMQ_CONFLATE` | `options.conflate` | Pattern-level: keep only last msg |
+| `ZMQ_SNDBUF` | `options.sndbuf` | Applied via `applyTcpOptions` |
+| `ZMQ_RCVBUF` | `options.rcvbuf` | Applied via `applyTcpOptions` |
+| **Timeouts** | | |
+| `ZMQ_SNDTIMEO` | `options.send_timeout_ms` | Used in `sendBlocking` |
+| `ZMQ_RCVTIMEO` | `options.recv_timeout_ms` | Used in `recvBlocking` |
+| `ZMQ_LINGER` | `options.linger_ms` | Implemented in `close()` |
+| `ZMQ_CONNECT_TIMEOUT` | `options.connect_timeout_ms` | Session connect |
+| `ZMQ_HANDSHAKE_IVL` | `options.handshake_timeout_ms` | ZMTP handshake |
+| **Reconnection** | | |
+| `ZMQ_RECONNECT_IVL` | `options.reconnect_ivl_ms` | -1 = disable |
+| `ZMQ_RECONNECT_IVL_MAX` | `options.reconnect_ivl_max_ms` | 0 = no backoff |
+| **TCP Transport** | | |
+| `ZMQ_TCP_KEEPALIVE` | `options.tcp_keepalive` | Applied via `applyTcpOptions` |
+| `ZMQ_TCP_KEEPALIVE_IDLE` | `options.tcp_keepalive_idle` | |
+| `ZMQ_TCP_KEEPALIVE_CNT` | `options.tcp_keepalive_cnt` | |
+| `ZMQ_TCP_KEEPALIVE_INTVL` | `options.tcp_keepalive_intvl` | |
+| `ZMQ_TOS` | `options.tos` | IP_TOS / DSCP |
+| **Heartbeat (ZMTP 3.1)** | | |
+| `ZMQ_HEARTBEAT_IVL` | `options.heartbeat_ivl_ms` | Session timer |
+| `ZMQ_HEARTBEAT_TTL` | `options.heartbeat_ttl_ms` | Sent to peer |
+| `ZMQ_HEARTBEAT_TIMEOUT` | `options.heartbeat_timeout_ms` | Local timeout |
+| **Network** | | |
+| `ZMQ_IPV6` | `options.ipv6` | Dual-stack |
+| `ZMQ_BACKLOG` | `options.backlog` | `listen(2)` |
+| `ZMQ_IMMEDIATE` | `options.immediate` | Queue only to completed connections |
+| **Identity / Routing** | | |
+| `ZMQ_ROUTING_ID` | `options.routing_id` | 1-255 bytes |
+| `ZMQ_ROUTER_MANDATORY` | `options.router_mandatory` | Error vs silent drop |
+| `ZMQ_ROUTER_HANDOVER` | `options.router_handover` | Takeover on ID collision |
+| `ZMQ_PROBE_ROUTER` | `options.probe_router` | Empty msg on connect |
+| **REQ Options** | | |
+| `ZMQ_REQ_RELAXED` | `options.req_relaxed` | Skip strict alternation |
+| `ZMQ_REQ_CORRELATE` | `options.req_correlate` | Match replies to requests |
+| **PUB/SUB Options** | | |
+| `ZMQ_SUBSCRIBE` | `SubPattern.subscribe()` | Method, not option |
+| `ZMQ_UNSUBSCRIBE` | `SubPattern.unsubscribe()` | Method, not option |
+| `ZMQ_INVERT_MATCHING` | `options.invert_matching` | |
+| `ZMQ_XPUB_VERBOSE` | `options.xpub_verbose` | |
+| `ZMQ_XPUB_VERBOSER` | `options.xpub_verboser` | |
+| **Security** | | |
+| `ZMQ_MECHANISM` | `options.mechanism` | NULL/PLAIN/CURVE |
+| `ZMQ_PLAIN_USERNAME` | `options.plain_username` | |
+| `ZMQ_PLAIN_PASSWORD` | `options.plain_password` | |
+| `ZMQ_CURVE_PUBLICKEY` | `options.curve_public_key` | |
+| `ZMQ_CURVE_SECRETKEY` | `options.curve_secret_key` | |
+| `ZMQ_CURVE_SERVERKEY` | `options.curve_server_key` | |
+| `ZMQ_ZAP_DOMAIN` | `options.zap_domain` | |
+| **Application Messages** | | |
+| `ZMQ_HELLO_MSG` | `options.hello_msg` | Auto-sent on connect |
+| `ZMQ_DISCONNECT_MSG` | `options.disconnect_msg` | Local notification |
+| **Read-Only Getters** | | |
+| `ZMQ_TYPE` | `socket.socketType()` | From pattern tag |
+| `ZMQ_RCVMORE` | `msg.flags.more` | Direct field access |
+| `ZMQ_EVENTS` | `hasIn()` / `hasOut()` | No side effects (see note below) |
+| `ZMQ_LAST_ENDPOINT` | `socket.lastEndpoint()` | |
+| **Not Applicable** | | |
+| `ZMQ_FD` | — | No FDs; coroutine-native poll replaces OS poll |
+| `ZMQ_AFFINITY` | — | zio executors replace I/O thread affinity |
+| `ZMQ_THREAD_SAFE` | — | All sockets are coroutine-safe by design |
+| `ZMQ_BLOCKY` | — | No context-level global; linger is per-socket |
+| `ZMQ_IN_BATCH_SIZE` | — | Batching controlled by Session read buffer |
+| `ZMQ_OUT_BATCH_SIZE` | — | Batching controlled by writeBatch iovec |
+| `ZMQ_ROUTER_RAW` | — | Raw TCP is a separate transport, not a mode |
+| `ZMQ_TCP_ACCEPT_FILTER` | — | Deprecated in libzmq |
+| `ZMQ_IPC_FILTER_*` | — | Deprecated in libzmq |
+| `ZMQ_IPV4ONLY` | — | Deprecated alias for `!ZMQ_IPV6` |
+| **Future** | | |
+| `ZMQ_SOCKS_PROXY` | — | Requires SOCKS5 transport layer |
+| `ZMQ_CONNECT_ROUTING_ID` | — | Pre-assign routing ID on connect |
+| `ZMQ_XPUB_MANUAL` | — | Manual subscription management |
+| `ZMQ_XPUB_WELCOME_MSG` | — | Welcome message on subscribe |
+| `ZMQ_HICCUP_MSG` | — | Temporary disconnect notification |
+| `ZMQ_METADATA` | — | ZMTP handshake metadata |
+| `ZMQ_USE_FD` | — | Pre-allocated FD passthrough |
+| `ZMQ_STREAM_NOTIFY` | — | STREAM socket type not yet implemented |
+| `ZMQ_ROUTER_NOTIFY` | — | Connect/disconnect notifications |
+| `ZMQ_RECONNECT_STOP` | — | Conditional reconnect disable |
+| `ZMQ_TCP_MAXRT` | — | Max TCP retransmit timeout |
+| `ZMQ_BINDTODEVICE` | — | SO_BINDTODEVICE for VRF |
 
 ### Fair Queuing (`FairQueue`)
 
@@ -3008,13 +3300,18 @@ pub const RouterPattern = struct {
     prefetch: ?Msg = null,
     prefetch_pipe: ?*Pipe = null,
 
+    // ZMQ_ROUTER_MANDATORY: if true, return error on unknown routing ID
+    // instead of silently dropping.
+    mandatory: bool = false,
+
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator) RouterPattern {
+    pub fn init(allocator: Allocator, options: *const Socket.Options) RouterPattern {
         return .{
             .fq = FairQueue.init(allocator),
             .out_pipes = std.AutoHashMap(u32, *Pipe).init(allocator),
             .anonymous_pipes = std.AutoHashMap(*Pipe, void).init(allocator),
+            .mandatory = options.router_mandatory,
             .allocator = allocator,
         };
     }
@@ -3084,8 +3381,11 @@ pub const RouterPattern = struct {
             if (data.len != 4) return error.InvalidRoutingId;
             const routing_id = std.mem.readInt(u32, data[0..4], .little);
 
-            self.current_out = self.out_pipes.get(routing_id) orelse
-                return error.HostUnreachable;
+            self.current_out = self.out_pipes.get(routing_id) orelse {
+                // ZMQ_ROUTER_MANDATORY: error vs silent drop
+                if (self.mandatory) return error.HostUnreachable;
+                return;  // silently drop (libzmq default)
+            };
             self.more_out = true;
             return;  // Consumed routing ID frame
         }
