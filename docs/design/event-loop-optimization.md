@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v8)
+## Status: DESIGN PROPOSAL (v9)
 
 ## Context
 
@@ -1988,6 +1988,9 @@ pub const Socket = struct {
     // Lifecycle
     active: bool = true,
     allocator: Allocator,
+    executor: *zio.Executor,           // coroutine scheduler for spawning sessions
+    ctx: *Context,                      // context for inproc endpoint registry
+    last_endpoint: ?[]const u8 = null,  // ZMQ_LAST_ENDPOINT
 
     pub const Options = struct {
         // ---- Flow Control / HWM (ZMQ_SNDHWM, ZMQ_RCVHWM) ----
@@ -2109,14 +2112,164 @@ pub const Socket = struct {
         curve,           // ZMQ_CURVE — CurveZMQ (libsodium)
     };
 
-    pub fn init(self: *Socket, allocator: Allocator, pattern: Pattern) void {
+    pub fn init(
+        self: *Socket,
+        allocator: Allocator,
+        pattern: Pattern,
+        executor: *zio.Executor,
+        ctx: *Context,
+    ) void {
         self.* = .{
             .pipes = std.ArrayList(*Pipe).init(allocator),
             .pattern = pattern,
             .options = .{},
             .allocator = allocator,
+            .executor = executor,
+            .ctx = ctx,
         };
         self.readiness_signal = &self.own_readiness_signal;
+    }
+
+    // ----------------------------------------------------------
+    // Connect / Bind — the user-facing transport API
+    // ----------------------------------------------------------
+
+    /// Connect to a remote endpoint. Spawns a background coroutine
+    /// that manages the TCP session and reconnects on failure.
+    ///
+    /// In libzmq, zmq_connect() is async — it returns immediately and
+    /// the connection happens in a background I/O thread. We do the
+    /// same: spawn a coroutine on the executor that runs reconnectLoop.
+    /// Messages can be queued before the connection completes (unless
+    /// options.immediate is true).
+    pub fn connect(self: *Socket, endpoint: []const u8) !void {
+        const parsed = try parseEndpoint(endpoint);
+        switch (parsed.transport) {
+            .tcp => {
+                const addr = try zio.net.IpAddress.parse(
+                    parsed.address, parsed.port,
+                );
+                // Spawn reconnect loop as a coroutine on the executor.
+                // It will create pipe pairs, connect, and call attachPipe.
+                try self.executor.spawn(reconnectLoop, .{ self, addr });
+                self.last_endpoint = endpoint;
+            },
+            .ipc => {
+                const pipes = try pipePair(
+                    self.allocator, self.options.hwm_send, self.options.hwm_recv,
+                );
+                const session = try Transport.ipcConnect(
+                    self.allocator, parsed.address, pipes[1],
+                );
+                self.attachPipe(pipes[0], true);
+                try self.executor.spawn(Session.run, .{session});
+                self.last_endpoint = endpoint;
+            },
+            .inproc => {
+                // Inproc: look up the bound socket in the context's
+                // registry and connect pipe pairs directly — no session,
+                // no codec, no network. Just two pipes.
+                const peer = try self.ctx.findEndpoint(parsed.address);
+                const pipes = try pipePair(
+                    self.allocator, self.options.hwm_send, peer.options.hwm_recv,
+                );
+                self.attachPipe(pipes[0], true);
+                peer.attachPipe(pipes[1], false);
+                self.last_endpoint = endpoint;
+            },
+        }
+    }
+
+    /// Bind to a local endpoint. For TCP/IPC, starts listening and
+    /// spawns an accept loop that creates a new session coroutine
+    /// for each incoming connection.
+    ///
+    /// In libzmq, zmq_bind() starts a listener in a background I/O
+    /// thread. We spawn an accept-loop coroutine on the executor.
+    pub fn bind(self: *Socket, endpoint: []const u8) !void {
+        const parsed = try parseEndpoint(endpoint);
+        switch (parsed.transport) {
+            .tcp => {
+                const addr = try zio.net.IpAddress.parse(
+                    parsed.address, parsed.port,
+                );
+                var server = try addr.listen(.{
+                    .backlog = self.options.backlog,
+                });
+                // Spawn accept loop as a background coroutine.
+                try self.executor.spawn(acceptLoop, .{ self, &server });
+                // Resolve ephemeral port for ZMQ_LAST_ENDPOINT
+                self.last_endpoint = try server.getLocalEndpoint();
+            },
+            .ipc => {
+                var server = try zio.net.UnixAddress.init(parsed.address)
+                    .listen(.{ .backlog = self.options.backlog });
+                try self.executor.spawn(acceptLoop, .{ self, &server });
+                self.last_endpoint = endpoint;
+            },
+            .inproc => {
+                // Inproc: register this socket in the context's endpoint
+                // registry so that connect() can find it. No listener,
+                // no accept loop — connects happen synchronously.
+                try self.ctx.registerEndpoint(parsed.address, self);
+                self.last_endpoint = endpoint;
+            },
+        }
+    }
+
+    /// Accept loop: runs as a background coroutine, accepts incoming
+    /// connections, creates a pipe pair + session for each.
+    fn acceptLoop(self: *Socket, server: anytype) void {
+        while (self.active) {
+            const pipes = pipePair(
+                self.allocator, self.options.hwm_send, self.options.hwm_recv,
+            ) catch continue;
+
+            const session = Transport.tcpAccept(
+                self.allocator, server, pipes[1], &self.options,
+            ) catch continue;
+
+            self.attachPipe(pipes[0], false);
+
+            // Each accepted connection gets its own session coroutine.
+            self.executor.spawn(Session.run, .{session}) catch {
+                self.detachPipe(pipes[0]);
+                continue;
+            };
+        }
+    }
+
+    const TransportType = enum { tcp, ipc, inproc };
+
+    const ParsedEndpoint = struct {
+        transport: TransportType,
+        address: []const u8,
+        port: ?u16 = null,
+    };
+
+    fn parseEndpoint(endpoint: []const u8) !ParsedEndpoint {
+        if (std.mem.startsWith(u8, endpoint, "tcp://")) {
+            const rest = endpoint["tcp://".len..];
+            const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse
+                return error.InvalidEndpoint;
+            return .{
+                .transport = .tcp,
+                .address = rest[0..colon],
+                .port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch
+                    return error.InvalidEndpoint,
+            };
+        } else if (std.mem.startsWith(u8, endpoint, "ipc://")) {
+            return .{
+                .transport = .ipc,
+                .address = endpoint["ipc://".len..],
+            };
+        } else if (std.mem.startsWith(u8, endpoint, "inproc://")) {
+            return .{
+                .transport = .inproc,
+                .address = endpoint["inproc://".len..],
+            };
+        }
+        return error.InvalidEndpoint;
     }
 
     // ----------------------------------------------------------
