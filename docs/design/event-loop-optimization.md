@@ -61,10 +61,26 @@ This is a useful reference but too heavyweight for the pipe hot path
 
 ## Design: What We Build
 
-### Layer 1: Message (`Msg`)
+### Layer 1: Frame (`Msg`)
 
-The fundamental unit of data. Matches libzmq's `msg_t` semantics:
-small messages inline, large messages reference-counted, zero-copy handoff.
+The fundamental unit of data transfer. Despite the name `Msg` (inherited
+from libzmq's `msg_t` for familiarity), this struct represents a single
+**frame**, not a complete message. A ZMQ "message" is one or more frames
+linked by the `flags.more` bit — the application-level unit of delivery.
+
+We keep the name `Msg` rather than `Frame` because:
+1. Every libzmq API uses `zmq_msg_*` — users expect the name
+2. The pipe, queue, and session layers all traffic in `Msg` values
+3. Renaming would create a translation burden with no semantic gain
+
+But the mental model matters: HWM counts **frames** (Msg values in the
+pipe), not messages. Flush happens at **message boundaries** (`!more`).
+The pipe guarantees atomic delivery of complete multi-frame messages —
+if any frame of a message is written, all frames are delivered before
+any frame of the next message.
+
+Matches libzmq's `msg_t` semantics: small frames inline, large frames
+reference-counted, zero-copy handoff.
 
 ```zig
 pub const Msg = struct {
@@ -191,8 +207,8 @@ pub const Msg = struct {
 ```
 
 **Size**: Target is 64 bytes (one cache line), matching libzmq's msg_t.
-The `Data` union is 49 bytes (48 inline + 1 len for vsm), flags + routing_id
-+ tag + padding fill the rest. Enforced at compile time:
+The `Data` union is 49 bytes (48 inline + 1 len for vsm), flags +
+routing_id + tag + padding fill the rest. Enforced at compile time:
 
 ```zig
 comptime {
@@ -203,10 +219,11 @@ comptime {
 ```
 
 **Why this matches libzmq semantics**:
-- VSM (value small message): messages <= 48 bytes stored inline, zero allocation
-- LMSG: large messages heap-allocated with refcount, zero-copy on pipe transfer
+- VSM (value small message): frames <= 48 bytes stored inline, zero allocation
+- LMSG: large frames heap-allocated with refcount, zero-copy on pipe transfer
 - CMSG: external constant data, zero-copy reference
-- Multi-part: `flags.more` links frames into logical messages
+- Multi-part: `flags.more` links frames into logical messages (the
+  application-visible unit). A "message" is 1+ Msg values ending with `more=false`.
 - Move semantics: `msg.move()` transfers ownership without copy or refcount bump
 
 ### Layer 2: Queue (`YQueue`)
@@ -4512,7 +4529,7 @@ is the regime where most real-world applications live.
 2. **YQueue chunk allocator**: Same design — N-element chunks with one
    spare chunk recycled via atomic exchange. N=256 for messages.
 
-3. **Msg layout**: 64-byte cache-line-sized message with VSM/LMSG/CMSG
+3. **Msg layout**: 64-byte cache-line-sized frame with VSM/LMSG/CMSG
    variants, matching libzmq's msg_t semantics.
 
 4. **HWM/LWM backpressure**: Same algorithm — writer blocks at HWM,
