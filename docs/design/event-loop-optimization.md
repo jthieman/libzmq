@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v4)
+## Status: DESIGN PROPOSAL (v5)
 
 ## Context
 
@@ -505,7 +505,7 @@ pub const Pipe = struct {
     lwm: u32,
     msgs_read: u64 = 0,
     msgs_written: u64 = 0,
-    peers_msgs_read: u64 = 0,
+    peers_msgs_read: std.atomic.Value(u64) = .init(0),  // atomic: cross-thread
     next_activate_threshold: u64 = 0,
 
     // Activity flags
@@ -521,13 +521,14 @@ pub const Pipe = struct {
     // is attached to a socket/session on a specific executor.
     executor: *zio.Runtime.Executor = undefined,
 
-    // Waiter for the read side: parked task waiting for data.
-    // When flush() returns false, we wake this instead of going
-    // through a mailbox.
-    read_waiter: ?*Waiter = null,
+    // ReadySignal for the read side: persistent, pipe-owned.
+    // When flush() returns false, we notify this instead of going
+    // through a mailbox. See "Concurrency Model" section for why
+    // these must be pipe-owned (not stack-allocated Waiters).
+    read_signal: ReadySignal = .{},
 
-    // Waiter for the write side: parked task waiting for HWM space.
-    write_waiter: ?*Waiter = null,
+    // ReadySignal for the write side: parked task waiting for HWM space.
+    write_signal: ReadySignal = .{},
 
     // Adaptive spin calibration
     spin_count: u32 = initial_spin_count,
@@ -592,28 +593,20 @@ pub const Pipe = struct {
     }
 
     fn wakeReader(self: *Pipe) void {
-        const peer = self.peer;
-        if (peer.read_waiter) |waiter| {
-            // zio handles locality transparently:
-            // - Same executor → scheduleTaskLocal: plain queue push, ~3 instructions
-            // - Diff executor → scheduleTaskRemote: Treiber CAS + loop.wake()
-            //   (~250-500ns, but coalesced — multiple wakes = one syscall)
-            waiter.signal();
-        }
-        // If no waiter, reader isn't blocked — it will see data on
-        // next checkRead(). No notification needed.
+        // Notify the peer's persistent ReadySignal.
+        // Safe from any thread — ReadySignal is pipe-owned (heap lifetime),
+        // and AnyTask is executor-managed (heap lifetime).
+        // See "Concurrency Model" section for the full happens-before proof.
+        self.peer.read_signal.notify();
     }
 
     fn wakeWriter(self: *Pipe) void {
-        const peer = self.peer;
-        if (peer.write_waiter) |waiter| {
-            waiter.signal();
-        }
+        self.peer.write_signal.notify();
     }
 
     fn checkHwm(self: *const Pipe) bool {
         if (self.hwm == 0) return true;  // infinite
-        return (self.msgs_written - self.peers_msgs_read) < self.hwm;
+        return (self.msgs_written - self.peers_msgs_read.load(.acquire)) < self.hwm;
     }
 
     // -------------------------------------------------------
@@ -638,7 +631,7 @@ pub const Pipe = struct {
             // Threshold-based backpressure: comparison, not modulo (~1ns vs ~30ns)
             if (self.msgs_read >= self.next_activate_threshold) {
                 self.next_activate_threshold += self.lwm;
-                self.peer.peers_msgs_read = self.msgs_read;
+                self.peer.peers_msgs_read.store(self.msgs_read, .release);
                 if (!self.peer.out_active) {
                     self.peer.out_active = true;
                     self.wakeWriter();
@@ -670,13 +663,11 @@ pub const Pipe = struct {
     /// space available. Does NOT flush — caller must call flush()
     /// when ready (or use sendBlockingAndFlush for single-message case).
     pub fn sendBlocking(self: *Pipe, msg: *Msg) !void {
+        var gen = self.write_signal.currentGen();
         while (true) {
             if (try self.send(msg)) return;
-            // Park until writer is activated
-            var waiter = Waiter.init();
-            self.write_waiter = &waiter;
-            defer self.write_waiter = null;
-            try waiter.wait(1, .allow_cancel);
+            // Park until writer is activated (see Concurrency Model)
+            gen = try self.write_signal.park(gen);
         }
     }
 
@@ -715,19 +706,20 @@ pub const Pipe = struct {
             }
         }
 
-        // Spin exhausted, no data — park the coroutine.
+        // Spin exhausted, no data — park via ReadySignal.
         // Decrease spin count: spinning wasn't worthwhile.
         if (self.spin_count > min_spin_count) {
             self.spin_count -= self.spin_count / 8;
         }
 
-        var waiter = Waiter.init();
-        self.read_waiter = &waiter;
-        defer self.read_waiter = null;
-        try waiter.wait(1, .allow_cancel);
-
-        // Woken by writer's flush() → data must be available now
-        return self.recv().?;
+        // Snapshot generation BEFORE checking data (see Concurrency Model)
+        var gen = self.read_signal.currentGen();
+        while (true) {
+            if (self.in_pipe.checkRead()) return self.recv().?;
+            // Park with generation check (prevents missed wakeup)
+            gen = try self.read_signal.park(gen);
+            if (self.in_pipe.checkRead()) return self.recv().?;
+        }
     }
 };
 
@@ -3109,6 +3101,643 @@ Here is the complete flow of a TCP connection through all layers:
 
 ---
 
+
+## Concurrency Model: Happens-Before, Waiter Safety, Cancellation
+
+This section defines the formal concurrency rules for the entire design.
+Every cross-thread interaction in the system must be covered here; if it
+isn't, it's a bug.
+
+### The Waiter Lifetime Problem
+
+The Layer 4 Pipe design uses stack-allocated `Waiter` structs published
+to other threads via raw pointers:
+
+```zig
+// Reader (Layer 4 recvBlocking, as originally proposed):
+var waiter = Waiter.init();       // stack-allocated
+self.read_waiter = &waiter;       // publish raw pointer to shared field
+defer self.read_waiter = null;    // unpublish
+try waiter.wait(1, .allow_cancel);
+```
+
+```zig
+// Writer (Layer 4 wakeReader):
+fn wakeReader(self: *Pipe) void {
+    if (self.peer.read_waiter) |waiter| {
+        waiter.signal();  // dereferences raw pointer to reader's stack
+    }
+}
+```
+
+**This has a use-after-free race.**
+
+zio's `Waiter.signal()` accesses `self.mode.direct.task` and
+`self.mode.direct.notify.state` — fields stored inside the Waiter struct
+itself. If the Waiter is on the reader's stack, the writer's `signal()`
+dereferences a pointer into the reader's stack frame. The race:
+
+```
+Writer thread                    Reader thread
+─────────────                    ─────────────
+                                 var waiter = Waiter.init()
+                                 read_waiter = &waiter
+                                 waiter.wait(1, ...)
+                                 // ... woken by timeout/cancel ...
+                                 read_waiter = null
+                                 // function returns
+load read_waiter → &waiter       // stack frame freed
+waiter.signal()                  //
+  ↑ accesses freed memory        //
+  UAF → undefined behavior       //
+```
+
+The window between the writer loading the pointer and calling `signal()`
+is small (a few instructions), but **any race on memory lifetime is
+undefined behavior** — it doesn't matter how small the window is.
+
+The same race exists in the Layer 7 Socket for `readiness_waiter` in
+`Poller.poll()` and in `Socket.sendBlocking()`/`recvBlocking()`.
+
+### Solution: Persistent ReadySignal (Pipe-Owned, Heap-Lifetime)
+
+We replace stack-allocated `Waiter` pointers with a persistent
+`ReadySignal` struct owned by each Pipe endpoint. The ReadySignal
+has heap lifetime (same as the Pipe) and separates the signal state
+from the wake mechanism:
+
+```zig
+pub const ReadySignal = struct {
+    /// Monotonic generation counter. Incremented on every signal.
+    /// Persistent — lives as long as the Pipe. No lifetime issue.
+    generation: std.atomic.Value(u64) = .init(0),
+
+    /// Pointer to the parked coroutine's task struct.
+    /// The task struct is managed by zio's executor (heap-allocated
+    /// when the coroutine is spawned, freed when it completes).
+    /// Safe to access from any thread as long as the coroutine exists.
+    ///
+    /// null = nobody is parked. Non-null = a coroutine is waiting.
+    parked_task: std.atomic.Value(?*AnyTask) = .init(null),
+
+    // -------------------------------------------------------
+    // Writer side (called from producer coroutine/thread)
+    // -------------------------------------------------------
+
+    /// Notify the reader that new data is available.
+    /// Safe to call from any thread at any time.
+    pub fn notify(self: *ReadySignal) void {
+        // 1. Increment generation (release: makes prior writes visible)
+        _ = self.generation.fetchAdd(1, .release);
+
+        // 2. Load task pointer (acquire: sees reader's publication)
+        //    task.wake() is safe because:
+        //    - AnyTask is heap-allocated by zio runtime
+        //    - AnyTask lives until coroutine completes
+        //    - wake() does scheduleTask() which is thread-safe
+        if (self.parked_task.load(.acquire)) |task| {
+            task.wake();
+        }
+        // If null: reader isn't parked (either actively processing
+        // or hasn't parked yet). Either way, the generation bump
+        // ensures the reader sees data on its next check.
+    }
+
+    // -------------------------------------------------------
+    // Reader side (called from consumer coroutine)
+    // -------------------------------------------------------
+
+    /// Park the current coroutine until notify() is called.
+    /// Returns the new generation (caller uses it for next park).
+    ///
+    /// Protocol:
+    /// 1. Record last-seen generation
+    /// 2. Check for data (caller does this BEFORE calling park)
+    /// 3. Publish task pointer (announce "I'm about to sleep")
+    /// 4. Re-check generation (catch races — see happens-before)
+    /// 5. If generation changed: data arrived, return immediately
+    /// 6. Else: actually suspend coroutine
+    /// 7. On wake: unpublish task pointer, return
+    pub fn park(self: *ReadySignal, last_seen_gen: u64) !u64 {
+        const task = zio.runtime.getCurrentTask();
+
+        // Step 3: Publish intent to park (release: makes our
+        // "last_seen_gen" observation visible to the notifier)
+        self.parked_task.store(task, .release);
+
+        // Step 4: Re-check generation AFTER publishing task pointer.
+        // This is the critical double-check that prevents missed wakeups.
+        // (See happens-before Case 2 below.)
+        const current_gen = self.generation.load(.acquire);
+        if (current_gen != last_seen_gen) {
+            // Data arrived between caller's check and our publication.
+            // Unpublish and return without parking.
+            self.parked_task.store(null, .release);
+            return current_gen;
+        }
+
+        // Step 6: Actually suspend. When notify() calls task.wake(),
+        // the executor reschedules us and we resume here.
+        zio.runtime.suspendCurrentTask() catch |err| {
+            // Cancellation: unpublish before propagating
+            self.parked_task.store(null, .release);
+            return err;
+        };
+
+        // Step 7: Woken. Unpublish task pointer.
+        self.parked_task.store(null, .release);
+        return self.generation.load(.acquire);
+    }
+
+    /// Read the current generation without side effects.
+    pub fn currentGen(self: *ReadySignal) u64 {
+        return self.generation.load(.acquire);
+    }
+};
+```
+
+**Why this is safe:**
+
+1. **ReadySignal is a field of Pipe** (heap-allocated). Its lifetime equals
+   the Pipe's lifetime. `notify()` accesses `self.generation` and
+   `self.parked_task`, which are fields of this persistent struct — no stack
+   dependency.
+
+2. **`parked_task` points to `AnyTask`**, which is heap-allocated by zio's
+   runtime when the coroutine is spawned. It lives until the coroutine
+   completes and is freed by the runtime. `task.wake()` calls
+   `task.getExecutor().scheduleTask(task)`, which is safe from any thread
+   (Treiber stack push + `loop.wake()`).
+
+3. **Generation counter is persistent**. `notify()` always increments it,
+   regardless of whether anyone is parked. The counter never wraps in
+   practice (2^64 increments at 1GHz = 584 years).
+
+4. **No signal-after-free**: The notifier never accesses stack memory.
+   It accesses Pipe fields (heap) and AnyTask (heap). Both outlive any
+   individual send/recv call.
+
+### Updated Pipe Integration
+
+The Pipe struct from Layer 4 changes:
+
+```zig
+pub const Pipe = struct {
+    // ... existing fields ...
+
+    // REPLACE stack-allocated Waiter pointers with persistent ReadySignals
+    // OLD: read_waiter: ?*Waiter = null,
+    // OLD: write_waiter: ?*Waiter = null,
+    read_signal: ReadySignal = .{},
+    write_signal: ReadySignal = .{},
+
+    // --- Write path (unchanged except wakeReader) ---
+
+    pub fn flush(self: *Pipe) void {
+        if (!self.out_pipe.flush()) {
+            // Reader was sleeping (c was NULL). Notify.
+            self.peer.read_signal.notify();
+        }
+    }
+
+    fn wakeWriter(self: *Pipe) void {
+        self.peer.write_signal.notify();
+    }
+
+    // --- Blocking recv (rewritten with ReadySignal) ---
+
+    pub fn recvBlocking(self: *Pipe) !Msg {
+        // Fast path: data already available
+        if (self.recv()) |msg| return msg;
+
+        // Adaptive spin: check for data without parking
+        var spun: u32 = 0;
+        while (spun < self.spin_count) : (spun += 1) {
+            std.atomic.spinLoopHint();
+            if (self.in_pipe.checkRead()) {
+                self.spin_count = @min(
+                    self.spin_count + (self.spin_count / 4),
+                    max_spin_count,
+                );
+                return self.recv().?;
+            }
+        }
+
+        // Spin exhausted — park via ReadySignal
+        if (self.spin_count > min_spin_count) {
+            self.spin_count -= self.spin_count / 8;
+        }
+
+        // Snapshot generation BEFORE checking data
+        var gen = self.read_signal.currentGen();
+        while (true) {
+            // Check again (may have arrived during spin wind-down)
+            if (self.in_pipe.checkRead()) return self.recv().?;
+
+            // Park with generation check (prevents missed wakeup)
+            gen = try self.read_signal.park(gen);
+
+            // Woken — check for data
+            if (self.in_pipe.checkRead()) return self.recv().?;
+            // Spurious wake (generation bumped but data consumed
+            // by another path) — re-park
+        }
+    }
+
+    // --- Blocking send (rewritten with ReadySignal) ---
+
+    pub fn sendBlocking(self: *Pipe, msg: *Msg) !void {
+        var gen = self.write_signal.currentGen();
+        while (true) {
+            if (try self.send(msg)) return;
+            gen = try self.write_signal.park(gen);
+        }
+    }
+};
+```
+
+### Updated Poller Integration
+
+The Socket-level Poller from Layer 7 changes similarly. Instead of
+publishing a stack-allocated Waiter to multiple sockets, each Socket
+owns a persistent `ReadySignal` that the Poller taps into:
+
+```zig
+pub const Socket = struct {
+    // REPLACE: readiness_waiter: ?*Waiter = null,
+    readiness_signal: ReadySignal = .{},
+
+    fn signalReadiness(self: *Socket) void {
+        self.readiness_signal.notify();
+    }
+
+    pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
+        var gen = self.readiness_signal.currentGen();
+        while (true) {
+            if (self.hasOut()) return try self.send(msg);
+            gen = try self.readiness_signal.park(gen);
+        }
+    }
+
+    pub fn recvBlocking(self: *Socket) !Msg {
+        var gen = self.readiness_signal.currentGen();
+        while (true) {
+            if (self.hasIn()) return try self.recv();
+            gen = try self.readiness_signal.park(gen);
+        }
+    }
+};
+```
+
+For multi-socket polling, we use a `MultiSignal` that wraps multiple
+ReadySignals with a shared counter:
+
+```zig
+pub const Poller = struct {
+    pub const Item = struct {
+        socket: *Socket,
+        events: Events,
+        revents: Events = .{},
+    };
+
+    pub const Events = packed struct(u8) {
+        pollin: bool = false,
+        pollout: bool = false,
+        _pad: u6 = 0,
+    };
+
+    /// Multi-socket poll using generation-based wakeup.
+    ///
+    /// The trick: we temporarily install a shared ReadySignal on each
+    /// socket. When ANY socket changes readiness, it bumps the shared
+    /// generation, waking the poller. This avoids per-socket Waiter
+    /// publication entirely.
+    pub fn poll(items: []Item, timeout_ms: i64) !u32 {
+        // Phase 1: non-blocking check
+        var ready = checkAll(items);
+        if (ready > 0 or timeout_ms == 0) return ready;
+
+        // Phase 2: create a shared multi-signal
+        // This is heap-allocated (or arena-allocated) because it's
+        // published to multiple sockets across potentially different
+        // executors. Using a shared signal avoids N separate wakeups.
+        var shared = ReadySignal{};
+
+        // Install shared signal on all sockets.
+        // Save originals to restore after.
+        var originals: [64]ReadySignal = undefined;
+        for (items, 0..) |*item, i| {
+            originals[i] = item.socket.readiness_signal;
+            item.socket.readiness_signal = shared;
+        }
+        defer {
+            for (items, 0..) |*item, i| {
+                item.socket.readiness_signal = originals[i];
+            }
+        }
+
+        // Phase 3: re-check after installing (prevents missed wakeup)
+        ready = checkAll(items);
+        if (ready > 0) return ready;
+
+        // Phase 4: park on the shared signal
+        const gen = shared.currentGen();
+        if (timeout_ms > 0) {
+            // Timed wait
+            const ns: u64 = @intCast(timeout_ms * std.time.ns_per_ms);
+            _ = shared.parkTimeout(gen, ns) catch {};
+        } else {
+            _ = try shared.park(gen);
+        }
+
+        // Phase 5: re-check all sockets
+        return checkAll(items);
+    }
+
+    fn checkAll(items: []Item) u32 {
+        var ready: u32 = 0;
+        for (items) |*item| {
+            item.revents = .{};
+            if (item.events.pollin and item.socket.hasIn())
+                item.revents.pollin = true;
+            if (item.events.pollout and item.socket.hasOut())
+                item.revents.pollout = true;
+            if (@as(u8, @bitCast(item.revents)) != 0) ready += 1;
+        }
+        return ready;
+    }
+};
+```
+
+### Happens-Before Analysis
+
+Every cross-thread data transfer in the system must be justified by a
+happens-before chain. There are exactly four interacting paths:
+
+#### Path 1: Data Send (Writer → Reader via YPipe)
+
+```
+Writer thread                    Reader thread
+─────────────                    ─────────────
+W1: write msg to ypipe slot
+    (plain store to queue array)
+W2: ypipe.flush()
+    CAS(c, w, f) [acq_rel]      R1: ypipe.checkRead()
+                                     CAS(c, front, null) [acq_rel]
+                                 R2: ypipe.read() → msg
+                                     (plain load from queue array)
+```
+
+**Happens-before chain**: W2's `acq_rel` CAS on `c` synchronizes-with
+R1's `acq_rel` CAS on `c`. Therefore W1 (write to queue) happens-before
+R2 (read from queue). The message data is correctly visible.
+
+This is identical to libzmq's ypipe protocol. The CAS on `c` is the
+single synchronization point.
+
+#### Path 2: Backpressure (Reader → Writer via Pipe Counters)
+
+```
+Reader thread                    Writer thread
+─────────────                    ─────────────
+R1: msgs_read += 1
+R2: peer.peers_msgs_read =
+      self.msgs_read
+    [plain store]                W1: load peers_msgs_read
+                                     [plain load]
+R3: write_signal.notify()        W2: check HWM
+    generation.fetchAdd
+    [release]
+    load parked_task [acquire]
+    task.wake()
+```
+
+**Issue**: R2 is a plain store and W1 is a plain load — no synchronization
+between them. This is a **data race on `peers_msgs_read`**.
+
+**Fix**: `peers_msgs_read` must be an atomic:
+
+```zig
+peers_msgs_read: std.atomic.Value(u64) = .init(0),
+
+// Reader updates:
+self.peer.peers_msgs_read.store(self.msgs_read, .release);
+
+// Writer checks:
+const peer_read = self.peers_msgs_read.load(.acquire);
+return (self.msgs_written - peer_read) < self.hwm;
+```
+
+After fix: R2's `release` store synchronizes-with W1's `acquire` load.
+R1 (msgs_read update) happens-before W2 (HWM check).
+
+**Notification chain** (when writer was blocked on HWM):
+
+R3's `generation.fetchAdd(.release)` happens-before the writer's
+`generation.load(.acquire)` inside `park()`. R2 (store peers_msgs_read
+with release) happens-before R3 (release on generation), which
+happens-before writer's park-return (acquire on generation). So the
+writer sees the updated `peers_msgs_read` after waking.
+
+#### Path 3: ReadySignal (notify → park protocol)
+
+There are four sub-cases. All must be correct.
+
+**Case A: notify() before park() — fast path**
+
+```
+Writer                           Reader
+──────                           ──────
+                                 R1: check data → none
+N1: write data to ypipe          R2: gen = currentGen() → G
+N2: flush() → CAS on c
+N3: notify():
+    generation: G → G+1
+    [fetchAdd, release]
+    load parked_task → null      R3: re-check data → still none(?)
+    [acquire]                    R4: park(G):
+    // no wake (null)                store task [release]
+                                     load generation [acquire] → G+1
+                                     G+1 ≠ G → return immediately!
+```
+
+**Correctness**: R4 loads generation (acquire) and sees G+1 (written by
+N3 with release). N2's flush (acq_rel CAS on `c`) happened before N3
+(program order, same thread). R4's generation load (acquire)
+synchronizes-with N3's fetchAdd (release). Therefore N2 (flush)
+happens-before R4 (return from park). Reader's subsequent `checkRead()`
+will see the flushed data.
+
+**Case B: park() before notify() — wake path**
+
+```
+Writer                           Reader
+──────                           ──────
+                                 R1: check data → none
+                                 R2: gen = currentGen() → G
+                                 R3: park(G):
+                                     store task [release]
+                                     load generation [acquire] → G
+                                     G == G → actually suspend
+N1: write data to ypipe
+N2: flush() → CAS on c
+N3: notify():
+    generation: G → G+1
+    [fetchAdd, release]
+    load parked_task → task
+    [acquire]
+    task.wake()                  R4: resume from suspend
+                                     store null to parked_task [release]
+                                     return G+1
+                                 R5: checkRead() → data!
+```
+
+**Correctness**: R3's `store task [release]` happens-before N3's
+`load parked_task [acquire]` (release-acquire on `parked_task`).
+N2's flush (acq_rel) happened before N3 (program order). N3's
+`fetchAdd [release]` on generation happens-before R4's wakeup (the
+executor's scheduling provides the acquire barrier — `scheduleTaskRemote`
+uses a Treiber stack push with release, the executor's drain uses acquire).
+Therefore N2 (flush) happens-before R5 (checkRead).
+
+**Case C: notify() races with park() setup — no park needed**
+
+```
+Writer                           Reader
+──────                           ──────
+                                 R1: check data → none
+                                 R2: gen = currentGen() → G
+N1: write data + flush
+N2: notify():                   R3: park(G):
+    generation: G → G+1              store task [release]
+    [fetchAdd, release]
+    load parked_task → task
+    [acquire]
+    task.wake()                      load generation [acquire] → G+1
+                                     G+1 ≠ G → return immediately
+                                     store null [release]
+```
+
+**Correctness**: N2's `fetchAdd [release]` synchronizes-with R3's
+`load generation [acquire]`. The reader sees G+1, returns without
+parking. N1's flush happened-before N2 (program order), so data is
+visible when reader subsequently calls `checkRead()`.
+
+The `task.wake()` call is harmless — it schedules the task, but the
+task is already running (it returned from `park()` immediately). The
+extra schedule is a no-op: the task is either already on the ready
+queue, or it gets re-added (zio's scheduler handles this — re-adding
+a running task is idempotent).
+
+**Case D: notify() while reader is in spin phase**
+
+```
+Writer                           Reader
+──────                           ──────
+                                 R1: recv() → null
+                                 R2: adaptive spin...
+N1: write data + flush                spinLoopHint()
+    flush returns true ← c was       checkRead() → true!
+    not null (reader was              (spin catches data)
+    spinning, not parked)             return recv().?
+```
+
+**Correctness**: flush() returns true because `c != NULL` (reader set it
+to NULL via the checkRead CAS, but the CAS failed because the writer's
+flush CAS already updated `c`). The reader's `checkRead()` CAS on `c`
+provides the acquire barrier that makes the flushed data visible.
+
+No ReadySignal involved — this is pure YPipe protocol.
+
+### Cancellation Rules
+
+A coroutine can be cancelled while parked inside `ReadySignal.park()`.
+The cancellation rules are:
+
+1. **Cancellation during park()**: `suspendCurrentTask()` returns
+   `error.Canceled`. The reader stores `null` to `parked_task` and
+   propagates the error. The writer may call `task.wake()` on the
+   cancelled task — this is safe because:
+   - The task struct lives until the coroutine completes
+   - `wake()` on a cancelled task is handled by the executor
+   - The reader will re-check data or propagate cancellation
+
+2. **Cancellation during spin**: No special handling needed. The spin
+   loop checks for data, not for cancellation. If the coroutine is
+   cancelled during spin, the cancellation will be delivered when the
+   next `suspendCurrentTask()` call happens (in `park()`).
+
+3. **Cancellation during send/recv**: If `recvBlocking()` or
+   `sendBlocking()` is cancelled, the error propagates to the caller.
+   No partial state is left in the Pipe — the ReadySignal is always
+   unpublished (parked_task = null) on exit, whether normal or cancelled.
+
+4. **Socket close during park**: When `Socket.close()` terminates a pipe,
+   the pipe's delimiter sentinel eventually wakes the parked coroutine
+   (via the YPipe flush → ReadySignal notify path). The coroutine wakes,
+   reads the delimiter, and the pipe transitions to terminated state.
+
+### Memory Ordering Summary
+
+Every atomic operation in the system and its required ordering:
+
+| Field | Operation | Ordering | Justification |
+|-------|-----------|----------|---------------|
+| `YPipe.c` | CAS (flush) | `acq_rel` | Makes queue writes visible to reader |
+| `YPipe.c` | CAS (checkRead) | `acq_rel` | Sees writer's flush, publishes NULL for sleep |
+| `YPipe.c` | store (flush, CAS failed) | `release` | Makes queue writes visible after notify |
+| `ReadySignal.generation` | fetchAdd (notify) | `release` | Makes prior data operations visible |
+| `ReadySignal.generation` | load (park) | `acquire` | Sees notifier's prior data operations |
+| `ReadySignal.parked_task` | store (park) | `release` | Publishes task pointer for notifier |
+| `ReadySignal.parked_task` | load (notify) | `acquire` | Sees reader's task publication |
+| `ReadySignal.parked_task` | store null (unpublish) | `release` | Makes unpublish visible to future notifiers |
+| `Pipe.peers_msgs_read` | store (reader) | `release` | Makes read count visible to writer |
+| `Pipe.peers_msgs_read` | load (writer) | `acquire` | Sees reader's updated count |
+| `YQueue.spare_chunk` | swap (push/pop) | `acquire`/`release` | Chunk recycling between reader/writer |
+| `Msg.Content.refcount` | fetchAdd (copy) | `monotonic` | Refcount increment (no ordering needed) |
+| `Msg.Content.refcount` | fetchSub (release) | `release` + fence | Last decrement sees all prior uses |
+| `Pipe.state` | store (terminate) | `release` | Makes state transition visible |
+| `Pipe.state` | load (processDelimiter) | `acquire` | Sees peer's state transition |
+
+### No Relaxed Loads on Shared Mutable State
+
+A deliberate design rule: **we never use `monotonic`/`relaxed` ordering
+on fields that participate in cross-thread signaling protocols.** The
+only `monotonic` operation is `Content.refcount.fetchAdd` (which only
+needs atomicity, not ordering, because the last releaser uses `release` +
+`acquire` fence).
+
+This means we leave some performance on the table (an `acquire` load is
+~0-1ns more than a `relaxed` load on x86, and ~2-5ns more on ARM).
+The payoff is that **every cross-thread read sees a consistent snapshot
+of the data it depends on**, and the correctness argument doesn't require
+reasoning about which relaxed loads can be reordered past which stores.
+
+### What About the `read_parked` Flag? (Why We Don't Need One)
+
+An earlier design iteration used an explicit `read_parked: atomic(bool)`
+flag to gate notify signals (only signal if reader is parked). We removed
+it because:
+
+1. **The generation counter subsumes it.** If the reader isn't parked,
+   `parked_task` is null, and `notify()` just bumps the generation.
+   The reader sees the bumped generation on its next `park()` call and
+   returns immediately — no actual suspension.
+
+2. **No signal accumulation.** Without a parked flag, `notify()` might
+   call `task.wake()` on a task that's already running. This is safe
+   (executor handles it) but wasteful. However, this only happens when
+   the reader is in the narrow window between publishing `parked_task`
+   and actually suspending — a window of ~2 instructions. In practice,
+   double-wake is extremely rare.
+
+3. **One fewer atomic operation on the hot path.** Removing the parked
+   flag eliminates one atomic store (reader) and one atomic load (writer)
+   per blocking recv. The generation check inside `park()` catches all
+   cases the parked flag would have caught.
+
+---
+
 ## Comparison: libzmq vs This Design
 
 ### Hot Path Operations (per-message costs)
@@ -3117,7 +3746,7 @@ Here is the complete flow of a TCP connection through all layers:
 |---|---|---|
 | Write msg to pipe | ypipe::write + push (~10ns) | YPipe.write + push (~10ns) |
 | Flush (CAS) | ypipe::flush CAS per msg (~20ns) | YPipe.flush CAS per batch (~20ns / N) |
-| Notify sleeping reader | signaler.send() ~1000ns syscall | waiter.signal() ~8ns atomic |
+| Notify sleeping reader | signaler.send() ~1000ns syscall | ReadySignal.notify() ~8ns atomic |
 | | + mailbox mutex ~30ns | + Treiber push ~15ns |
 | | + mailbox ypipe write ~10ns | + loop.wake() ~200-500ns (coalesced) |
 | | + mailbox ypipe flush ~20ns | |
@@ -3126,7 +3755,7 @@ Here is the complete flow of a TCP connection through all layers:
 | Read msg from pipe | ypipe::read + checkRead (~25ns) | YPipe.read (~5ns array read) |
 | | (CAS on every checkRead) | (CAS only at chunk boundary, 1/256) |
 | Backpressure check | msgs_read % lwm ~30ns (modulo) | msgs_read >= threshold ~1ns |
-| Backpressure notify | mailbox.send() ~1500ns | waiter.signal() ~8ns |
+| Backpressure notify | mailbox.send() ~1500ns | ReadySignal.notify() ~8ns |
 | Command throttle | RDTSC ~100ns or tick count | Not needed (no command path) |
 | Adaptive spin | N/A (reader blocks immediately) | ~0.3ns/iter (PAUSE instruction) |
 
@@ -3148,12 +3777,13 @@ is the regime where most real-world applications live.
 
 ### What We Eliminate
 
-1. **Signaler** (eventfd/pipe): Replaced by zio's `Waiter.signal()` which
-   uses the executor's existing notification path (Treiber stack +
-   `loop.wake()` with fetchOr coalescing).
+1. **Signaler** (eventfd/pipe): Replaced by persistent `ReadySignal` with
+   atomic generation counter + `task.wake()`. Uses the executor's existing
+   notification path (Treiber stack + `loop.wake()` with fetchOr coalescing).
+   See "Concurrency Model" section for the happens-before proof.
 
 2. **Mailbox** (mutex + SPSC ypipe + signaler): Eliminated entirely.
-   `activate_read` and `activate_write` are direct `waiter.signal()` calls.
+   `activate_read` and `activate_write` are direct `ReadySignal.notify()`.
    No command serialization, no command routing, no TID-based dispatch.
 
 3. **Command system** (`object_t::send_command` → `ctx_t::send_command` →
