@@ -2021,7 +2021,8 @@ pub const Socket = struct {
     // poll()'s swap. See Concurrency Model for the Dekker drain protocol.
     readiness_signal: std.atomic.Value(*ReadySignal) = .init(undefined),
     own_readiness_signal: ReadySignal = .{},
-    in_flight_notifies: std.atomic.Value(u32) = .init(0),
+    notify_enter: std.atomic.Value(u32) = .init(0),
+    notify_leave: std.atomic.Value(u32) = .init(0),
 
     // Monitor event channel (null if no monitor attached)
     monitor: ?*MonitorChannel = null,
@@ -2423,12 +2424,13 @@ pub const Socket = struct {
     }
 
     fn signalReadiness(self: *Socket) void {
-        // Dekker protocol: increment in_flight_notifies BEFORE loading
-        // the signal pointer (pairs with drain in Poller.poll).
-        _ = self.in_flight_notifies.fetchAdd(1, .monotonic);
+        // Dekker protocol: enter BEFORE loading the signal pointer
+        // (pairs with drain in Poller.poll). Enter/leave counters
+        // prevent livelock under sustained notification traffic.
+        _ = self.notify_enter.fetchAdd(1, .monotonic);
         @fence(.seq_cst);
         self.readiness_signal.load(.acquire).notify();
-        _ = self.in_flight_notifies.fetchSub(1, .release);
+        _ = self.notify_leave.fetchAdd(1, .release);
     }
 
     // ----------------------------------------------------------
@@ -2471,6 +2473,10 @@ pub const Socket = struct {
     ///
     /// Uses an absolute deadline so spurious wakeups and re-checks
     /// don't extend the total wait beyond the requested timeout.
+    ///
+    /// Error handling: parkTimeout can return error.Canceled (task
+    /// cancellation via zio) or error.Timeout. Cancellation propagates
+    /// to the caller; only genuine timeout/deadline-expired maps to Eagain.
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
         if (self.hasOut()) return try self.send(msg);
         if (self.options.send_timeout_ms == 0) return error.Eagain;
@@ -2491,8 +2497,10 @@ pub const Socket = struct {
             while (true) {
                 const remaining = deadline.remaining() orelse
                     return error.Eagain;
-                gen = signal.parkTimeout(gen, remaining) catch
-                    return error.Eagain;
+                gen = signal.parkTimeout(gen, remaining) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return error.Eagain,
+                };
                 if (self.hasOut()) return try self.send(msg);
             }
         } else {
@@ -2519,8 +2527,10 @@ pub const Socket = struct {
             while (true) {
                 const remaining = deadline.remaining() orelse
                     return error.Eagain;
-                gen = signal.parkTimeout(gen, remaining) catch
-                    return error.Eagain;
+                gen = signal.parkTimeout(gen, remaining) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return error.Eagain,
+                };
                 if (self.hasIn()) return try self.recv();
             }
         } else {
@@ -2571,6 +2581,8 @@ pub const Socket = struct {
             );
             while (self.pipes.items.len > 0) {
                 const remaining = deadline.remaining() orelse break;
+                // catch-all is intentional: during close(), both timeout
+                // and cancellation should fall through to force-terminate.
                 gen = signal.parkTimeout(gen, remaining) catch break;
             }
             // Force-terminate any pipes that didn't finish in time
@@ -3989,14 +4001,18 @@ pub const ReadySignal = struct {
     /// null = nobody is parked. Non-null = a coroutine is waiting.
     parked_task: std.atomic.Value(?*AnyTask) = .init(null),
 
-    /// In-flight wake counter. Tracks how many notify() calls are
-    /// currently between loading parked_task and completing task.wake().
+    /// In-flight wake tracking. Uses monotonic enter/leave counters
+    /// instead of a single up/down counter. This prevents livelock:
+    /// unpublishAndDrain() only waits for notifies that entered BEFORE
+    /// the unpublish, not for new ones that arrive after (which are safe
+    /// because they'll see parked_task == null).
     ///
-    /// Prevents use-after-free: park() drains this counter before
+    /// Prevents use-after-free: park() drains pre-cutover notifies before
     /// returning, ensuring no concurrent notify() is still holding
     /// a stale task pointer. This is the "drain-before-destroy"
     /// pattern from zio's Waiter (common.zig:119-127).
-    in_flight_wakes: std.atomic.Value(u32) = .init(0),
+    wake_enter: std.atomic.Value(u32) = .init(0),
+    wake_leave: std.atomic.Value(u32) = .init(0),
 
     // -------------------------------------------------------
     // Writer side (called from producer coroutine/thread)
@@ -4006,26 +4022,31 @@ pub const ReadySignal = struct {
     /// Safe to call from any thread at any time.
     ///
     /// Drain protocol (Dekker-style, prevents UAF on task pointer):
-    ///   notify:  fetchAdd(in_flight_wakes) → fence(seq_cst) → load(parked_task)
-    ///   park:    store(parked_task, null)   → fence(seq_cst) → drain(in_flight_wakes)
+    ///   notify:  fetchAdd(wake_enter) → fence(seq_cst) → load(parked_task) → ... → fetchAdd(wake_leave)
+    ///   park:    store(parked_task, null) → fence(seq_cst) → snapshot = load(wake_enter) → spin until wake_leave >= snapshot
     ///
     /// The seq_cst fences create a total order, guaranteeing at least one
     /// side sees the other's store. If notify loaded a non-null task,
-    /// in_flight_wakes > 0. If the drain sees 0, notify either loaded null
-    /// (safe) or has already completed its wake() call (safe).
+    /// wake_enter was already incremented. If the drain sees
+    /// wake_leave >= snapshot, all pre-cutover notifies have completed.
+    ///
+    /// Unlike a single up/down counter, this cannot livelock: new notifies
+    /// arriving after unpublish increment wake_enter past the snapshot but
+    /// will see parked_task == null (safe), and their wake_leave increments
+    /// only help the drain converge faster.
     pub fn notify(self: *ReadySignal) void {
         // 1. Increment generation (release: makes prior writes visible)
         _ = self.generation.fetchAdd(1, .release);
 
         // 2. Enter in-flight region BEFORE loading the task pointer.
         //    This is the first half of the Dekker handshake.
-        _ = self.in_flight_wakes.fetchAdd(1, .monotonic);
+        _ = self.wake_enter.fetchAdd(1, .monotonic);
         @fence(.seq_cst);
 
         // 3. Load task pointer. If non-null, wake it.
         //    task.wake() is safe because:
         //    - We're inside the in-flight region (park won't return
-        //      while in_flight_wakes > 0)
+        //      until wake_leave catches up to the snapshot)
         //    - AnyTask is heap-allocated by zio runtime
         //    - wake() on an already-running task (.ready) is a no-op
         //      (scheduleTask swaps .ready → .ready, returns immediately)
@@ -4033,9 +4054,9 @@ pub const ReadySignal = struct {
             task.wake();
         }
 
-        // 4. Exit in-flight region (release: makes wake() visible
+        // 4. Leave in-flight region (release: makes wake() visible
         //    to the draining park() call)
-        _ = self.in_flight_wakes.fetchSub(1, .release);
+        _ = self.wake_leave.fetchAdd(1, .release);
 
         // If null: reader isn't parked (either actively processing
         // or hasn't parked yet). Either way, the generation bump
@@ -4121,23 +4142,34 @@ pub const ReadySignal = struct {
         return self.generation.load(.acquire);
     }
 
-    /// Unpublish the task pointer and drain in-flight wakes.
+    /// Unpublish the task pointer and drain pre-cutover in-flight wakes.
     ///
     /// Dekker-style handshake with notify():
-    ///   park:    store(parked_task, null) → fence(seq_cst) → drain(in_flight_wakes)
-    ///   notify:  fetchAdd(in_flight_wakes) → fence(seq_cst) → load(parked_task)
+    ///   park:    store(parked_task, null) → fence(seq_cst) → snapshot(wake_enter) → spin(wake_leave >= snapshot)
+    ///   notify:  fetchAdd(wake_enter) → fence(seq_cst) → load(parked_task) → ... → fetchAdd(wake_leave)
     ///
     /// The seq_cst fences create a total order. Either:
     /// (a) notify sees null → doesn't call wake() → safe, OR
-    /// (b) notify loaded our task → in_flight_wakes > 0 → we spin until
-    ///     notify completes wake() and decrements → safe.
+    /// (b) notify loaded our task → its wake_enter was counted in
+    ///     our snapshot → we spin until its wake_leave catches up → safe.
     ///
-    /// The drain spin is bounded: notify() does at most one wake() call
-    /// (a few hundred nanoseconds), so the spin is extremely short.
+    /// No livelock: we only wait for notifies that entered before our
+    /// snapshot. New notifies after unpublish see null and are harmless —
+    /// their wake_enter/leave increments only help convergence.
+    ///
+    /// The spin is bounded by the number of pre-cutover notifies, each
+    /// of which does at most one wake() call (~hundreds of nanoseconds).
     fn unpublishAndDrain(self: *ReadySignal) void {
         self.parked_task.store(null, .release);
         @fence(.seq_cst);
-        while (self.in_flight_wakes.load(.acquire) != 0) {
+
+        // Snapshot: how many notifies entered before we unpublished.
+        // Thanks to the seq_cst fences, any notify that entered before
+        // our store(null) is included in this snapshot.
+        const cutover = self.wake_enter.load(.acquire);
+
+        // Wait only for those pre-cutover notifies to leave.
+        while (self.wake_leave.load(.acquire) != cutover) {
             std.atomic.spinLoopHint();
         }
     }
@@ -4222,23 +4254,23 @@ pub const ReadySignal = struct {
 /// passes the full original timeout to parkTimeout, allowing the total
 /// wait to exceed the requested duration on spurious wakeups.
 ///
-/// Uses zio's monotonic clock (ev.Loop.now / std.time.Timer) to avoid
+/// Uses zio.Timestamp.now(.monotonic) — monotonic clock, immune to
 /// wall-clock jumps from NTP/settimeofday.
 const Deadline = struct {
-    deadline_ns: u64,
+    target: zio.Timestamp,
 
     pub fn init(timeout_ms: u64) Deadline {
-        const now = zio.time.monotonicNow();
+        const now = zio.Timestamp.now(.monotonic);
         return .{
-            .deadline_ns = now + timeout_ms * std.time.ns_per_ms,
+            .target = now.addDuration(zio.Duration.fromMilliseconds(timeout_ms)),
         };
     }
 
     /// Returns remaining time as a Timeout, or null if expired.
     pub fn remaining(self: Deadline) ?Timeout {
-        const now = zio.time.monotonicNow();
-        if (now >= self.deadline_ns) return null;
-        return Timeout.fromNanoseconds(self.deadline_ns - now);
+        const now = zio.Timestamp.now(.monotonic);
+        if (now.value >= self.target.value) return null;
+        return Timeout.fromDuration(now.durationTo(self.target));
     }
 };
 ```
@@ -4251,14 +4283,16 @@ const Deadline = struct {
    of this persistent struct — no stack dependency.
 
 2. **`parked_task` is protected by the drain protocol.** `notify()` brackets
-   its access to the task pointer inside `in_flight_wakes` (increment before
-   load, decrement after wake). `park()` calls `unpublishAndDrain()` which
-   stores null then spins until `in_flight_wakes == 0`. The seq_cst fences
-   in both paths form a Dekker-style handshake: either notify() sees null
-   (no wake), or park() sees `in_flight_wakes > 0` (waits for wake to
-   complete). This mirrors zio's Waiter drain pattern (common.zig:119-127)
-   where `waiter.wait(1, .no_cancel)` drains in-flight signals before the
-   stack-allocated Waiter is destroyed.
+   its access to the task pointer inside `wake_enter`/`wake_leave` (enter
+   before load, leave after wake). `park()` calls `unpublishAndDrain()` which
+   stores null, then snapshots `wake_enter` and spins until `wake_leave`
+   catches up. The seq_cst fences in both paths form a Dekker-style handshake:
+   either notify() sees null (no wake), or park() sees the enter count and
+   waits for the corresponding leave. This cannot livelock: new notifies
+   arriving after unpublish see null and are harmless — their enter/leave
+   only help convergence. This mirrors zio's Waiter drain pattern
+   (common.zig:119-127) where `waiter.wait(1, .no_cancel)` drains in-flight
+   signals before the stack-allocated Waiter is destroyed.
 
 3. **AnyTask lifetime vs. wake() safety.** Even without the drain, calling
    `task.wake()` on a *running* task (state `.ready`) is safe — zio's
@@ -4375,14 +4409,15 @@ pub const Socket = struct {
     readiness_signal: std.atomic.Value(*ReadySignal) = .init(undefined),
     own_readiness_signal: ReadySignal = .{},
 
-    // In-flight signalReadiness() counter. Used by Poller to drain
-    // concurrent notifiers before returning from poll() and destroying
-    // the stack-local shared signal.
+    // In-flight signalReadiness() tracking. Uses monotonic enter/leave
+    // counters (same pattern as ReadySignal.wake_enter/wake_leave) to
+    // prevent livelock under sustained notification traffic.
     //
-    // Dekker protocol (same pattern as ReadySignal.in_flight_wakes):
-    //   signalReadiness: fetchAdd(in_flight_notifies) → fence(seq_cst) → load(readiness_signal)
-    //   poll unsubscribe: store(readiness_signal, original) → fence(seq_cst) → drain(in_flight_notifies)
-    in_flight_notifies: std.atomic.Value(u32) = .init(0),
+    // Dekker protocol:
+    //   signalReadiness: fetchAdd(notify_enter) → fence(seq_cst) → load(readiness_signal) → ... → fetchAdd(notify_leave)
+    //   poll unsubscribe: store(readiness_signal, original) → fence(seq_cst) → snapshot(notify_enter) → spin(notify_leave >= snapshot)
+    notify_enter: std.atomic.Value(u32) = .init(0),
+    notify_leave: std.atomic.Value(u32) = .init(0),
 
     pub fn init(self: *Socket) void {
         // ... other initialization ...
@@ -4394,11 +4429,15 @@ pub const Socket = struct {
     /// Uses the Dekker drain protocol so Poller.poll() can safely
     /// swap the signal pointer and know when all in-flight notifies
     /// have completed (preventing UAF on the stack-local shared signal).
+    ///
+    /// Enter/leave counters prevent livelock: poll() only drains
+    /// notifies that entered before the pointer was restored, not
+    /// new ones (which safely see the restored pointer).
     fn signalReadiness(self: *Socket) void {
-        _ = self.in_flight_notifies.fetchAdd(1, .monotonic);
+        _ = self.notify_enter.fetchAdd(1, .monotonic);
         @fence(.seq_cst);
         self.readiness_signal.load(.acquire).notify();
-        _ = self.in_flight_notifies.fetchSub(1, .release);
+        _ = self.notify_leave.fetchAdd(1, .release);
     }
 
     pub fn sendBlocking(self: *Socket, msg: *Msg) !void {
@@ -4426,8 +4465,10 @@ signal. During `poll()`, we temporarily redirect each socket's pointer
 to a shared signal, so any socket's `signalReadiness()` wakes the poller.
 
 The shared signal is stack-local (owned by the poll() call frame).
-This is safe because poll() drains all in-flight `signalReadiness()`
-calls before returning, using the Dekker protocol on `in_flight_notifies`.
+This is safe because poll() drains all pre-cutover `signalReadiness()`
+calls before returning, using the Dekker enter/leave protocol on
+`notify_enter`/`notify_leave`. This cannot livelock under sustained
+notification traffic because only pre-restore notifies are waited on.
 
 ```zig
 pub const Poller = struct {
@@ -4493,11 +4534,13 @@ pub const Poller = struct {
             // any signalReadiness() that loaded &shared has finished.
             @fence(.seq_cst);
 
-            // Drain: wait for all in-flight signalReadiness() calls.
-            // After this loop, no concurrent thread holds &shared —
-            // the stack-local signal can safely go out of scope.
+            // Drain: snapshot each socket's notify_enter, then wait for
+            // notify_leave to catch up. Only pre-restore notifies are
+            // waited on — new ones see the restored pointer and are safe.
+            // This cannot livelock under sustained notification traffic.
             for (items) |*item| {
-                while (item.socket.in_flight_notifies.load(.acquire) != 0) {
+                const cutover = item.socket.notify_enter.load(.acquire);
+                while (item.socket.notify_leave.load(.acquire) != cutover) {
                     std.atomic.spinLoopHint();
                 }
             }
@@ -4510,8 +4553,13 @@ pub const Poller = struct {
         // Phase 4: park on the shared signal
         const gen = shared.currentGen();
         if (timeout_ms > 0) {
-            // Timed wait — uses Timeout.fromMilliseconds (zio time.zig)
-            _ = shared.parkTimeout(gen, Timeout.fromMilliseconds(@intCast(timeout_ms))) catch {};
+            // Timed wait. catch-all is correct here: poll() returns the
+            // check result regardless of whether park ended by timeout,
+            // cancellation, or real notification — all fall through to
+            // the final checkAll(). This matches zmq_poll semantics.
+            _ = shared.parkTimeout(gen, Timeout.fromDuration(
+                zio.Duration.fromMilliseconds(@intCast(timeout_ms)),
+            )) catch {};
         } else {
             // Infinite wait (timeout_ms == -1)
             _ = try shared.park(gen);
