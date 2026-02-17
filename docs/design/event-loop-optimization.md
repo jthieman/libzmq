@@ -2142,6 +2142,13 @@ pub const Socket = struct {
     /// same: spawn a coroutine on the executor that runs reconnectLoop.
     /// Messages can be queued before the connection completes (unless
     /// options.immediate is true).
+    /// Connect to a remote endpoint. Always non-blocking — returns
+    /// immediately. The actual TCP/IPC connect happens in a background
+    /// coroutine (matching libzmq's zmq_connect semantics).
+    ///
+    /// Messages can be queued before the connection completes (unless
+    /// options.immediate is true, which delays pipe attachment until
+    /// the ZMTP handshake finishes).
     pub fn connect(self: *Socket, endpoint: []const u8) !void {
         const parsed = try parseEndpoint(endpoint);
         switch (parsed.transport) {
@@ -2151,24 +2158,26 @@ pub const Socket = struct {
                 );
                 // Spawn reconnect loop as a coroutine on the executor.
                 // It will create pipe pairs, connect, and call attachPipe.
+                // Non-blocking: the connect() syscall happens in the coroutine.
                 try self.executor.spawn(reconnectLoop, .{ self, addr });
                 self.last_endpoint = endpoint;
             },
             .ipc => {
-                const pipes = try pipePair(
-                    self.allocator, self.options.hwm_send, self.options.hwm_recv,
-                );
-                const session = try Transport.ipcConnect(
-                    self.allocator, parsed.address, pipes[1],
-                );
-                self.attachPipe(pipes[0], true);
-                try self.executor.spawn(Session.run, .{session});
+                // Same pattern as TCP: spawn a background coroutine for
+                // the connect() syscall. Unix domain connect can block
+                // (backlog full, slow peer). reconnectLoop handles IPC
+                // via Transport.ipcConnect + reconnect on failure.
+                try self.executor.spawn(ipcReconnectLoop, .{
+                    self, parsed.address,
+                });
                 self.last_endpoint = endpoint;
             },
             .inproc => {
                 // Inproc: look up the bound socket in the context's
                 // registry and connect pipe pairs directly — no session,
                 // no codec, no network. Just two pipes.
+                // Synchronous by design: the pipes must be connected
+                // atomically so both sides can send immediately.
                 const peer = try self.ctx.findEndpoint(parsed.address);
                 const pipes = try pipePair(
                     self.allocator, self.options.hwm_send, peer.options.hwm_recv,
@@ -2180,12 +2189,14 @@ pub const Socket = struct {
         }
     }
 
-    /// Bind to a local endpoint. For TCP/IPC, starts listening and
-    /// spawns an accept loop that creates a new session coroutine
-    /// for each incoming connection.
+    /// Bind to a local endpoint. The listen() syscall (socket + bind +
+    /// listen) happens synchronously — this is fast and non-blocking
+    /// (no network round-trip, just kernel bookkeeping). The expensive
+    /// part (accepting connections) runs in a spawned coroutine.
     ///
-    /// In libzmq, zmq_bind() starts a listener in a background I/O
-    /// thread. We spawn an accept-loop coroutine on the executor.
+    /// This matches libzmq: zmq_bind() does the listen synchronously
+    /// and returns the resolved endpoint (including ephemeral port).
+    /// The accept loop runs in a background I/O thread / coroutine.
     pub fn bind(self: *Socket, endpoint: []const u8) !void {
         const parsed = try parseEndpoint(endpoint);
         switch (parsed.transport) {
@@ -2236,6 +2247,40 @@ pub const Socket = struct {
                 self.detachPipe(pipes[0]);
                 continue;
             };
+        }
+    }
+
+    /// IPC reconnect loop — same structure as TCP reconnectLoop but
+    /// for Unix domain sockets. Runs as a background coroutine.
+    fn ipcReconnectLoop(self: *Socket, path: []const u8) void {
+        const opts = self.options;
+        if (opts.reconnect_ivl_ms < 0) return;
+
+        const base_ivl: u64 = @intCast(opts.reconnect_ivl_ms);
+        const max_ivl: u64 = if (opts.reconnect_ivl_max_ms > 0)
+            @intCast(opts.reconnect_ivl_max_ms)
+        else
+            base_ivl;
+        var backoff: u64 = base_ivl;
+
+        while (self.active) {
+            const pipes = pipePair(
+                self.allocator, opts.hwm_send, opts.hwm_recv,
+            ) catch continue;
+
+            const session = Transport.ipcConnect(
+                self.allocator, path, pipes[1],
+            ) catch {
+                zio.time.sleep(backoff * std.time.ns_per_ms);
+                backoff = @min(backoff * 2, max_ivl);
+                continue;
+            };
+
+            backoff = base_ivl;
+            self.attachPipe(pipes[0], true);
+            session.run() catch {};
+            self.detachPipe(pipes[0]);
+            session.stream.close();
         }
     }
 
