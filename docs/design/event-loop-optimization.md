@@ -1,6 +1,6 @@
 # ZMQ Pipe Implementation on Zig + zio
 
-## Status: DESIGN PROPOSAL (v5)
+## Status: DESIGN PROPOSAL (v6)
 
 ## Context
 
@@ -1709,12 +1709,15 @@ pub fn recv(self: *Pipe) ?Msg {
         return null;  // No user-visible message
     }
 
-    // Normal message — update backpressure counters (unchanged from Layer 4)
+    // Normal message — update backpressure counters.
+    // NOTE: peers_msgs_read is atomic (release/acquire) because it is
+    // read by the writer on a different thread. See "Concurrency Model"
+    // Path 2 for the happens-before proof.
     if (!msg.flags.more) {
         self.msgs_read += 1;
         if (self.msgs_read >= self.next_activate_threshold) {
             self.next_activate_threshold += self.lwm;
-            self.peer.peers_msgs_read = self.msgs_read;
+            self.peer.peers_msgs_read.store(self.msgs_read, .release);
             if (!self.peer.out_active) {
                 self.peer.out_active = true;
                 self.wakeWriter();
@@ -3210,43 +3213,134 @@ pub const ReadySignal = struct {
     /// Park the current coroutine until notify() is called.
     /// Returns the new generation (caller uses it for next park).
     ///
-    /// Protocol:
-    /// 1. Record last-seen generation
-    /// 2. Check for data (caller does this BEFORE calling park)
-    /// 3. Publish task pointer (announce "I'm about to sleep")
+    /// Protocol — mirrors zio's preparing_to_wait → waiting handshake:
+    ///
+    /// 1. Caller checks for data and snapshots generation BEFORE calling park
+    /// 2. Publish task pointer (announce "I'm about to sleep")
+    /// 3. Set task state to .preparing_to_wait (release: the handshake entry)
     /// 4. Re-check generation (catch races — see happens-before)
-    /// 5. If generation changed: data arrived, return immediately
-    /// 6. Else: actually suspend coroutine
-    /// 7. On wake: unpublish task pointer, return
+    /// 5. If generation changed: abort park, set state back to .ready, return
+    /// 6. Else: yield(.park). The executor's processCleanup() will CAS
+    ///    .preparing_to_wait → .waiting. If notify()'s task.wake() already
+    ///    swapped state to .ready, the CAS fails and the executor
+    ///    reschedules the task immediately (never truly parked — no lost wake).
+    /// 7. On resume: unpublish task pointer, return new generation.
+    ///
+    /// This is the same double-check pattern used by zio's common.zig
+    /// waitTask(): the .preparing_to_wait state is a reservation that
+    /// allows scheduleTask() to detect and prevent lost wakes.
     pub fn park(self: *ReadySignal, last_seen_gen: u64) !u64 {
         const task = zio.runtime.getCurrentTask();
 
-        // Step 3: Publish intent to park (release: makes our
+        // Step 2: Publish task pointer (release: makes our
         // "last_seen_gen" observation visible to the notifier)
         self.parked_task.store(task, .release);
 
-        // Step 4: Re-check generation AFTER publishing task pointer.
-        // This is the critical double-check that prevents missed wakeups.
+        // Step 3: Enter the preparing_to_wait state.
+        // This is the KEY integration with zio's scheduler:
+        // - scheduleTask() (called by notify → task.wake()) does
+        //   state.swap(.ready, .acq_rel).
+        // - If it sees .preparing_to_wait, it returns immediately —
+        //   the yield below will see .ready and skip parking.
+        // - If it sees .waiting, it schedules the task to run.
+        // - processCleanup() does CAS(.preparing_to_wait → .waiting).
+        //   If CAS fails (state already .ready), it reschedules locally.
+        task.state.store(.preparing_to_wait, .release);
+
+        // Step 4: Re-check generation AFTER publishing task pointer
+        // AND entering preparing_to_wait. This is the critical double-
+        // check that prevents missed wakeups.
         // (See happens-before Case 2 below.)
         const current_gen = self.generation.load(.acquire);
         if (current_gen != last_seen_gen) {
             // Data arrived between caller's check and our publication.
-            // Unpublish and return without parking.
+            // Abort park: restore state and unpublish.
+            task.state.store(.ready, .release);
             self.parked_task.store(null, .release);
             return current_gen;
         }
 
-        // Step 6: Actually suspend. When notify() calls task.wake(),
-        // the executor reschedules us and we resume here.
-        zio.runtime.suspendCurrentTask() catch |err| {
+        // Step 6: Yield to the executor. The executor's processCleanup
+        // will CAS our state from .preparing_to_wait → .waiting.
+        // If notify()'s task.wake() already swapped us to .ready
+        // (between step 3 and now), the CAS fails and processCleanup
+        // reschedules us immediately — we never actually park.
+        //
+        // .allow_cancel: if the task is cancelled while parked,
+        // yield returns error.Canceled.
+        task.yield(.park, .allow_cancel) catch |err| {
             // Cancellation: unpublish before propagating
             self.parked_task.store(null, .release);
             return err;
         };
 
-        // Step 7: Woken. Unpublish task pointer.
+        // Step 7: Woken (or immediately rescheduled). Unpublish.
         self.parked_task.store(null, .release);
         return self.generation.load(.acquire);
+    }
+
+    /// Park with a timeout. Same handshake as park(), but registers an
+    /// ev.Timer with the executor's event loop. If the timer fires before
+    /// notify(), the timer callback calls self.notify(), which bumps the
+    /// generation and wakes the parked task — same path as a real wakeup.
+    ///
+    /// The race between timer-fire and notify() is safe: whichever calls
+    /// task.wake() second sees `.ready` in scheduleTask()'s state.swap
+    /// and returns immediately (no double-enqueue).
+    ///
+    /// Returns the current generation on wake (whether by notify or timeout).
+    /// The caller must re-check its readiness condition to distinguish
+    /// "real data arrived" from "timeout expired" — this function does not
+    /// distinguish them (same as zio's Waiter.timedWait pattern).
+    ///
+    /// Modeled after zio's Waiter.timedWait (common.zig:153-168):
+    ///   ev.Timer + callback → signal() → wake task,
+    ///   defer loop.clearTimer() on exit.
+    pub fn parkTimeout(self: *ReadySignal, last_seen_gen: u64, timeout: Timeout) !u64 {
+        if (timeout == .none) {
+            return self.park(last_seen_gen);
+        }
+
+        const task = zio.runtime.getCurrentTask();
+
+        // Set up a timer whose callback calls self.notify().
+        // When the timer fires, notify() bumps generation and wakes
+        // the parked task — identical to a real data-ready notification.
+        // This mirrors Waiter.timedWait's timer + callback pattern.
+        var timer: ev.Timer = .init(timeout);
+        timer.c.userdata = self;
+        timer.c.callback = timerCallback;
+
+        task.getExecutor().loop.setTimer(&timer, timeout);
+        defer timer.c.loop.?.clearTimer(&timer);
+
+        // Same handshake as park():
+        self.parked_task.store(task, .release);
+        task.state.store(.preparing_to_wait, .release);
+
+        const current_gen = self.generation.load(.acquire);
+        if (current_gen != last_seen_gen) {
+            task.state.store(.ready, .release);
+            self.parked_task.store(null, .release);
+            return current_gen;
+        }
+
+        // Yield — either notify() or the timer callback will wake us.
+        task.yield(.park, .allow_cancel) catch |err| {
+            self.parked_task.store(null, .release);
+            return err;
+        };
+
+        self.parked_task.store(null, .release);
+        return self.generation.load(.acquire);
+    }
+
+    /// Timer callback for parkTimeout. Called by the event loop when
+    /// the timeout expires. Calls notify() to bump generation and wake
+    /// the parked task. Mirrors zio's Waiter.callback (common.zig:219).
+    fn timerCallback(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *ReadySignal = @ptrCast(@alignCast(c.userdata.?));
+        self.notify();
     }
 
     /// Read the current generation without side effects.
@@ -3364,8 +3458,18 @@ owns a persistent `ReadySignal` that the Poller taps into:
 
 ```zig
 pub const Socket = struct {
-    // REPLACE: readiness_waiter: ?*Waiter = null,
-    readiness_signal: ReadySignal = .{},
+    // Pointer to the active ReadySignal.
+    // Normally points to self.own_readiness_signal (embedded, heap-lifetime).
+    // During Poller.poll(), temporarily redirected to a shared signal.
+    // Using a pointer (not inline value) ensures that Poller's swap
+    // actually shares one signal across all subscribed sockets.
+    readiness_signal: *ReadySignal = undefined,  // set in init()
+    own_readiness_signal: ReadySignal = .{},
+
+    pub fn init(self: *Socket) void {
+        // ... other initialization ...
+        self.readiness_signal = &self.own_readiness_signal;
+    }
 
     fn signalReadiness(self: *Socket) void {
         self.readiness_signal.notify();
@@ -3389,8 +3493,11 @@ pub const Socket = struct {
 };
 ```
 
-For multi-socket polling, we use a `MultiSignal` that wraps multiple
-ReadySignals with a shared counter:
+For multi-socket polling, we use a pointer-based shared signal.
+Each Socket has a `readiness_signal: *ReadySignal` pointer (not an
+inline value). Normally this points to the socket's own embedded signal.
+During `poll()`, we temporarily redirect each socket's pointer to a
+shared signal, so any socket's `signalReadiness()` wakes the poller.
 
 ```zig
 pub const Poller = struct {
@@ -3408,49 +3515,69 @@ pub const Poller = struct {
 
     /// Multi-socket poll using generation-based wakeup.
     ///
-    /// The trick: we temporarily install a shared ReadySignal on each
-    /// socket. When ANY socket changes readiness, it bumps the shared
-    /// generation, waking the poller. This avoids per-socket Waiter
-    /// publication entirely.
+    /// Protocol — subscribe/unsubscribe via pointer swap:
+    ///
+    /// 1. Create a stack-local ReadySignal ("shared").
+    ///    (Stack-local is safe here because the Poller owns the entire
+    ///    lifetime: we block until poll returns, and we unsubscribe
+    ///    every socket before returning. No dangling pointer is possible.)
+    ///
+    /// 2. For each socket: swap its readiness_signal pointer to &shared.
+    ///    Save the original pointer for restoration.
+    ///
+    /// 3. Re-check all sockets AFTER subscribing (prevents missed wakeup
+    ///    between phase-1 check and subscription).
+    ///
+    /// 4. Park on the shared signal. Any socket's pipe flush will call
+    ///    socket.signalReadiness() → shared.notify() → poller wakes.
+    ///
+    /// 5. Restore every socket's original signal pointer (unsubscribe).
+    ///    This MUST happen before returning, even on error/cancellation.
     pub fn poll(items: []Item, timeout_ms: i64) !u32 {
-        // Phase 1: non-blocking check
+        // Phase 1: non-blocking check (no subscription needed)
         var ready = checkAll(items);
         if (ready > 0 or timeout_ms == 0) return ready;
 
-        // Phase 2: create a shared multi-signal
-        // This is heap-allocated (or arena-allocated) because it's
-        // published to multiple sockets across potentially different
-        // executors. Using a shared signal avoids N separate wakeups.
+        // Phase 2: create shared signal and subscribe all sockets.
+        // Dynamically allocate the originals array to support any
+        // number of sockets (no hard cap).
         var shared = ReadySignal{};
+        const allocator = std.heap.page_allocator;  // or arena
+        const originals = try allocator.alloc(*ReadySignal, items.len);
+        defer allocator.free(originals);
 
-        // Install shared signal on all sockets.
-        // Save originals to restore after.
-        var originals: [64]ReadySignal = undefined;
         for (items, 0..) |*item, i| {
             originals[i] = item.socket.readiness_signal;
-            item.socket.readiness_signal = shared;
+            // Pointer swap: socket now notifies our shared signal.
+            // This is safe because:
+            // - We hold the poller's coroutine (won't return until phase 5)
+            // - Socket.signalReadiness() just calls signal.notify()
+            // - notify() only accesses fields of the pointed-to ReadySignal
+            item.socket.readiness_signal = &shared;
         }
         defer {
+            // Phase 5: unsubscribe — restore original signal pointers.
+            // This runs even if park() returns error (cancellation).
             for (items, 0..) |*item, i| {
                 item.socket.readiness_signal = originals[i];
             }
         }
 
-        // Phase 3: re-check after installing (prevents missed wakeup)
+        // Phase 3: re-check after subscribing (prevents missed wakeup)
         ready = checkAll(items);
         if (ready > 0) return ready;
 
         // Phase 4: park on the shared signal
         const gen = shared.currentGen();
         if (timeout_ms > 0) {
-            // Timed wait
-            const ns: u64 = @intCast(timeout_ms * std.time.ns_per_ms);
-            _ = shared.parkTimeout(gen, ns) catch {};
+            // Timed wait — uses Timeout.fromMilliseconds (zio time.zig)
+            _ = shared.parkTimeout(gen, Timeout.fromMilliseconds(@intCast(timeout_ms))) catch {};
         } else {
+            // Infinite wait (timeout_ms == -1)
             _ = try shared.park(gen);
         }
 
-        // Phase 5: re-check all sockets
+        // Phase 5 (deferred): restore signal pointers
         return checkAll(items);
     }
 
@@ -3557,8 +3684,12 @@ N3: notify():
     load parked_task → null      R3: re-check data → still none(?)
     [acquire]                    R4: park(G):
     // no wake (null)                store task [release]
+                                     state → .preparing_to_wait [release]
                                      load generation [acquire] → G+1
-                                     G+1 ≠ G → return immediately!
+                                     G+1 ≠ G → abort park:
+                                       state → .ready [release]
+                                       store null [release]
+                                       return G+1
 ```
 
 **Correctness**: R4 loads generation (acquire) and sees G+1 (written by
@@ -3577,8 +3708,12 @@ Writer                           Reader
                                  R2: gen = currentGen() → G
                                  R3: park(G):
                                      store task [release]
+                                     state → .preparing_to_wait [release]
                                      load generation [acquire] → G
-                                     G == G → actually suspend
+                                     G == G → yield(.park)
+                                     processCleanup: CAS
+                                       .preparing_to_wait → .waiting
+                                     (task is now suspended)
 N1: write data to ypipe
 N2: flush() → CAS on c
 N3: notify():
@@ -3586,7 +3721,9 @@ N3: notify():
     [fetchAdd, release]
     load parked_task → task
     [acquire]
-    task.wake()                  R4: resume from suspend
+    task.wake():
+      state.swap(.ready) [acq_rel]
+      (old = .waiting → enqueue)  R4: resume from yield
                                      store null to parked_task [release]
                                      return G+1
                                  R5: checkRead() → data!
@@ -3598,6 +3735,8 @@ N2's flush (acq_rel) happened before N3 (program order). N3's
 `fetchAdd [release]` on generation happens-before R4's wakeup (the
 executor's scheduling provides the acquire barrier — `scheduleTaskRemote`
 uses a Treiber stack push with release, the executor's drain uses acquire).
+N3's `task.wake()` does `state.swap(.ready, .acq_rel)`, which sees
+`.waiting` (set by `processCleanup`'s CAS) and enqueues the task.
 Therefore N2 (flush) happens-before R5 (checkRead).
 
 **Case C: notify() races with park() setup — no park needed**
@@ -3610,12 +3749,14 @@ Writer                           Reader
 N1: write data + flush
 N2: notify():                   R3: park(G):
     generation: G → G+1              store task [release]
-    [fetchAdd, release]
+    [fetchAdd, release]              state → .preparing_to_wait [release]
     load parked_task → task
     [acquire]
-    task.wake()                      load generation [acquire] → G+1
-                                     G+1 ≠ G → return immediately
-                                     store null [release]
+    task.wake():                     load generation [acquire] → G+1
+      state.swap(.ready) [acq_rel]   G+1 ≠ G → abort park:
+      (old = .preparing_to_wait        state → .ready [release]
+       → return, no enqueue)           store null to parked_task [release]
+                                       return G+1
 ```
 
 **Correctness**: N2's `fetchAdd [release]` synchronizes-with R3's
@@ -3623,11 +3764,45 @@ N2: notify():                   R3: park(G):
 parking. N1's flush happened-before N2 (program order), so data is
 visible when reader subsequently calls `checkRead()`.
 
-The `task.wake()` call is harmless — it schedules the task, but the
-task is already running (it returned from `park()` immediately). The
-extra schedule is a no-op: the task is either already on the ready
-queue, or it gets re-added (zio's scheduler handles this — re-adding
-a running task is idempotent).
+The `task.wake()` call in this scenario is safe, but the reason is
+precise — not a blanket "wake is idempotent" claim.
+
+**Why this specific wake is safe — `scheduleTask()` state machine:**
+
+`task.wake()` calls `executor.scheduleTask(task)`, which does
+`task.state.swap(.ready, .acq_rel)`. The previous state determines
+the outcome:
+
+| Previous state | What happens | Safe? |
+|---|---|---|
+| `.preparing_to_wait` | Returns immediately. `processCleanup()` sees `.ready`, reschedules locally. | Yes — task never parks |
+| `.waiting` | Enqueues task to ready queue. | Yes — normal wake |
+| `.ready` | Swap is a no-op (already `.ready`). Returns without enqueuing. | Yes — deduped |
+| `.finished` | **Panic** — task already completed. | **Unsafe** |
+
+In Case C, the reader has stored `.preparing_to_wait` but has not yet
+called `task.yield(.park)`. The `scheduleTask()` swap sees
+`.preparing_to_wait` and swaps it to `.ready`, then returns immediately
+(no enqueue needed). When the reader subsequently calls `yield(.park)`,
+the executor's `processCleanup` CAS from `.preparing_to_wait` →
+`.waiting` **fails** (state is already `.ready`), so `processCleanup`
+calls `scheduleTaskLocal()` and the task runs immediately — no
+actual suspension, no double-enqueue, no panic.
+
+**The critical safety invariant**: `parked_task` is set to non-null
+**only while the owning coroutine is alive** (between `park()` entry
+and `park()` exit). The coroutine cannot reach `.finished` state
+while `parked_task` is non-null, because:
+
+1. `park()` always stores `null` to `parked_task` before returning
+   (both normal and error paths, enforced by the code structure above).
+2. Only the owning coroutine calls `park()`, so `parked_task` is
+   non-null → coroutine is inside `park()` → coroutine is alive →
+   task state is `.ready`, `.preparing_to_wait`, or `.waiting`.
+3. Therefore `scheduleTask()` will never see `.finished` when called
+   from `notify()` via a non-null `parked_task` load.
+
+This rules out the dangerous case (wake-after-finish panic).
 
 **Case D: notify() while reader is in spin phase**
 
@@ -3654,18 +3829,19 @@ No ReadySignal involved — this is pure YPipe protocol.
 A coroutine can be cancelled while parked inside `ReadySignal.park()`.
 The cancellation rules are:
 
-1. **Cancellation during park()**: `suspendCurrentTask()` returns
-   `error.Canceled`. The reader stores `null` to `parked_task` and
-   propagates the error. The writer may call `task.wake()` on the
+1. **Cancellation during park()**: `task.yield(.park, .allow_cancel)`
+   returns `error.Canceled`. The reader stores `null` to `parked_task`
+   and propagates the error. The writer may call `task.wake()` on the
    cancelled task — this is safe because:
    - The task struct lives until the coroutine completes
-   - `wake()` on a cancelled task is handled by the executor
+   - `scheduleTask()` on a cancelled-but-alive task is handled by the
+     executor (state swap to `.ready` is safe in any pre-`.finished` state)
    - The reader will re-check data or propagate cancellation
 
 2. **Cancellation during spin**: No special handling needed. The spin
    loop checks for data, not for cancellation. If the coroutine is
    cancelled during spin, the cancellation will be delivered when the
-   next `suspendCurrentTask()` call happens (in `park()`).
+   next `task.yield(.park, .allow_cancel)` call happens (in `park()`).
 
 3. **Cancellation during send/recv**: If `recvBlocking()` or
    `sendBlocking()` is cancelled, the error propagates to the caller.
@@ -3726,10 +3902,13 @@ it because:
 
 2. **No signal accumulation.** Without a parked flag, `notify()` might
    call `task.wake()` on a task that's already running. This is safe
-   (executor handles it) but wasteful. However, this only happens when
-   the reader is in the narrow window between publishing `parked_task`
-   and actually suspending — a window of ~2 instructions. In practice,
-   double-wake is extremely rare.
+   because `scheduleTask()` does `state.swap(.ready, .acq_rel)`: if
+   the task is already in `.ready` state, the swap is a no-op and the
+   task is not double-enqueued (see the `scheduleTask()` state table
+   in the Case C analysis above). This only happens when the reader is
+   in the narrow window between publishing `parked_task` and actually
+   calling `task.yield(.park)` — a window of ~2 instructions. In
+   practice, double-wake is extremely rare.
 
 3. **One fewer atomic operation on the hot path.** Removing the parked
    flag eliminates one atomic store (reader) and one atomic load (writer)
@@ -3894,15 +4073,19 @@ is the regime where most real-world applications live.
 
 | Component | File | Key Lines | Role |
 |---|---|---|---|
-| Executor.scheduleTask | src/runtime.zig | 477-517 | Task dispatch with migration |
+| Executor.scheduleTask | src/runtime.zig | 477-517 | Task dispatch with state.swap(.ready) |
 | Executor.scheduleTaskRemote | src/runtime.zig | 461-472 | Treiber stack + loop.wake() |
 | Executor.run | src/runtime.zig | 367-410 | Main loop: tasks → drain remote → poll |
 | Executor.getNextTask | src/runtime.zig | 416-443 | Fairness: EVENT_INTERVAL=61, tick guard |
-| Executor.processCleanup | src/runtime.zig | 531-548 | Deferred park with CAS |
+| Executor.processCleanup | src/runtime.zig | 531-548 | Deferred park: CAS(.preparing_to_wait → .waiting) |
+| AnyTask.yield | src/runtime/task.zig | (various) | Suspend coroutine: .park or .reschedule mode |
+| AnyTask.state | src/runtime/task.zig | (various) | .new/.ready/.preparing_to_wait/.waiting/.finished |
+| AnyTask.wake | src/runtime/task.zig | (various) | Calls executor.scheduleTask(self) |
 | loop.wake | src/ev/loop.zig | 295-301 | fetchOr coalescing, one syscall |
 | LoopState.markCompleted | src/ev/loop.zig | 135-159 | Atomic cancel coordination |
 | AtomicStack (Treiber) | src/ev/loop.zig | 63-88 | Lock-free MPSC for cross-thread |
-| Waiter | src/common.zig | (various) | Task parking / futex signaling |
+| Waiter | src/common.zig | (various) | Task parking / futex signaling (reference) |
+| waitTask | src/common.zig | (various) | preparing_to_wait → waiting handshake pattern |
 | Channel | src/sync/channel.zig | 24-100 | MPMC reference (mutex-based) |
 | Completion lifecycle | src/ev/completion.zig | 55-100 | new→running→completed→dead |
 | Context switch | src/coro/coroutines.zig | (asm) | ~100ns register save/restore |
