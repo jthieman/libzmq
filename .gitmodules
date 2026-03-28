@@ -1,0 +1,3 @@
+[submodule "zio"]
+	path = zio
+	url = git@github.com:lalinsky/zio.git
